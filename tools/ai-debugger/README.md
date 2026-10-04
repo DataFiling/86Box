@@ -65,6 +65,8 @@ python3 tools/ai-debugger/smoke_test.py      # prints RESULT: PASS
 
 It was verified on an IBM PC 5150 (8088) and an AMI 486 (OPTi 495).
 
+See [DEVLOG.md](DEVLOG.md) for design decisions, test results and next steps.
+
 ## Tools
 
 | Area | Tools |
