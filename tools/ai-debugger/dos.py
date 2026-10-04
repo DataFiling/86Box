@@ -107,10 +107,14 @@ def is_register(name):
 
 def parse_number(text):
     """Bare numbers are hexadecimal, as in DEBUG.COM; "0x" and "h" are accepted."""
+    orig = text
     text = text.strip().lower()
     if text.endswith("h"):
         text = text[:-1]
-    return int(text, 16)
+    try:
+        return int(text, 16)
+    except ValueError:
+        raise ValueError("can't read %r as a register or hex number" % orig) from None
 
 
 def parse_term(text, regs):
@@ -164,7 +168,11 @@ def describe(loc, regs):
     if loc.sel is None:
         return "linear %08X" % loc.linear
     if segmented(regs):
-        how = "real-mode segment, %04X*16" % loc.sel if cpu_mode(regs) == "real" else "V86 segment, %04X*16" % loc.sel
+        kind = "real-mode" if cpu_mode(regs) == "real" else "V86"
+        if loc.base == loc.sel * 16:
+            how = "%s segment, %04X*16" % (kind, loc.sel)
+        else:  # e.g. CS=F000 with base FFFF0000 right after a 286+ reset
+            how = "%s segment %04X, cached base %08X" % (kind, loc.sel, loc.base)
     else:
         how = "protected-mode selector, base %08X" % loc.base
     return "linear %08X (%s)" % (loc.linear, how)
@@ -378,9 +386,14 @@ def read_text_screen(client, include_attributes=False):
     elif mode in (0, 1, 2, 3):
         base = 0xB8000
     else:
-        return {"mode": mode, "text": None,
-                "note": "Video mode %02Xh is a graphics mode; text is not in memory. "
-                        "Use the screenshot tool." % mode}
+        # Other modes (SVGA/VESA text such as 132 columns, or graphics): ask
+        # the VGA graphics controller whether it is in text mode and where
+        # its memory map is, restoring the controller's index afterwards.
+        base = vga_text_base(client)
+        if base is None:
+            return {"mode": mode, "text": None,
+                    "note": "Video mode %02Xh is a graphics mode; text is not in memory. "
+                            "Use the screenshot tool." % mode}
 
     if not (1 <= cols <= 132 and 1 <= rows <= 60):
         cols, rows = 80, 25
@@ -397,6 +410,21 @@ def read_text_screen(client, include_attributes=False):
     if include_attributes:
         result["attributes"] = attr_lines
     return result
+
+
+def vga_text_base(client):
+    """Base of text memory if the VGA graphics controller is in text mode,
+    else None. Reads GC register 6 (Miscellaneous) through 3CEh/3CFh."""
+    def inb(port):
+        return int(client.monitor("ib 0x%x 1" % port).split()[1], 16)
+
+    index = inb(0x3CE)
+    client.monitor("ob 0x3ce 0x6")
+    misc = inb(0x3CF)
+    client.monitor("ob 0x3ce 0x%x" % index)
+    if misc & 1:  # graphics
+        return None
+    return {0: 0xA0000, 1: 0xA0000, 2: 0xB0000, 3: 0xB8000}[(misc >> 2) & 3]
 
 
 def read_ivt(client, first=0, count=256):

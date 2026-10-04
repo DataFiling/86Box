@@ -15,7 +15,7 @@ from mcp.server.fastmcp import FastMCP, Image
 
 import dos
 import pcinput
-from gdb_rsp import (BP_HARDWARE, WP_ACCESS, WP_READ, WP_WRITE, GdbClient, GdbError)
+from gdb_rsp import (BP_HARDWARE, BP_SOFTWARE, WP_ACCESS, WP_READ, WP_WRITE, GdbClient, GdbError)
 
 INSTRUCTIONS = """\
 Tools for live-debugging DOS-era software running inside the 86Box PC emulator.
@@ -37,9 +37,9 @@ Find a variable (e.g. lives) by search_memory for its value, change it in game,
 search again, then set_watchpoint on the surviving address to find the code
 that modifies it.
 
-`screenshot` shows the emulated display (any video mode). Keyboard and mouse
-tools (press_keys, type_text, key_down/key_up, mouse_*) resume the CPU if it
-is paused, since the guest has to run to receive input; they leave it running.
+`screenshot` shows the emulated display (any video mode). The input tools
+press_keys, type_text, key_down and mouse_* resume the CPU if it is paused,
+since the guest has to run to receive input, and leave it running.
 """
 
 mcp = FastMCP("86box-debugger", instructions=INSTRUCTIONS)
@@ -48,7 +48,7 @@ _client = None
 _client_lock = threading.Lock()
 _points = {}  # (kind, linear) -> {"kind":..., "address":..., "length":..., "expr":...}
 
-KIND_NAMES = {BP_HARDWARE: "breakpoint", WP_WRITE: "write-watch", WP_READ: "read-watch",
+KIND_NAMES = {BP_SOFTWARE: "sw-breakpoint", BP_HARDWARE: "breakpoint", WP_WRITE: "write-watch", WP_READ: "read-watch",
               WP_ACCESS: "access-watch"}
 
 
@@ -67,6 +67,10 @@ def client():
                     "-DGDBSTUB=ON; the port is set by gdbstub_port in 86box.cfg." % (host, port, e))
             _client = c
             _points.clear()
+            # Points can outlive a connection when the stub holds them (run_tool.py).
+            for kind, addr, length in c.list_points() or []:
+                _points[(kind, addr)] = {"kind": kind, "address": addr, "length": length,
+                                         "expr": "set by an earlier connection"}
         return _client
 
 
@@ -214,8 +218,12 @@ def step_over(timeout_seconds: float = 10.0) -> str:
         md = dos.capstone.Cs(dos.capstone.CS_ARCH_X86,
                              dos.capstone.CS_MODE_16 if bits == 16 else dos.capstone.CS_MODE_32)
         insn = next(md.disasm(data, 0), None)
-    over = insn is not None and (insn.mnemonic.startswith(("call", "int", "loop")) or
-                                 insn.mnemonic.split(" ")[0] in ("rep", "repe", "repne", "repz", "repnz"))
+    words = insn.mnemonic.split() if insn is not None else []
+    string_ops = ("movs", "stos", "lods", "cmps", "scas", "ins", "outs")
+    over = bool(words) and (words[0] in ("call", "lcall", "int", "int1", "int3", "into") or
+                            words[0].startswith("loop") or
+                            (words[0] in ("rep", "repe", "repne", "repz", "repnz") and len(words) > 1
+                             and words[1].startswith(string_ops)))
     if not over:
         return _state_report(c.step())
     target = regs["eip"] + insn.size
@@ -281,6 +289,10 @@ def set_register(name: str, value: str) -> str:
     regs = _regs()
     name = name.lower()
     val = dos.parse_term(value, regs)
+    if name == "cs" and not dos.segmented(regs):
+        return ("Refusing to load CS directly in protected mode: the stub loads it like a data "
+                "selector, without switching the code size or checking privilege. Move within CS "
+                "with set_register eip/pc, or let the program do a far jump.")
     if name in ("ip", "eip"):
         c.write_register("eip", (dos.seg_cache(regs, "cs")["base"] + val) & 0xFFFFFFFF)
     elif name == "pc":
@@ -353,7 +365,15 @@ def search_memory(pattern: str, start: str = "0", end: str = "110000", as_text: 
     if not hits:
         return "No matches."
     real = dos.segmented(regs)
-    seg_note = lambda a: " (%04X:%04X)" % (a >> 4, a & 0xF) if (real and a < 0x110000) else ""
+
+    def seg_note(a):
+        if not real:
+            return ""
+        if a < 0x100000:
+            return " (%04X:%04X)" % (a >> 4, a & 0xF)
+        if a < 0x10FFF0:  # the HMA, reachable as FFFF:xxxx
+            return " (FFFF:%04X)" % (a - 0xFFFF0)
+        return ""
     return "%d match(es):\n" % len(hits) + "\n".join("%08X%s" % (h, seg_note(h)) for h in hits)
 
 
@@ -382,9 +402,14 @@ def read_stack(entries: int = 16) -> str:
         sp, w, mask, fmt = regs["esp"] & 0xFFFF, 2, 0xFFFF, "%04X:%04X  %04X"
     else:
         sp, w, mask, fmt = regs["esp"], 4, 0xFFFFFFFF, "%04X:%08X  %08X"
-    data = client().read_memory((ss["base"] + sp) & 0xFFFFFFFF, entries * w)
-    return "\n".join(fmt % (ss["sel"], (sp + i * w) & mask, int.from_bytes(data[i * w:(i + 1) * w], "little"))
-                     for i in range(entries))
+    c = client()
+    lines = []
+    for i in range(entries):
+        off = (sp + i * w) & mask  # a 16-bit stack wraps within its 64 KiB segment
+        data = c.read_memory((ss["base"] + off) & 0xFFFFFFFF, w)
+        val = int.from_bytes(data, "little") if len(data) == w else None
+        lines.append(fmt % (ss["sel"], off, val) if val is not None else (fmt[:-6] % (ss["sel"], off)) + "  ??")
+    return "\n".join(lines)
 
 
 # ---- breakpoints / watchpoints ----------------------------------------------
@@ -454,7 +479,10 @@ def read_interrupt_vectors(first: str = "0", count: int = 48) -> str:
 
     In protected mode these are still what DOS and reflected interrupts use;
     the protected-mode handlers are in the IDT (read_descriptor_table "idt")."""
-    out = dos.read_ivt(client(), dos.parse_number(first), max(1, min(count, 256)))
+    first = dos.parse_number(first)
+    if not 0 <= first <= 0xFF:
+        return "first must be an interrupt number from 0 to FF."
+    out = dos.read_ivt(client(), first, max(1, min(count, 256 - first)))
     if not dos.segmented(_regs()):
         out = ("NOTE: CPU is in protected mode; these are the real-mode vectors. "
                "Protected-mode handlers: read_descriptor_table(\"idt\").\n") + out
@@ -482,16 +510,27 @@ def read_descriptor_table(table: str = "gdt", first: int = 0, count: int = 32) -
     return dos.read_table(client(), regs, table, max(0, first), max(1, min(count, 256)))
 
 
+def _io_width(width):
+    width = width.lower()
+    if width not in ("b", "w", "l"):
+        raise ValueError("width must be b, w or l")
+    return width
+
+
 @tool
 def io_read(port: str, count: int = 1, width: str = "b") -> str:
-    """Read I/O port(s). width: b, w or l. Reading may have side effects on real hardware registers."""
-    return client().monitor("i%s %s %d" % (width, port, count)).strip()
+    """Read I/O port(s) (port in hex). width: b, w or l. Reads can have side
+    effects on the emulated hardware (e.g. clearing status bits)."""
+    # The stub reads a bare leading 0 as octal, so always send explicit hex.
+    return client().monitor("i%s 0x%x %d" % (_io_width(width), dos.parse_number(port) & 0xFFFF,
+                                             max(1, min(count, 256)))).strip()
 
 
 @tool
 def io_write(port: str, value: str, width: str = "b") -> str:
-    """Write a value (hex) to an I/O port. width: b, w or l."""
-    out = client().monitor("o%s %s %s" % (width, port, value)).strip()
+    """Write a value to an I/O port (both hex). width: b, w or l."""
+    out = client().monitor("o%s 0x%x 0x%x" % (_io_width(width), dos.parse_number(port) & 0xFFFF,
+                                             dos.parse_number(value))).strip()
     return out or "OK"
 
 
@@ -501,6 +540,9 @@ def io_write(port: str, value: str, width: str = "b") -> str:
 def screenshot(downscale: int = 1, save_path: str = "") -> list:
     """Capture the emulated display as a PNG (the last completed frame).
 
+    Games that clear and redraw the screen without double buffering can be
+    caught mid-redraw (flicker, as on real hardware): if something you
+    expect is missing, take another screenshot before concluding it is gone.
     downscale: integer factor to shrink large frames (2 halves each side).
     save_path: optionally also write the PNG to this host path."""
     w, h, seq, rgb = pcinput.grab_frame(client())
@@ -577,9 +619,9 @@ def key_up(key: str) -> str:
 
 @tool
 def mouse_move(dx: int, dy: int) -> str:
-    """Move the mouse by a relative amount in mickeys (positive dy is down).
-
-    Guest drivers scale this; take a screenshot to see where the pointer went."""
+    """Move the mouse by a relative amount (positive dy is down), in the same
+    units as host mouse motion: 86Box applies its mouse sensitivity and the
+    guest driver its own scaling. Take a screenshot to see where the pointer went."""
     c = client()
     note = _ensure_running()
     # Large jumps are split so drivers that clamp per-sample deltas keep up.
@@ -618,7 +660,8 @@ def mouse_buttons(left: bool = False, right: bool = False, middle: bool = False)
 
 @tool
 def mouse_scroll(clicks: int) -> str:
-    """Turn the mouse wheel (needs a wheel mouse and driver in the guest); negative is up."""
+    """Turn the mouse wheel by whole clicks; positive turns it away from you (scroll up).
+    Needs a wheel mouse and a wheel-aware driver in the guest."""
     c = client()
     note = _ensure_running()
     pcinput.mouse_move(c, 0, 0, clicks)

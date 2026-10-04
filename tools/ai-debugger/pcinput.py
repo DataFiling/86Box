@@ -1,6 +1,7 @@
 """Screen capture and keyboard/mouse input through the 86Box GDB stub's
 monitor commands (fi/fb, kd/ku, mm/mb; see "monitor help")."""
 
+import re
 import struct
 import time
 import zlib
@@ -93,10 +94,12 @@ def scancode(name):
 
 
 def parse_combo(combo):
-    """'ctrl+alt+delete' -> [scan, ...]; a lone '+' is the plus key."""
-    if combo.strip() == "+":
+    """'ctrl+alt+delete' -> [scan, ...]. "kp+" (keypad plus) works inside
+    chords too ("ctrl+kp+"); a lone "+" is also the keypad plus."""
+    combo = combo.strip().lower()
+    if combo == "+":
         return [scancode("kp+")]
-    return [scancode(part) for part in combo.split("+")]
+    return [scancode(m.group()) for m in re.finditer(r"kp\+|[^+]+", combo)]
 
 
 def char_keys(ch):

@@ -88,6 +88,13 @@ class GdbClient:
 
     def close(self):
         if self.sock:
+            # shutdown() first: close() alone doesn't send the FIN while the
+            # reader thread is blocked in recv() on the socket, so the stub
+            # wouldn't notice that this client has gone.
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 self.sock.close()
             except OSError:
@@ -154,7 +161,11 @@ class GdbClient:
         try:
             reply = self.replies.get(timeout=timeout or self.timeout)
         except queue.Empty:
-            raise GdbError("timed out waiting for the emulator (is 86Box paused from its own UI?)")
+            # A late reply would otherwise be taken as the answer to the next
+            # request, so drop the connection; the next call reconnects.
+            self.close()
+            raise GdbError("timed out waiting for the emulator (is 86Box paused from its own UI?); "
+                           "disconnected, the next call reconnects")
         if reply is None:
             raise GdbError("connection to 86Box closed")
         return reply
@@ -175,14 +186,15 @@ class GdbClient:
     def resume(self):
         with self.lock:
             self._drain_stops()
-            self._send_packet("c")
+            # Set before sending: the reader clears it when the stop reply comes.
             self.running = True
+            self._send_packet("c")
 
     def step(self, timeout=None):
         with self.lock:
             self._drain_stops()
-            self._send_packet("s")
             self.running = True
+            self._send_packet("s")
         return self.wait_stop(timeout)
 
     def pause(self, timeout=None):
@@ -262,11 +274,16 @@ class GdbClient:
     CHUNK = 4096
 
     def read_memory(self, addr, length):
+        """Read guest memory. Returns fewer bytes than asked if the range runs
+        into a page the CPU can't read (the stub returns what it read before
+        the fault); raises only if nothing at all could be read."""
         out = bytearray()
         while length > 0:
             n = min(length, self.CHUNK)
             reply = self.request("m%x,%x" % (addr, n))
             if reply.startswith("E") and len(reply) == 3:
+                if out:
+                    break
                 raise GdbError("memory read failed at %08X (%s; page fault?)" % (addr, reply))
             data = bytes.fromhex(reply)
             out += data
@@ -288,6 +305,22 @@ class GdbClient:
         reply = self.request("Z%d,%x,%x" % (kind, addr, length))
         if reply != "OK":
             raise GdbError("could not set point at %08X: %s" % (addr, reply or "unsupported"))
+
+    def list_points(self):
+        """Breakpoints/watchpoints the stub holds, as [(kind, addr, length)], or
+        None on builds without the "bl" monitor command."""
+        try:
+            text = self.monitor("bl")
+        except GdbError as e:
+            if "unknown" in str(e):
+                return None
+            raise
+        points = []
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) == 3:
+                points.append((int(parts[0]), int(parts[1], 16), int(parts[2], 16)))
+        return points
 
     def clear_point(self, kind, addr, length=1):
         reply = self.request("z%d,%x,%x" % (kind, addr, length))
@@ -321,6 +354,8 @@ class GdbClient:
                     raise GdbError("monitor command %r failed (%s); is this 86Box build current?" % (command, reply))
                 if reply and reply != "OK":
                     out += bytes.fromhex(reply)
+                if not raw:
+                    out = out.rstrip(b"\x00")  # some text replies include the C string's NUL
                 if out == b"Unknown command\n":
                     raise GdbError("monitor command %r unknown to this 86Box build" % command)
                 return out if raw else out.decode("latin-1")
