@@ -43,6 +43,11 @@ enum {
             gdbstub_mem_access(gdbstub_addrs, (access) | (width));                    \
         }
 
+/* Pages with a watchpoint must not enter the MMU lookup caches, as accesses
+   through those bypass readmembl() and friends, and with them the checks. */
+#    define GDBSTUB_PAGE_WATCHED(addr) \
+        (gdbstub_watch_pages[((addr) >> MEM_GRANULARITY_BITS) >> 6] & (1ULL << (((addr) >> MEM_GRANULARITY_BITS) & 63)))
+
 #    define GDBSTUB_MEM_ACCESS_FAST(addrs, access, width)                           \
         uint32_t gdbstub_page = (addrs)[0] >> MEM_GRANULARITY_BITS;                 \
         if (gdbstub_watch_pages[gdbstub_page >> 6] & (1ULL << (gdbstub_page & 63))) \
@@ -62,6 +67,7 @@ extern void gdbstub_close(void);
 
 #    define GDBSTUB_MEM_ACCESS(addr, access, width)
 #    define GDBSTUB_MEM_ACCESS_FAST(addrs, access, width)
+#    define GDBSTUB_PAGE_WATCHED(addr) 0
 
 #    define gdbstub_step      0
 #    define gdbstub_next_asap 0

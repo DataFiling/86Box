@@ -1452,6 +1452,10 @@ unknown:
                         l++;
                     }
                 }
+
+                /* Drop cached translations, so that watched pages stop
+                   bypassing the checks through the MMU lookup caches. */
+                flushmmucache();
             }
 
             /* Respond positively. */

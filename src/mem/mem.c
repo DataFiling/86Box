@@ -610,6 +610,9 @@ addreadlookup(uint32_t virt, uint32_t phys)
     if (virt == 0xffffffff)
         return;
 
+    if (GDBSTUB_PAGE_WATCHED(virt))
+        return;
+
     if (readlookup2[index] != (uintptr_t) LOOKUP_INV)
         return;
 
@@ -628,6 +631,9 @@ void
 addwritelookup(uint32_t virt, uint32_t phys)
 {
     if (virt == 0xffffffff)
+        return;
+
+    if (GDBSTUB_PAGE_WATCHED(virt))
         return;
 
     if (page_lookup[virt >> 12])
@@ -715,6 +721,8 @@ read_mem_b(uint32_t addr)
     mem_mapping_t *map;
     uint8_t        ret        = 0xff;
 
+    GDBSTUB_MEM_ACCESS(addr, GDBSTUB_MEM_READ, 1);
+
     mem_logical_addr = addr;
     addr &= rammask;
 
@@ -737,6 +745,8 @@ read_mem_w(uint32_t addr)
     if (addr & 1)
         ret = read_mem_b(addr) | (read_mem_b(addr + 1) << 8);
     else {
+        GDBSTUB_MEM_ACCESS(addr, GDBSTUB_MEM_READ, 2);
+
         map = read_mapping[addr >> MEM_GRANULARITY_BITS];
 
         if (map && map->read_w)
@@ -752,6 +762,8 @@ void
 write_mem_b(uint32_t addr, uint8_t val)
 {
     mem_mapping_t *map;
+
+    GDBSTUB_MEM_ACCESS(addr, GDBSTUB_MEM_WRITE, 1);
 
     mem_logical_addr = addr;
     addr &= rammask;
@@ -773,6 +785,8 @@ write_mem_w(uint32_t addr, uint16_t val)
         write_mem_b(addr, val);
         write_mem_b(addr + 1, val >> 8);
     } else {
+        GDBSTUB_MEM_ACCESS(addr, GDBSTUB_MEM_WRITE, 2);
+
         map = write_mapping[addr >> MEM_GRANULARITY_BITS];
         if (map) {
             if (map->write_w)
