@@ -119,6 +119,46 @@ New monitor commands:
 `press_keys`, `type_text`, `key_down`/`key_up`, `mouse_move` (large moves
 split into steps), `mouse_click`, `mouse_buttons`, `mouse_scroll`.
 
+### 6. Protected-mode basics
+**Problem:** the GDB register packets carry selectors but not segment
+bases, so in protected mode the bridge couldn't turn `SEL:OFF` into an
+address, show `CS:EIP`, or know whether code is 16- or 32-bit. It refused
+`SEG:OFF` there and assumed flat 32-bit code.
+
+**Emulator:** a new `sg` monitor command reports each segment register's
+descriptor cache (selector, base, limit, access byte, flags byte), GDTR,
+IDTR, LDTR, TR, and the CPU's `use32`/`stack32`/CPL.
+
+**Bridge:**
+- `read_registers()` fetches `sg` too, falling back to the old behaviour on
+  builds without it.
+- One resolver (`dos.resolve`) for every tool. Segment registers use their
+  cached base in all modes. Numeric selectors are `*16` in real/V86 mode, and
+  in protected mode are looked up in the GDT or LDT, which also gives the
+  code size.
+- `CS:EIP` is shown in protected mode with the code/stack size, CPL, paging,
+  and the segment bases. Real mode notes "unreal" segments (limits above 64
+  KiB).
+- A side benefit: right after a 286+ reset the bridge shows `F000:FFF0`
+  (base FFFF0000), where before it could only show the linear PC.
+- Disassembly, `step_over` and `read_stack` use the real code and stack sizes.
+  `set_register ip/eip` takes the offset within CS; `pc` takes a linear
+  address.
+- New tools: `get_segments`, and `read_descriptor_table` for the GDT, LDT and
+  IDT (segments, TSS/LDT entries and gates decoded).
+- Breakpoint, watchpoint and run-until results say how the address was
+  resolved. A protected-mode selector given while the CPU is still in real
+  mode is (correctly) taken as a real-mode segment, which the test hit once
+  and which an AI could otherwise miss.
+
+**Test program:** `testdata/pm_probe.asm` (NASM, with the assembled `.bin`)
+is loaded by the debugger at 0000:8000. It builds a GDT, enters protected
+mode, and loops between a flat 32-bit code segment and a 16-bit code segment
+based at 8100h that increments a word through FS (base 12340h). That covers
+16- and 32-bit protected-mode code, non-zero bases, and selector lookup.
+`smoke_test.py --protected-mode` runs it on 386+ machines and hard-resets
+afterwards.
+
 ## Test results
 
 Test machines, built with `-DQT=OFF -DSDL2=ON -DGDBSTUB=ON` and run headless
@@ -135,13 +175,17 @@ under Xvfb:
 | F1 on the 486 | Entered AMIBIOS setup; colour VGA screenshot pixel-correct |
 | CGA graphics (`SCREEN 1`) | Screenshot correct; `read_text_screen` reports a graphics mode |
 | Serial mouse | Injected moves/buttons produce Microsoft-mouse packets on COM1 (e.g. `4C 0B 3C`) |
+| `smoke_test.py --protected-mode` on the 486 | PASS: `CS:IP = 0020:0000` 16-bit and `CS:EIP = 0008:0000802C` 32-bit, `inc word ptr fs:[0]` / `inc dword ptr [0x806e]` decoded at the right size, `fs:0` and `0018:0000` both linear 12340, write watchpoint through FS fired, 32-bit stack at `0010:0009F000`, GDT decoded |
 
 Not yet tested: a real DOS game, and a DOS mouse driver end to end.
 
 ## Known limitations
 
-- Protected mode: no segment bases from the stub, so `SEG:OFF` only works in
-  real/V86 mode. Use linear addresses for DOS extenders.
+- Breakpoints and watchpoints are on linear addresses, resolved when set; one
+  set through a selector whose base later changes stays at the old address.
+- No DOS-extender awareness yet (load address, DPMI calls). V86 mode is
+  handled through the same descriptor caches but hasn't been tested under
+  EMM386 yet.
 - Watchpoints stop after the accessing instruction; on 8-bit-bus CPUs a word
   access reports its second byte's address.
 - Pausing from 86Box's own UI stops request servicing (tools time out).
@@ -150,14 +194,19 @@ Not yet tested: a real DOS game, and a DOS mouse driver end to end.
 
 ## Next steps
 
-1. **Real-game test bed:** FreeDOS plus freeware games (text-mode, VGA, and
-   one using the mouse), with an automated boot-and-play check. This also
-   validates mouse input against a DOS driver.
-2. **DOS awareness:** find the running program (PSP/MCB chain), break on
-   program start, log `INT 21h`/`INT 10h` calls with names, memory diffing to
-   find variables, save/restore machine state.
-3. **Protected mode:** segment bases/descriptors through the stub, so
-   `SEG:OFF` and 16/32-bit disassembly work under DOS extenders.
+1. **Test setup across three eras:** FreeDOS on a 286/386 (early real-mode
+   games), a 486 (DOS-extender games, with Doom shareware as the
+   protected-mode test) and a Pentium machine. One freeware or shareware game
+   each, an automated boot-and-play check, the find-and-patch-the-lives
+   exercise, a DOS mouse driver check, and a speed measurement on the Pentium
+   machine.
+2. **DOS and extender awareness:** find the running program (PSP/MCB chain,
+   extender load address), break on program start, log `INT 21h`/`INT 10h`/
+   `INT 31h` calls with names, memory diffing to find variables,
+   save/restore machine state.
+3. **Speed, only if step 1 shows Pentium-era games are too slow:** let the
+   dynamic recompiler run while no breakpoints, watchpoints or stepping are
+   active.
 4. **Autonomous loop:** an agent that runs a game, detects hangs or crashes,
    and diagnoses them.
 5. Offer the emulator fixes upstream (86Box/86Box) as separate pull requests.

@@ -213,7 +213,37 @@ class GdbClient:
             regs[name] &= 0xFFFF  # the stub leaves stale bytes in the upper half
         for idx, name in ((REG_CR0, "cr0"), (REG_CR2, "cr2"), (REG_CR3, "cr3"), (REG_CR4, "cr4")):
             regs[name] = self.read_register(idx)
+        regs["seg"] = self.read_segments()
         return regs
+
+    _has_sg = True
+
+    def read_segments(self):
+        """Segment descriptor caches and descriptor table registers from the
+        stub's "sg" monitor command, or None on builds without it.
+
+        Returns {"cs": {"sel", "base", "limit", "access", "flags"}, ..., "gdt",
+        "idt", "ldt", "tr", "cpu": {"use32", "stack32", "cpl"}}."""
+        if not self._has_sg:
+            return None
+        try:
+            text = self.monitor("sg")
+        except GdbError as e:
+            if "unknown" not in str(e):
+                raise
+            self._has_sg = False
+            return None
+        out = {}
+        for line in text.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            fields = {}
+            for kv in parts[1:]:
+                key, val = kv.split("=", 1)
+                fields[key] = int(val, 10 if parts[0] == "cpu" else 16)
+            out[parts[0]] = fields
+        return out
 
     def read_register(self, index):
         reply = self.request("p%x" % index)

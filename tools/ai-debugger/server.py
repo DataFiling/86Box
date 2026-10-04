@@ -20,9 +20,14 @@ from gdb_rsp import (BP_HARDWARE, WP_ACCESS, WP_READ, WP_WRITE, GdbClient, GdbEr
 INSTRUCTIONS = """\
 Tools for live-debugging DOS-era software running inside the 86Box PC emulator.
 
-Addresses: "SEG:OFF" (e.g. "1234:0100", "ds:si", "es:di+10", "cs:ip") in real/V86
-mode, or linear addresses ("B8000", "0x12345", "12345h"). Bare numbers are HEX,
-as in DEBUG.COM. All breakpoints/watchpoints are on linear addresses.
+Addresses: "SEG:OFF" (e.g. "1234:0100", "ds:si", "es:di+10", "cs:eip") or linear
+addresses ("B8000", "0x12345", "12345h"). Bare numbers are HEX, as in DEBUG.COM.
+SEG:OFF works in every CPU mode: segment registers use their cached base, and in
+protected mode a numeric selector (e.g. "0028:00401000") is looked up in the
+GDT/LDT. Breakpoints and watchpoints are set on the resulting linear address
+(with paging on, that is the virtual linear address). Disassembly picks 16- or
+32-bit code from the segment; get_segments and read_descriptor_table show the
+descriptors (useful under DOS extenders such as DOS/4GW).
 
 The emulator starts PAUSED when the debugger is enabled: call `resume` to boot it.
 Most inspection tools work while the guest is running, but registers are only
@@ -81,17 +86,25 @@ def _regs():
     return client().read_registers()
 
 
-def _bits(regs, bits):
-    if bits in (16, 32):
-        return bits
-    return 16 if dos.segmented(regs) else 32
+def _resolve(address, regs):
+    return dos.resolve(address, regs, client())
 
 
-def _code_at(regs, linear, count, bits=None):
+def _cs_loc(regs, linear):
+    """Label code at `linear` as CS:offset when it lies inside CS."""
+    try:
+        cs = dos.seg_cache(regs, "cs")
+    except ValueError:
+        return None
+    if 0 <= linear - cs["base"] <= cs["limit"]:
+        return dos.Loc(linear, cs["sel"], cs["base"], dos.code_bits(regs))
+    return None
+
+
+def _code_at(regs, linear, count):
     c = client()
     data = c.read_memory(linear, count * 15)
-    seg = regs["cs"] if (dos.segmented(regs) and 0 <= linear - regs["cs"] * 16 < 0x10000) else None
-    return dos.disassemble(data, linear, _bits(regs, bits), seg, count)
+    return dos.disassemble(data, linear, dos.code_bits(regs), _cs_loc(regs, linear), count)
 
 
 def _state_report(stop=None, code_lines=6):
@@ -194,7 +207,7 @@ def step_over(timeout_seconds: float = 10.0) -> str:
     if c.running:
         c.pause()
     regs = _regs()
-    bits = _bits(regs, None)
+    bits = dos.code_bits(regs)
     data = c.read_memory(regs["eip"], 15)
     insn = None
     if dos.capstone is not None:
@@ -228,11 +241,16 @@ def _run_to(linear, timeout):
 
 @tool
 def run_until(address: str, timeout_seconds: float = 30.0) -> str:
-    """Resume until execution reaches `address` (temporary breakpoint), or pause on timeout."""
+    """Resume until execution reaches `address` (temporary breakpoint), or pause on timeout.
+
+    The address is resolved now, in the current CPU mode: a protected-mode
+    SEL:OFF given while still in real mode is taken as a real-mode segment."""
     c = client()
     if c.running:
         c.pause()
-    return _run_to(dos.parse_address(address, _regs()), timeout_seconds)
+    regs = _regs()
+    loc = _resolve(address, regs)
+    return "Target %s = %s.\n\n%s" % (address, dos.describe(loc, regs), _run_to(loc.linear, timeout_seconds))
 
 
 @tool
@@ -252,14 +270,23 @@ def get_state(instructions: int = 8) -> str:
 
 @tool
 def set_register(name: str, value: str) -> str:
-    """Set a register (eax..edi, eip, eflags, cs, ss, ds, es, fs, gs). Value is hex.
+    """Set a register (eax..edi, eip/ip, eflags, cs, ss, ds, es, fs, gs). Value is hex.
 
-    Note: eip is LINEAR in this stub; to change IP in real mode pass CS*16+IP."""
+    eip/ip is the offset within CS, as shown in CS:EIP; "pc" sets the linear
+    address instead. Loading a segment register in protected mode loads the
+    descriptor for that selector."""
     c = client()
     if c.running:
         return "Pause the CPU first."
     regs = _regs()
-    c.write_register(name.lower(), dos.parse_term(value, regs))
+    name = name.lower()
+    val = dos.parse_term(value, regs)
+    if name in ("ip", "eip"):
+        c.write_register("eip", (dos.seg_cache(regs, "cs")["base"] + val) & 0xFFFFFFFF)
+    elif name == "pc":
+        c.write_register("eip", val & 0xFFFFFFFF)
+    else:
+        c.write_register(name, val)
     return _state_report()
 
 
@@ -267,13 +294,10 @@ def set_register(name: str, value: str) -> str:
 def read_memory(address: str, length: int = 128, format: str = "hex") -> str:
     """Read guest memory. format: hex (dump), words, dwords, text (CP437)."""
     c = client()
-    regs = _regs()
-    linear = dos.parse_address(address, regs)
+    loc = _resolve(address, _regs())
+    linear = loc.linear
     length = max(1, min(length, 65536))
     data = c.read_memory(linear, length)
-    seg = None
-    if ":" in address and dos.segmented(regs):
-        seg = dos.parse_term(address.split(":", 1)[0], regs)
     if format == "text":
         return data.decode("cp437", errors="replace")
     if format in ("words", "dwords"):
@@ -282,14 +306,14 @@ def read_memory(address: str, length: int = 128, format: str = "hex") -> str:
         fmt = "%04X" if w == 2 else "%08X"
         return "\n".join("%08X: " % (linear + i * 16) + " ".join(fmt % v for v in vals[i * 16 // w:(i + 1) * 16 // w])
                          for i in range((len(vals) * w + 15) // 16))
-    return dos.hexdump(data, linear, seg)
+    return dos.hexdump(data, linear, loc)
 
 
 @tool
 def write_memory(address: str, hex_bytes: str) -> str:
     """Write bytes (hex string, e.g. "90 90" or "EB05") to guest memory."""
     c = client()
-    linear = dos.parse_address(address, _regs())
+    linear = _resolve(address, _regs()).linear
     data = bytes.fromhex(hex_bytes.replace(" ", ""))
     c.write_memory(linear, data)
     return "Wrote %d bytes at linear %08X." % (len(data), linear)
@@ -303,7 +327,7 @@ def search_memory(pattern: str, start: str = "0", end: str = "110000", as_text: 
     Default range covers the first 1MB + HMA, i.e. all real-mode memory."""
     c = client()
     regs = _regs()
-    lo, hi = dos.parse_address(start, regs), dos.parse_address(end, regs)
+    lo, hi = _resolve(start, regs).linear, _resolve(end, regs).linear
     if as_text:
         needle = [b for b in pattern.encode("cp437")]
     else:
@@ -328,37 +352,38 @@ def search_memory(pattern: str, start: str = "0", end: str = "110000", as_text: 
         addr += block
     if not hits:
         return "No matches."
-    seg_note = lambda a: " (%04X:%04X)" % (a >> 4, a & 0xF) if a < 0x110000 else ""
+    real = dos.segmented(regs)
+    seg_note = lambda a: " (%04X:%04X)" % (a >> 4, a & 0xF) if (real and a < 0x110000) else ""
     return "%d match(es):\n" % len(hits) + "\n".join("%08X%s" % (h, seg_note(h)) for h in hits)
 
 
 @tool
-def disassemble(address: str = "cs:ip", count: int = 20, bits: int = 0) -> str:
-    """Disassemble `count` instructions at `address`. bits: 16, 32 or 0 for auto (by CPU mode)."""
+def disassemble(address: str = "cs:eip", count: int = 20, bits: int = 0) -> str:
+    """Disassemble `count` instructions at `address`.
+
+    bits: 16, 32, or 0 for auto: the segment's own size for SEG:OFF addresses,
+    otherwise the size of the code currently running."""
     regs = _regs()
-    linear = dos.parse_address(address, regs)
+    loc = _resolve(address, regs)
     count = max(1, min(count, 200))
-    c = client()
-    data = c.read_memory(linear, count * 15)
-    seg = None
-    if ":" in address and dos.segmented(regs):
-        seg = dos.parse_term(address.split(":", 1)[0], regs)
-    return dos.disassemble(data, linear, _bits(regs, bits or None), seg, count)
+    data = client().read_memory(loc.linear, count * 15)
+    if bits not in (16, 32):
+        bits = loc.bits or dos.code_bits(regs)
+    return dos.disassemble(data, loc.linear, bits, loc, count)
 
 
 @tool
 def read_stack(entries: int = 16) -> str:
-    """Show the top of the stack at SS:SP as 16-bit words (32-bit in protected mode)."""
+    """Show the top of the stack at SS:(E)SP, as 16- or 32-bit entries to match the stack size."""
     regs = _regs()
-    if dos.segmented(regs):
-        sp = regs["esp"] & 0xFFFF
-        linear = regs["ss"] * 16 + sp
-        data = client().read_memory(linear, entries * 2)
-        return "\n".join("%04X:%04X  %04X" % (regs["ss"], (sp + i * 2) & 0xFFFF,
-                                               int.from_bytes(data[i * 2:i * 2 + 2], "little"))
-                         for i in range(entries))
-    data = client().read_memory(regs["esp"], entries * 4)
-    return "\n".join("%08X  %08X" % (regs["esp"] + i * 4, int.from_bytes(data[i * 4:i * 4 + 4], "little"))
+    ss = dos.seg_cache(regs, "ss")
+    entries = max(1, min(entries, 256))
+    if dos.stack_bits(regs) == 16:
+        sp, w, mask, fmt = regs["esp"] & 0xFFFF, 2, 0xFFFF, "%04X:%04X  %04X"
+    else:
+        sp, w, mask, fmt = regs["esp"], 4, 0xFFFFFFFF, "%04X:%08X  %08X"
+    data = client().read_memory((ss["base"] + sp) & 0xFFFFFFFF, entries * w)
+    return "\n".join(fmt % (ss["sel"], (sp + i * w) & mask, int.from_bytes(data[i * w:(i + 1) * w], "little"))
                      for i in range(entries))
 
 
@@ -366,12 +391,16 @@ def read_stack(entries: int = 16) -> str:
 
 @tool
 def set_breakpoint(address: str) -> str:
-    """Set an execution breakpoint (hardware-style; works in ROM and does not modify memory)."""
+    """Set an execution breakpoint (hardware-style; works in ROM and does not modify memory).
+
+    SEG:OFF is resolved to a linear address now, in the current CPU mode."""
     c = client()
-    linear = dos.parse_address(address, _regs())
+    regs = _regs()
+    loc = _resolve(address, regs)
+    linear = loc.linear
     c.set_point(BP_HARDWARE, linear)
     _points[(BP_HARDWARE, linear)] = {"kind": BP_HARDWARE, "address": linear, "length": 1, "expr": address}
-    return "Breakpoint set at linear %08X (%s)." % (linear, address)
+    return "Breakpoint set at %s = %s." % (address, dos.describe(loc, regs))
 
 
 @tool
@@ -379,10 +408,12 @@ def set_watchpoint(address: str, length: int = 1, kind: str = "write") -> str:
     """Stop when memory in [address, address+length) is accessed. kind: write, read or access."""
     c = client()
     k = {"write": WP_WRITE, "read": WP_READ, "access": WP_ACCESS}[kind]
-    linear = dos.parse_address(address, _regs())
+    regs = _regs()
+    loc = _resolve(address, regs)
+    linear = loc.linear
     c.set_point(k, linear, max(1, length))
     _points[(k, linear)] = {"kind": k, "address": linear, "length": max(1, length), "expr": address}
-    return "%s watchpoint on %08X..%08X (%s)." % (kind.capitalize(), linear, linear + length - 1, address)
+    return "%s watchpoint on %s, %d byte(s) = %s." % (kind.capitalize(), address, max(1, length), dos.describe(loc, regs))
 
 
 @tool
@@ -392,7 +423,7 @@ def clear_breakpoint(address: str = "all") -> str:
     if address == "all":
         targets = list(_points)
     else:
-        linear = dos.parse_address(address, _regs())
+        linear = _resolve(address, _regs()).linear
         targets = [key for key in _points if key[1] == linear]
     for key in targets:
         p = _points.pop(key)
@@ -419,8 +450,36 @@ def read_text_screen(include_attributes: bool = False) -> dict:
 
 @tool
 def read_interrupt_vectors(first: str = "0", count: int = 48) -> str:
-    """Show real-mode interrupt vectors (e.g. first="21", count=1 for the DOS handler)."""
-    return dos.read_ivt(client(), dos.parse_number(first), max(1, min(count, 256)))
+    """Show real-mode interrupt vectors (e.g. first="21", count=1 for the DOS handler).
+
+    In protected mode these are still what DOS and reflected interrupts use;
+    the protected-mode handlers are in the IDT (read_descriptor_table "idt")."""
+    out = dos.read_ivt(client(), dos.parse_number(first), max(1, min(count, 256)))
+    if not dos.segmented(_regs()):
+        out = ("NOTE: CPU is in protected mode; these are the real-mode vectors. "
+               "Protected-mode handlers: read_descriptor_table(\"idt\").\n") + out
+    return out
+
+
+@tool
+def get_segments() -> str:
+    """Show the segment registers' descriptor caches (base, limit, type, 16/32-bit),
+    the CPU's code/stack size and privilege level, and GDTR/IDTR/LDTR/TR."""
+    return dos.format_segments(_regs())
+
+
+@tool
+def read_descriptor_table(table: str = "gdt", first: int = 0, count: int = 32) -> str:
+    """Decode entries of the GDT, LDT or IDT (table: gdt, ldt or idt).
+
+    first/count are entry indexes (GDT selector = index * 8; IDT index = interrupt number)."""
+    table = table.lower()
+    if table not in ("gdt", "ldt", "idt"):
+        return "table must be gdt, ldt or idt."
+    regs = _regs()
+    if table == "idt" and dos.cpu_mode(regs) == "real":
+        return "CPU is in real mode; use read_interrupt_vectors for the interrupt vector table."
+    return dos.read_table(client(), regs, table, max(0, first), max(1, min(count, 256)))
 
 
 @tool
