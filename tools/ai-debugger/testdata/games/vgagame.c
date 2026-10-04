@@ -37,7 +37,7 @@ unsigned char difficulty = 3;
 volatile unsigned char keys[128];
 
 static unsigned char far *vga   = (unsigned char far *) MK_FP(0xA000, 0);
-static unsigned long far *ticks = (unsigned long far *) MK_FP(0x0040, 0x006C);
+static volatile unsigned long far *ticks = (volatile unsigned long far *) MK_FP(0x0040, 0x006C);
 static void(__interrupt __far *old_int9)(void);
 
 static void __interrupt __far

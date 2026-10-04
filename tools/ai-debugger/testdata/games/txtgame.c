@@ -34,7 +34,7 @@ pos_t         enemy[N_ENEMY];
 pos_t         gem[N_GEM];
 
 static unsigned short far *screen = (unsigned short far *) MK_FP(0xB800, 0);
-static unsigned long  far *ticks  = (unsigned long far *) MK_FP(0x0040, 0x006C);
+static volatile unsigned long far *ticks = (volatile unsigned long far *) MK_FP(0x0040, 0x006C);
 
 static void
 put(int x, int y, char c, unsigned char attr)

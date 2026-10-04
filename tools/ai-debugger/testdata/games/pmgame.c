@@ -44,7 +44,7 @@ struct game g;
 struct ship ships[N_SHIPS];
 
 static unsigned char *vga   = (unsigned char *) 0xA0000;
-static unsigned long *ticks = (unsigned long *) 0x46C;
+static volatile unsigned long *ticks = (volatile unsigned long *) 0x46C;
 
 static void
 set_mode(int mode)
