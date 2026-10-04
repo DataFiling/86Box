@@ -1274,6 +1274,24 @@ e00:
                     mouse_scale(j, k);
                     if ((p = strtok_r(NULL, " ", &strtok_save)) && gdbstub_num_decode(p, &j, GDB_MODE_BASE10))
                         mouse_set_z(j);
+                } else if (!strcmp(p, "sg")) {
+                    /* Report the segment descriptor caches and descriptor table registers,
+                       which the register packets don't carry, for protected mode debugging. */
+                    static const char *seg_names[] = { "cs", "ss", "ds", "es", "fs", "gs" };
+                    client->packet_pos = 0;
+                    for (i = 0; i < 6; i++)
+                        client->packet_pos += sprintf(&client->packet[client->packet_pos], "%s sel=%04X base=%08X limit=%08X access=%02X flags=%02X\n",
+                                                      seg_names[i], segment_regs[i]->seg, segment_regs[i]->base, segment_regs[i]->limit,
+                                                      segment_regs[i]->access, segment_regs[i]->ar_high);
+                    client->packet_pos += sprintf(&client->packet[client->packet_pos], "gdt base=%08X limit=%08X\nidt base=%08X limit=%08X\n",
+                                                  gdt.base, gdt.limit, idt.base, idt.limit);
+                    client->packet_pos += sprintf(&client->packet[client->packet_pos], "ldt sel=%04X base=%08X limit=%08X\ntr sel=%04X base=%08X limit=%08X\n",
+                                                  ldt.seg, ldt.base, ldt.limit, tr.seg, tr.base, tr.limit);
+                    client->packet_pos += sprintf(&client->packet[client->packet_pos], "cpu use32=%d stack32=%d cpl=%d\n",
+                                                  !!use32, !!stack32, CPL);
+                    client->response_pos = 0;
+                    gdbstub_client_respond_hex(client, (uint8_t *) client->packet, client->packet_pos);
+                    break;
                 } else if (!strcmp(p, "mb")) {
                     /* Set the mouse buttons held (bit 0 left, bit 1 right, bit 2 middle). */
                     if (!(p = strtok_r(NULL, " ", &strtok_save)) || !gdbstub_num_decode(p, &j, GDB_MODE_HEX))
@@ -1400,7 +1418,8 @@ e00:
                         "- fb - Read the frozen frame as RGB bytes\n"
                         "- kd/ku scancode - Press/release a key (hex set 1 scan code, E0xx if extended)\n"
                         "- mm dx dy [dz] - Move the mouse (decimal, relative)\n"
-                        "- mb buttons - Set the mouse buttons held (hex mask: 1 left, 2 right, 4 middle)\n");
+                        "- mb buttons - Set the mouse buttons held (hex mask: 1 left, 2 right, 4 middle)\n"
+                        "- sg - Show segment descriptor caches, descriptor tables and code/stack size\n");
                     break;
                 } else {
 unknown:
