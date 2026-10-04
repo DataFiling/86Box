@@ -37,7 +37,13 @@ async def main():
 
             async def call(name, **args):
                 res = await s.call_tool(name, args)
-                text = "\n".join(getattr(c, "text", str(c)) for c in res.content)
+                parts = []
+                for c in res.content:
+                    if getattr(c, "type", "") == "image":
+                        parts.append("[%s image, %d base64 chars]" % (c.mimeType, len(c.data)))
+                    else:
+                        parts.append(getattr(c, "text", str(c)))
+                text = "\n".join(parts)
                 print("\n>>> %s %s%s\n%s" % (name, args, "  [ERROR]" if res.isError else "", text[:1500]))
                 if res.isError:
                     failures.append(name)
@@ -74,6 +80,14 @@ async def main():
             out = await call("read_text_screen")
             expect('"mode"' in out, "text screen")
             await call("io_read", port="40", count=4)
+
+            out = await call("screenshot")
+            expect("image/png image" in out, "screenshot")
+            out = await call("screenshot", downscale=2)
+            expect("image/png image" in out, "downscaled screenshot")
+            await call("press_keys", keys="shift")  # harmless at any prompt
+            await call("mouse_move", dx=5, dy=5)
+            await call("mouse_click", button="left")
             await call("list_breakpoints")
             await call("resume")
 

@@ -78,6 +78,7 @@ class GdbClient:
     def connect(self):
         self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
         self.sock.settimeout(None)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._closed.clear()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
@@ -264,16 +265,20 @@ class GdbClient:
             raise GdbError("could not clear point at %08X: %s" % (addr, reply or "not set"))
 
     # ---- monitor commands (I/O ports, reset) ----------------------------
-    def monitor(self, command):
-        """Run a stub monitor command; returns its text output."""
+    def monitor(self, command, raw=False):
+        """Run a stub monitor command; returns its text output (bytes if raw)."""
         with self.lock:
             self._send_packet("qRcmd," + command.encode().hex())
-            text = ""
+            out = b""
             while True:
                 reply = self._get_reply()
                 if reply.startswith("O") and reply != "OK":
-                    text += bytes.fromhex(reply[1:]).decode("latin-1")
+                    out += bytes.fromhex(reply[1:])
                     continue
+                if reply.startswith("E") and len(reply) == 3:
+                    raise GdbError("monitor command %r failed (%s); is this 86Box build current?" % (command, reply))
                 if reply and reply != "OK":
-                    text += bytes.fromhex(reply).decode("latin-1")
-                return text
+                    out += bytes.fromhex(reply)
+                if out == b"Unknown command\n":
+                    raise GdbError("monitor command %r unknown to this 86Box build" % command)
+                return out if raw else out.decode("latin-1")

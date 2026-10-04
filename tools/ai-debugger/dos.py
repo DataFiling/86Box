@@ -175,7 +175,7 @@ def read_text_screen(client, include_attributes=False):
     else:
         return {"mode": mode, "text": None,
                 "note": "Video mode %02Xh is a graphics mode; text is not in memory. "
-                        "Use a screenshot once that tool is available." % mode}
+                        "Use the screenshot tool." % mode}
 
     if not (1 <= cols <= 132 and 1 <= rows <= 60):
         cols, rows = 80, 25

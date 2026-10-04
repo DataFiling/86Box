@@ -3,13 +3,14 @@
 An [MCP](https://modelcontextprotocol.io) server that lets an AI client
 (Claude Code, Claude Desktop) attach to a running 86Box and debug DOS-era
 software live. It can pause, step, set breakpoints and watchpoints, read and
-patch memory, disassemble, and read the text screen.
+patch memory, disassemble, see the screen in any video mode, and type and use
+the mouse.
 
 ```
 Claude ──MCP (stdio)──> server.py ──GDB remote protocol (TCP 12345)──> 86Box gdbstub
 ```
 
-It is step 1 of a larger plan (see [Roadmap](#roadmap)).
+It covers steps 1 and 2 of a larger plan (see [Roadmap](#roadmap)).
 
 ## 1. Build 86Box with the GDB stub
 
@@ -72,7 +73,9 @@ It was verified on an IBM PC 5150 (8088) and an AMI 486 (OPTi 495).
 | State | `get_state` (registers, CPU mode, next instructions), `set_register`, `read_stack` |
 | Memory | `read_memory` (hex/words/dwords/text), `write_memory`, `search_memory` (hex with `??` wildcards, or text), `disassemble` |
 | Break/watch | `set_breakpoint`, `set_watchpoint` (write/read/access, any length), `clear_breakpoint`, `list_breakpoints` |
-| PC/DOS | `read_text_screen` (BIOS mode, page, cursor, CP437 text), `read_interrupt_vectors`, `io_read`, `io_write` |
+| Screen | `screenshot` (PNG of the displayed frame, any video mode; optional `downscale`, `save_path`), `read_text_screen` (BIOS mode, page, cursor, CP437 text) |
+| Input | `press_keys` (`"enter"`, `"ctrl+c"`, `"up up space"`), `type_text`, `key_down`/`key_up` (hold keys), `mouse_move`, `mouse_click`, `mouse_buttons` (drag), `mouse_scroll` |
+| PC/DOS | `read_interrupt_vectors`, `io_read`, `io_write` |
 
 Addresses are `SEG:OFF` (`1234:0100`, `ds:si`, `es:di+10`, `cs:ip`) or
 linear (`B8000`, `0x12345`, `12345h`). Bare numbers are hexadecimal, as in
@@ -84,14 +87,18 @@ Example prompts:
 - "Lives are 3. Search memory for them, I'll lose a life, then narrow it down
   and set a write watchpoint to find the code that decrements lives."
 - "It hangs on the title screen. Pause it and work out what it's waiting for."
+- "Get past the setup menu by picking Sound Blaster on port 220, then show me the title screen."
 
 ## Known limitations
 
 - **Protected mode:** the stub does not expose segment bases, so `SEG:OFF`
   is only accepted in real/V86 mode. For flat DOS extenders (DOS/4GW etc.)
   use linear addresses; disassembly assumes 32-bit code in protected mode.
-- **No screenshots or keyboard/mouse input yet:** graphics-mode screens can't
-  be read, and the AI can't press keys. See the roadmap.
+- Input tools resume a paused CPU, since the guest must run to read input.
+  The keyboard uses the US layout. Mouse movement is relative (mickeys), as
+  real mice are; take a screenshot to see where the pointer went.
+- Mouse input reaches the emulated serial, PS/2 and bus mice; it has not yet
+  been checked end to end against a DOS mouse driver.
 - Watchpoints stop *after* the accessing instruction. On 8-bit-bus CPUs a
   word access reports its second byte's address.
 - Pausing 86Box from its own UI stops the stub from servicing requests, so
@@ -100,18 +107,31 @@ Example prompts:
 
 ## Emulator changes
 
-`src/mem/mem.c` and `src/gdbstub.c` were changed so that watchpoints work on
-all CPUs. Previously they were silently skipped on 8086-class CPUs (whose
-`read_mem_*`/`write_mem_*` accessors had no hook) and on 486+ CPUs whenever a
-page was in the MMU lookup cache. Watched pages are now kept out of that cache.
-This only affects builds with `-DGDBSTUB=ON`.
+All of these only take effect in builds with `-DGDBSTUB=ON`.
+
+- **Watchpoints work on all CPUs** (`src/mem/mem.c`, `src/gdbstub.c`). They
+  were silently skipped on 8086-class CPUs, whose `read_mem_*`/`write_mem_*`
+  accessors had no hook, and on 486+ CPUs whenever a page was in the MMU lookup
+  cache. Watched pages are now kept out of that cache.
+- **New stub monitor commands** (`monitor help` in GDB lists them):
+  `fi`/`fb` freeze and stream the last displayed frame, `kd`/`ku` press and
+  release keys by scan code, and `mm`/`mb` move the mouse and set its buttons.
+  `src/video/video.c` hands each completed frame to the stub, which copies it
+  only while a client is connected.
+- **Injected mouse input is delivered without a host mouse grab.** Serial,
+  PS/2 and bus mice only accept input while the host mouse is captured; a
+  `mouse_injected` flag, set by `mm`/`mb` and cleared when the debugger
+  disconnects, lets it through without grabbing the user's real mouse.
+- **`TCP_NODELAY` on stub connections.** Replies are sent in small pieces,
+  which Nagle's algorithm held back for ~85 ms each; requests now take ~1 ms.
 
 ## Roadmap
 
-1. **Bridge (this).** Execution control, memory, breakpoints, watchpoints, text screen.
-2. **Emulator-side additions to the stub's monitor commands:** screenshots
-   (graphics modes), keyboard/mouse injection, segment bases/descriptors for
-   protected mode, `INT xx` call tracing, and save/restore of machine state.
+1. **Bridge (done).** Execution control, memory, breakpoints, watchpoints, text screen.
+2. **Screen and input (done):** screenshots in any video mode, keyboard and
+   mouse. Next: a real-game test setup (FreeDOS plus freeware games).
+   Later: segment bases/descriptors for protected mode, `INT xx` call
+   tracing, and save/restore of machine state.
 3. **DOS awareness:** find the running program (PSP, MCB chain, load
    segment), break on program start, named `INT 21h` call logs, and memory
    diffing for finding variables (lives, score, timers).

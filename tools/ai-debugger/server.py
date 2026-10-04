@@ -11,9 +11,10 @@ import threading
 import time
 
 import anyio
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 
 import dos
+import pcinput
 from gdb_rsp import (BP_HARDWARE, WP_ACCESS, WP_READ, WP_WRITE, GdbClient, GdbError)
 
 INSTRUCTIONS = """\
@@ -30,6 +31,10 @@ get_state -> disassemble / read_memory -> set breakpoints/watchpoints -> resume.
 Find a variable (e.g. lives) by search_memory for its value, change it in game,
 search again, then set_watchpoint on the surviving address to find the code
 that modifies it.
+
+`screenshot` shows the emulated display (any video mode). Keyboard and mouse
+tools (press_keys, type_text, key_down/key_up, mouse_*) resume the CPU if it
+is paused, since the guest has to run to receive input; they leave it running.
 """
 
 mcp = FastMCP("86box-debugger", instructions=INSTRUCTIONS)
@@ -429,6 +434,136 @@ def io_write(port: str, value: str, width: str = "b") -> str:
     """Write a value (hex) to an I/O port. width: b, w or l."""
     out = client().monitor("o%s %s %s" % (width, port, value)).strip()
     return out or "OK"
+
+
+# ---- screen / input ---------------------------------------------------------
+
+@tool
+def screenshot(downscale: int = 1, save_path: str = "") -> list:
+    """Capture the emulated display as a PNG (the last completed frame).
+
+    downscale: integer factor to shrink large frames (2 halves each side).
+    save_path: optionally also write the PNG to this host path."""
+    w, h, seq, rgb = pcinput.grab_frame(client())
+    if not w:
+        return ["No frame has been displayed since the debugger connected; resume the guest briefly first."]
+    w, h, rgb = pcinput.downscale(w, h, rgb, max(1, min(downscale, 8)))
+    png = pcinput.encode_png(w, h, rgb)
+    if save_path:
+        with open(save_path, "wb") as f:
+            f.write(png)
+    note = "%dx%d frame #%d%s" % (w, h, seq, (" saved to " + save_path) if save_path else "")
+    if client().running:
+        note += " (guest running; frame is from the moment of capture)"
+    return [note, Image(data=png, format="png")]
+
+
+def _ensure_running():
+    c = client()
+    if not c.running:
+        c.resume()
+        return " (CPU was paused; resumed it so the guest receives input)"
+    return ""
+
+
+@tool
+def press_keys(keys: str, hold_ms: int = 80, gap_ms: int = 60) -> str:
+    """Press keys or chords in sequence, e.g. "enter", "ctrl+c", "alt+f x", "up up right space".
+
+    Separate presses with spaces; join simultaneous keys with "+". Key names:
+    a-z 0-9 f1-f12 esc enter space tab backspace up down left right home end
+    pageup pagedown insert delete shift ctrl alt rshift rctrl ralt capslock
+    numlock scrolllock kp0-kp9 kp+ kp- kp* kp/ kp. kpenter and punctuation."""
+    c = client()
+    combos = [pcinput.parse_combo(k) for k in keys.split()]
+    note = _ensure_running()
+    for scans in combos:
+        pcinput.press_combo(c, scans, hold_ms / 1000.0)
+        time.sleep(gap_ms / 1000.0)
+    return "Pressed %d key(s)%s." % (len(combos), note)
+
+
+@tool
+def type_text(text: str, delay_ms: int = 60) -> str:
+    """Type text as keystrokes (US layout). Use "\n" for Enter, e.g. "dir\n"."""
+    c = client()
+    plan = [pcinput.char_keys(ch) for ch in text]
+    note = _ensure_running()
+    shift = pcinput.KEYS["shift"]
+    for needs_shift, scan in plan:
+        pcinput.press_combo(c, [shift, scan] if needs_shift else [scan], delay_ms / 2000.0)
+        time.sleep(delay_ms / 2000.0)
+    return "Typed %d character(s)%s." % (len(plan), note)
+
+
+@tool
+def key_down(key: str) -> str:
+    """Hold a key down (e.g. to keep moving in a game) until key_up. Chords with "+" allowed."""
+    c = client()
+    scans = pcinput.parse_combo(key)
+    note = _ensure_running()
+    for s in scans:
+        pcinput.key_event(c, s, True)
+    return "Holding %s%s." % (key, note)
+
+
+@tool
+def key_up(key: str) -> str:
+    """Release a key (or "+"-joined keys) held with key_down."""
+    c = client()
+    for s in reversed(pcinput.parse_combo(key)):
+        pcinput.key_event(c, s, False)
+    return "Released %s." % key
+
+
+@tool
+def mouse_move(dx: int, dy: int) -> str:
+    """Move the mouse by a relative amount in mickeys (positive dy is down).
+
+    Guest drivers scale this; take a screenshot to see where the pointer went."""
+    c = client()
+    note = _ensure_running()
+    # Large jumps are split so drivers that clamp per-sample deltas keep up.
+    steps = max(1, (max(abs(dx), abs(dy)) + 63) // 64)
+    sent_x = sent_y = 0
+    for i in range(1, steps + 1):
+        nx, ny = dx * i // steps, dy * i // steps
+        pcinput.mouse_move(c, nx - sent_x, ny - sent_y)
+        sent_x, sent_y = nx, ny
+        time.sleep(0.02)
+    return "Moved mouse by (%d, %d)%s." % (dx, dy, note)
+
+
+@tool
+def mouse_click(button: str = "left", double: bool = False, hold_ms: int = 80) -> str:
+    """Click a mouse button: left, right or middle."""
+    c = client()
+    mask = pcinput.BUTTONS[button.lower()]
+    note = _ensure_running()
+    for _ in range(2 if double else 1):
+        pcinput.mouse_buttons(c, mask)
+        time.sleep(hold_ms / 1000.0)
+        pcinput.mouse_buttons(c, 0)
+        time.sleep(0.08)
+    return "%s-clicked%s%s." % (button, " twice" if double else "", note)
+
+
+@tool
+def mouse_buttons(left: bool = False, right: bool = False, middle: bool = False) -> str:
+    """Set which mouse buttons are held (for dragging: press, mouse_move, release)."""
+    c = client()
+    note = _ensure_running()
+    pcinput.mouse_buttons(c, (1 if left else 0) | (2 if right else 0) | (4 if middle else 0))
+    return "Buttons now: left=%s right=%s middle=%s%s." % (left, right, middle, note)
+
+
+@tool
+def mouse_scroll(clicks: int) -> str:
+    """Turn the mouse wheel (needs a wheel mouse and driver in the guest); negative is up."""
+    c = client()
+    note = _ensure_running()
+    pcinput.mouse_move(c, 0, 0, clicks)
+    return "Scrolled %d%s." % (clicks, note)
 
 
 if __name__ == "__main__":
