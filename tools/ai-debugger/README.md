@@ -66,10 +66,33 @@ python3 tools/ai-debugger/smoke_test.py --protected-mode   # 386+ machines: also
 
 `--protected-mode` loads `testdata/pm_probe.bin` (source alongside), which
 switches to protected mode and loops through 32-bit and 16-bit code segments,
-then hard-resets the machine at the end. It was verified on an IBM PC 5150
-(8088) and an AMI 486 (OPTi 495).
+then hard-resets the machine at the end. The basic test was verified on an
+IBM PC 5150 (8088) and an AMI 486 (OPTi 495); the protected-mode part on the
+486.
+
+For testing on real DOS software, [testdata/](testdata/README.md) builds a
+FreeDOS boot floppy with test games that have planted bugs, and configs for
+386, 486 and Pentium machines.
 
 See [DEVLOG.md](DEVLOG.md) for design decisions, test results and next steps.
+
+## Without an MCP client
+
+`run_tool.py` runs one tool per command, for scripts, shells and AI agents
+that don't speak MCP:
+
+```sh
+python3 tools/ai-debugger/run_tool.py --port 12345 get_state
+python3 tools/ai-debugger/run_tool.py read_memory address=ds:0026 length=16
+python3 tools/ai-debugger/run_tool.py press_keys keys="up up space"
+python3 tools/ai-debugger/run_tool.py screenshot      # prints the PNG's path
+```
+
+Values are JSON when they parse as JSON, else strings. Each command connects
+for just that call and asks the stub to *hold*: a CPU left paused stays
+paused between commands (and keeps its breakpoints), while one left running
+keeps running. The bridge's modules (`gdb_rsp.py`, `dos.py`, `pcinput.py`)
+can also be imported directly from Python.
 
 ## Tools
 
@@ -107,8 +130,10 @@ Example prompts:
   (virtual ones when paging is on), so one set on a selector whose base later
   changes stays at the old place. The bridge doesn't yet know about DOS
   extenders themselves (where the program was loaded, its DPMI calls).
-- With the stub enabled, 86Box runs the CPU interpreter only; Pentium-era
-  games may run slowly. Measured in the next step.
+- With the stub enabled, 86Box runs the CPU interpreter only. That still
+  keeps real time for a Pentium MMX 200 under a CPU-bound load on a modern
+  host (measurements in [testdata/README.md](testdata/README.md)); faster
+  emulated CPUs may fall behind.
 - Input tools resume a paused CPU, since the guest must run to read input.
   The keyboard uses the US layout. Mouse movement is relative (mickeys), as
   real mice are; take a screenshot to see where the pointer went.
@@ -130,9 +155,15 @@ All of these only take effect in builds with `-DGDBSTUB=ON`.
   cache. Watched pages are now kept out of that cache.
 - **New stub monitor commands** (`monitor help` in GDB lists them):
   `fi`/`fb` freeze and stream the last displayed frame, `kd`/`ku` press and
-  release keys by scan code, and `mm`/`mb` move the mouse and set its buttons.
-  `src/video/video.c` hands each completed frame to the stub, which copies it
-  only while a client is connected.
+  release keys by scan code (`keyboard_input_injected()`, which works even
+  when the keyboard requires capture), `mm`/`mb` move the mouse, turn the
+  wheel (`mouse_wheel_clicks()`) and set its buttons, `bl` lists breakpoints
+  and watchpoints, and `hold` keeps a paused CPU paused, with its
+  breakpoints, when the last client disconnects. `src/video/video.c` hands
+  each completed frame to the stub, which keeps a copy.
+- **Clean disconnects.** When the last client leaves (and isn't holding),
+  its breakpoints and watchpoints are removed so the guest can't stop with
+  nobody attached; injected keys and mouse buttons are always released.
 - **Injected mouse input is delivered without a host mouse grab.** Serial,
   PS/2 and bus mice only accept input while the host mouse is captured; a
   `mouse_injected` flag, set by `mm`/`mb` and cleared when the debugger
@@ -142,6 +173,13 @@ All of these only take effect in builds with `-DGDBSTUB=ON`.
 - **`sg` monitor command** reports the segment descriptor caches (selector,
   base, limit, access, flags), GDTR, IDTR, LDTR, TR, and the CPU's current
   code/stack size and CPL, which the GDB register packets don't carry.
+- **Fixes to existing stub behaviour** found by review: memory reads that hit
+  a page fault returned corrupt replies and writes reported success (reads
+  now return the bytes before the fault, writes an error), debugger accesses
+  overwrote the guest's CR2, watch addresses at or above 2 GiB indexed out of
+  bounds, a quick reconnect could have its new connection closed (descriptor
+  reuse race), and sends to a departed client could raise SIGPIPE. 8086-class
+  instruction fetches no longer trigger read watchpoints.
 
 ## Roadmap
 
@@ -149,14 +187,14 @@ All of these only take effect in builds with `-DGDBSTUB=ON`.
 2. **Screen and input (done):** screenshots in any video mode, keyboard and mouse.
 3. **Protected-mode basics (done):** segment bases, selector lookup, 16/32-bit
    code and stack, descriptor tables.
-4. **Test setup across three eras:** FreeDOS on a 286/386 (early real mode),
-   a 486 (DOS-extender games) and a Pentium machine, one freeware or shareware
-   game each, an automated boot-and-play check, and a speed measurement on the
-   Pentium machine.
+4. **Test setup across three eras (done):** FreeDOS on 386, 486 and Pentium
+   machines with test games that have planted bugs, AI debugging exercises
+   graded against ground truth, and a speed measurement.
 5. **DOS and extender awareness:** find the running program (PSP, MCB chain,
    load address), break on program start, named `INT 21h`/`INT 31h` call
    logs, memory diffing for finding variables, and save/restore of machine state.
-6. **Speed for Pentium-era games, if step 4 shows it's needed:** let the
-   dynamic recompiler run while no breakpoints, watchpoints or stepping are active.
+6. **Speed:** not needed for Pentium-era games (the interpreter keeps real
+   time at Pentium MMX 200). If later targets need it: let the dynamic
+   recompiler run while no breakpoints, watchpoints or stepping are active.
 7. **Autonomous loop:** an agent that plays/boots a game, detects hangs and
    crashes (stuck loops, invalid opcodes, exceptions), and diagnoses them.
