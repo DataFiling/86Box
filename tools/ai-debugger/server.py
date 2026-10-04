@@ -1,0 +1,435 @@
+"""MCP server exposing a running 86Box (built with -DGDBSTUB=ON) as debugger
+tools for an AI client such as Claude Code or Claude Desktop.
+
+Run:  python3 server.py           (stdio transport)
+Env:  BOX86_GDB_HOST (default 127.0.0.1), BOX86_GDB_PORT (default 12345)
+"""
+
+import functools
+import os
+import threading
+import time
+
+import anyio
+from mcp.server.fastmcp import FastMCP
+
+import dos
+from gdb_rsp import (BP_HARDWARE, WP_ACCESS, WP_READ, WP_WRITE, GdbClient, GdbError)
+
+INSTRUCTIONS = """\
+Tools for live-debugging DOS-era software running inside the 86Box PC emulator.
+
+Addresses: "SEG:OFF" (e.g. "1234:0100", "ds:si", "es:di+10", "cs:ip") in real/V86
+mode, or linear addresses ("B8000", "0x12345", "12345h"). Bare numbers are HEX,
+as in DEBUG.COM. All breakpoints/watchpoints are on linear addresses.
+
+The emulator starts PAUSED when the debugger is enabled: call `resume` to boot it.
+Most inspection tools work while the guest is running, but registers are only
+meaningful when paused. Typical loop: resume -> run_for / wait_for_stop ->
+get_state -> disassemble / read_memory -> set breakpoints/watchpoints -> resume.
+Find a variable (e.g. lives) by search_memory for its value, change it in game,
+search again, then set_watchpoint on the surviving address to find the code
+that modifies it.
+"""
+
+mcp = FastMCP("86box-debugger", instructions=INSTRUCTIONS)
+
+_client = None
+_client_lock = threading.Lock()
+_points = {}  # (kind, linear) -> {"kind":..., "address":..., "length":..., "expr":...}
+
+KIND_NAMES = {BP_HARDWARE: "breakpoint", WP_WRITE: "write-watch", WP_READ: "read-watch",
+              WP_ACCESS: "access-watch"}
+
+
+def client():
+    global _client
+    with _client_lock:
+        if _client is None or not _client.connected:
+            host = os.environ.get("BOX86_GDB_HOST", "127.0.0.1")
+            port = int(os.environ.get("BOX86_GDB_PORT", "12345"))
+            c = GdbClient(host, port)
+            try:
+                c.connect()
+            except OSError as e:
+                raise GdbError(
+                    "Cannot reach the 86Box GDB stub at %s:%d (%s). Start 86Box built with "
+                    "-DGDBSTUB=ON; the port is set by gdbstub_port in 86box.cfg." % (host, port, e))
+            _client = c
+            _points.clear()
+        return _client
+
+
+def tool(fn):
+    """Register a blocking function as an MCP tool, run off the event loop."""
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        return await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
+
+    return mcp.tool()(wrapper)
+
+
+# ---- helpers ------------------------------------------------------------
+
+def _regs():
+    return client().read_registers()
+
+
+def _bits(regs, bits):
+    if bits in (16, 32):
+        return bits
+    return 16 if dos.segmented(regs) else 32
+
+
+def _code_at(regs, linear, count, bits=None):
+    c = client()
+    data = c.read_memory(linear, count * 15)
+    seg = regs["cs"] if (dos.segmented(regs) and 0 <= linear - regs["cs"] * 16 < 0x10000) else None
+    return dos.disassemble(data, linear, _bits(regs, bits), seg, count)
+
+
+def _state_report(stop=None, code_lines=6):
+    c = client()
+    regs = _regs()
+    parts = []
+    if stop is not None:
+        why = {"breakpoint": "hit breakpoint", "watchpoint": "watchpoint triggered",
+               "pause": "paused", "trap": "stopped (single step)"}.get(stop.reason, stop.reason)
+        if stop.reason == "watchpoint":
+            why += " (%s access at linear %08X)" % (stop.watch_kind, stop.watch_addr)
+        parts.append("STOP: " + why)
+    parts.append(dos.format_registers(regs))
+    parts.append("Next instructions:\n" + _code_at(regs, regs["eip"], code_lines))
+    if c.running:
+        parts.insert(0, "NOTE: CPU is running; register values are a moving snapshot.")
+    return "\n\n".join(parts)
+
+
+# ---- connection / execution control ---------------------------------------
+
+@tool
+def status() -> str:
+    """Connect if needed and report whether the CPU is running, plus current state."""
+    c = client()
+    return ("CPU is RUNNING" if c.running else "CPU is PAUSED") + "\n\n" + _state_report()
+
+
+@tool
+def pause() -> str:
+    """Pause the emulated CPU and show registers and the next instructions."""
+    c = client()
+    if not c.running:
+        return "Already paused.\n\n" + _state_report()
+    stop = c.pause()
+    return _state_report(stop)
+
+
+@tool
+def resume() -> str:
+    """Resume execution and return immediately. Use wait_for_stop or run_for afterwards."""
+    c = client()
+    c.resume()
+    return "Resumed."
+
+
+@tool
+def run_for(seconds: float = 2.0) -> str:
+    """Resume, let the guest run for up to `seconds` of host time, then pause.
+
+    Returns early if a breakpoint or watchpoint is hit."""
+    c = client()
+    if not c.running:
+        c.resume()
+    stop = c.wait_stop(timeout=seconds)
+    if stop is None:
+        stop = c.pause()
+        return "Ran for %.1fs without hitting a breakpoint.\n\n%s" % (seconds, _state_report(stop))
+    return _state_report(stop)
+
+
+@tool
+def wait_for_stop(timeout_seconds: float = 30.0) -> str:
+    """Wait (while running) until a breakpoint/watchpoint hits. Does not pause on timeout."""
+    c = client()
+    if not c.running:
+        return "CPU is not running.\n\n" + _state_report()
+    stop = c.wait_stop(timeout=timeout_seconds)
+    if stop is None:
+        return "No stop within %.1fs; CPU still running." % timeout_seconds
+    return _state_report(stop)
+
+
+@tool
+def step(count: int = 1) -> str:
+    """Single-step `count` instructions (max 1000), following calls and interrupts."""
+    c = client()
+    if c.running:
+        c.pause()
+    count = max(1, min(count, 1000))
+    trace = []
+    stop = None
+    for _ in range(count):
+        if count > 1:
+            regs = _regs()
+            trace.append(_code_at(regs, regs["eip"], 1))
+        stop = c.step()
+        if stop is None:
+            return "Step timed out (is the emulator paused from its own UI?)"
+    out = _state_report(stop)
+    if trace:
+        out = "Executed:\n" + "\n".join(trace[-50:]) + "\n\n" + out
+    return out
+
+
+@tool
+def step_over(timeout_seconds: float = 10.0) -> str:
+    """Execute one instruction, running CALL/INT/LOOP/REP to completion instead of stepping into them."""
+    c = client()
+    if c.running:
+        c.pause()
+    regs = _regs()
+    bits = _bits(regs, None)
+    data = c.read_memory(regs["eip"], 15)
+    insn = None
+    if dos.capstone is not None:
+        md = dos.capstone.Cs(dos.capstone.CS_ARCH_X86,
+                             dos.capstone.CS_MODE_16 if bits == 16 else dos.capstone.CS_MODE_32)
+        insn = next(md.disasm(data, 0), None)
+    over = insn is not None and (insn.mnemonic.startswith(("call", "int", "loop")) or
+                                 insn.mnemonic.split(" ")[0] in ("rep", "repe", "repne", "repz", "repnz"))
+    if not over:
+        return _state_report(c.step())
+    target = regs["eip"] + insn.size
+    return _run_to(target, timeout_seconds)
+
+
+def _run_to(linear, timeout):
+    c = client()
+    temp = (BP_HARDWARE, linear) not in _points
+    if temp:
+        c.set_point(BP_HARDWARE, linear)
+    try:
+        c.resume()
+        stop = c.wait_stop(timeout=timeout)
+        if stop is None:
+            stop = c.pause()
+            return "Target %08X not reached within %.1fs; paused.\n\n%s" % (linear, timeout, _state_report(stop))
+        return _state_report(stop)
+    finally:
+        if temp:
+            c.clear_point(BP_HARDWARE, linear)
+
+
+@tool
+def run_until(address: str, timeout_seconds: float = 30.0) -> str:
+    """Resume until execution reaches `address` (temporary breakpoint), or pause on timeout."""
+    c = client()
+    if c.running:
+        c.pause()
+    return _run_to(dos.parse_address(address, _regs()), timeout_seconds)
+
+
+@tool
+def hard_reset() -> str:
+    """Hard-reset the emulated machine (like pressing the reset button)."""
+    client().monitor("r")
+    return "Machine reset."
+
+
+# ---- registers / memory -----------------------------------------------------
+
+@tool
+def get_state(instructions: int = 8) -> str:
+    """Show registers, CPU mode and the next instructions at CS:IP."""
+    return _state_report(code_lines=max(1, min(instructions, 50)))
+
+
+@tool
+def set_register(name: str, value: str) -> str:
+    """Set a register (eax..edi, eip, eflags, cs, ss, ds, es, fs, gs). Value is hex.
+
+    Note: eip is LINEAR in this stub; to change IP in real mode pass CS*16+IP."""
+    c = client()
+    if c.running:
+        return "Pause the CPU first."
+    regs = _regs()
+    c.write_register(name.lower(), dos.parse_term(value, regs))
+    return _state_report()
+
+
+@tool
+def read_memory(address: str, length: int = 128, format: str = "hex") -> str:
+    """Read guest memory. format: hex (dump), words, dwords, text (CP437)."""
+    c = client()
+    regs = _regs()
+    linear = dos.parse_address(address, regs)
+    length = max(1, min(length, 65536))
+    data = c.read_memory(linear, length)
+    seg = None
+    if ":" in address and dos.segmented(regs):
+        seg = dos.parse_term(address.split(":", 1)[0], regs)
+    if format == "text":
+        return data.decode("cp437", errors="replace")
+    if format in ("words", "dwords"):
+        w = 2 if format == "words" else 4
+        vals = [int.from_bytes(data[i:i + w], "little") for i in range(0, len(data) - w + 1, w)]
+        fmt = "%04X" if w == 2 else "%08X"
+        return "\n".join("%08X: " % (linear + i * 16) + " ".join(fmt % v for v in vals[i * 16 // w:(i + 1) * 16 // w])
+                         for i in range((len(vals) * w + 15) // 16))
+    return dos.hexdump(data, linear, seg)
+
+
+@tool
+def write_memory(address: str, hex_bytes: str) -> str:
+    """Write bytes (hex string, e.g. "90 90" or "EB05") to guest memory."""
+    c = client()
+    linear = dos.parse_address(address, _regs())
+    data = bytes.fromhex(hex_bytes.replace(" ", ""))
+    c.write_memory(linear, data)
+    return "Wrote %d bytes at linear %08X." % (len(data), linear)
+
+
+@tool
+def search_memory(pattern: str, start: str = "0", end: str = "110000", as_text: bool = False,
+                  max_results: int = 64) -> str:
+    """Search guest memory for a byte pattern (hex, "??" wildcard) or text.
+
+    Default range covers the first 1MB + HMA, i.e. all real-mode memory."""
+    c = client()
+    regs = _regs()
+    lo, hi = dos.parse_address(start, regs), dos.parse_address(end, regs)
+    if as_text:
+        needle = [b for b in pattern.encode("cp437")]
+    else:
+        toks = pattern.replace(",", " ").split()
+        if len(toks) == 1 and len(toks[0]) > 2:
+            toks = [toks[0][i:i + 2] for i in range(0, len(toks[0]), 2)]
+        needle = [None if t in ("??", "?") else int(t, 16) for t in toks]
+    if not needle:
+        return "Empty pattern."
+    hits = []
+    block = 0x10000
+    overlap = len(needle) - 1
+    addr = lo
+    while addr < hi and len(hits) < max_results:
+        n = min(block + overlap, hi - addr)
+        data = c.read_memory(addr, n)
+        for i in range(0, len(data) - len(needle) + 1):
+            if all(b is None or data[i + j] == b for j, b in enumerate(needle)):
+                hits.append(addr + i)
+                if len(hits) >= max_results:
+                    break
+        addr += block
+    if not hits:
+        return "No matches."
+    seg_note = lambda a: " (%04X:%04X)" % (a >> 4, a & 0xF) if a < 0x110000 else ""
+    return "%d match(es):\n" % len(hits) + "\n".join("%08X%s" % (h, seg_note(h)) for h in hits)
+
+
+@tool
+def disassemble(address: str = "cs:ip", count: int = 20, bits: int = 0) -> str:
+    """Disassemble `count` instructions at `address`. bits: 16, 32 or 0 for auto (by CPU mode)."""
+    regs = _regs()
+    linear = dos.parse_address(address, regs)
+    count = max(1, min(count, 200))
+    c = client()
+    data = c.read_memory(linear, count * 15)
+    seg = None
+    if ":" in address and dos.segmented(regs):
+        seg = dos.parse_term(address.split(":", 1)[0], regs)
+    return dos.disassemble(data, linear, _bits(regs, bits or None), seg, count)
+
+
+@tool
+def read_stack(entries: int = 16) -> str:
+    """Show the top of the stack at SS:SP as 16-bit words (32-bit in protected mode)."""
+    regs = _regs()
+    if dos.segmented(regs):
+        sp = regs["esp"] & 0xFFFF
+        linear = regs["ss"] * 16 + sp
+        data = client().read_memory(linear, entries * 2)
+        return "\n".join("%04X:%04X  %04X" % (regs["ss"], (sp + i * 2) & 0xFFFF,
+                                               int.from_bytes(data[i * 2:i * 2 + 2], "little"))
+                         for i in range(entries))
+    data = client().read_memory(regs["esp"], entries * 4)
+    return "\n".join("%08X  %08X" % (regs["esp"] + i * 4, int.from_bytes(data[i * 4:i * 4 + 4], "little"))
+                     for i in range(entries))
+
+
+# ---- breakpoints / watchpoints ----------------------------------------------
+
+@tool
+def set_breakpoint(address: str) -> str:
+    """Set an execution breakpoint (hardware-style; works in ROM and does not modify memory)."""
+    c = client()
+    linear = dos.parse_address(address, _regs())
+    c.set_point(BP_HARDWARE, linear)
+    _points[(BP_HARDWARE, linear)] = {"kind": BP_HARDWARE, "address": linear, "length": 1, "expr": address}
+    return "Breakpoint set at linear %08X (%s)." % (linear, address)
+
+
+@tool
+def set_watchpoint(address: str, length: int = 1, kind: str = "write") -> str:
+    """Stop when memory in [address, address+length) is accessed. kind: write, read or access."""
+    c = client()
+    k = {"write": WP_WRITE, "read": WP_READ, "access": WP_ACCESS}[kind]
+    linear = dos.parse_address(address, _regs())
+    c.set_point(k, linear, max(1, length))
+    _points[(k, linear)] = {"kind": k, "address": linear, "length": max(1, length), "expr": address}
+    return "%s watchpoint on %08X..%08X (%s)." % (kind.capitalize(), linear, linear + length - 1, address)
+
+
+@tool
+def clear_breakpoint(address: str = "all") -> str:
+    """Remove the breakpoint/watchpoints at `address`, or every one with "all"."""
+    c = client()
+    if address == "all":
+        targets = list(_points)
+    else:
+        linear = dos.parse_address(address, _regs())
+        targets = [key for key in _points if key[1] == linear]
+    for key in targets:
+        p = _points.pop(key)
+        c.clear_point(p["kind"], p["address"], p["length"])
+    return "Removed %d point(s)." % len(targets)
+
+
+@tool
+def list_breakpoints() -> str:
+    """List breakpoints and watchpoints set through this server."""
+    if not _points:
+        return "None."
+    return "\n".join("%-12s %08X len=%d  (%s)" % (KIND_NAMES[p["kind"]], p["address"], p["length"], p["expr"])
+                     for p in _points.values())
+
+
+# ---- PC / DOS views ---------------------------------------------------------
+
+@tool
+def read_text_screen(include_attributes: bool = False) -> dict:
+    """Read the current text-mode screen (from the BIOS video mode and video RAM)."""
+    return dos.read_text_screen(client(), include_attributes)
+
+
+@tool
+def read_interrupt_vectors(first: str = "0", count: int = 48) -> str:
+    """Show real-mode interrupt vectors (e.g. first="21", count=1 for the DOS handler)."""
+    return dos.read_ivt(client(), dos.parse_number(first), max(1, min(count, 256)))
+
+
+@tool
+def io_read(port: str, count: int = 1, width: str = "b") -> str:
+    """Read I/O port(s). width: b, w or l. Reading may have side effects on real hardware registers."""
+    return client().monitor("i%s %s %d" % (width, port, count)).strip()
+
+
+@tool
+def io_write(port: str, value: str, width: str = "b") -> str:
+    """Write a value (hex) to an I/O port. width: b, w or l."""
+    out = client().monitor("o%s %s %s" % (width, port, value)).strip()
+    return out or "OK"
+
+
+if __name__ == "__main__":
+    mcp.run()
