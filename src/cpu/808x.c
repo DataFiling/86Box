@@ -2856,7 +2856,11 @@ execx86_instruction(void)
                 break;
             case 0xcd:             /* INT */
                 wait_cycs(1, 0);
-                interrupt(pfq_fetchb());
+                temp = pfq_fetchb();
+#ifdef USE_GDBSTUB
+                gdbstub_int(temp, 0);
+#endif
+                interrupt(temp);
                 break;
             case 0xce:             /* INTO */
                 wait_cycs(3, 0);

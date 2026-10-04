@@ -3623,6 +3623,9 @@ execute_instruction(void)
             /* read_operand8() */
             temp = biu_pfq_fetchb();
             do_cycle_i();
+#ifdef USE_GDBSTUB
+            gdbstub_int(temp, 0);
+#endif
             sw_int(temp);
             jump = 1;
             break;
