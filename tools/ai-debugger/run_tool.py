@@ -19,6 +19,8 @@ import asyncio
 import inspect
 import json
 import os
+import re
+import signal
 import sys
 import tempfile
 import time
@@ -28,10 +30,13 @@ sys.path.insert(0, HERE)
 
 
 def parse_value(text):
+    """JSON when it parses ("5", "true", "\"x\""), otherwise the string with
+    \\n, \\t and \\\\ escapes turned into newline, tab and backslash (so
+    text="DIR\\n" types Enter, as it would through MCP)."""
     try:
         return json.loads(text)
     except ValueError:
-        return text
+        return re.sub(r"\\([nt\\])", lambda m: {"n": "\n", "t": "\t", "\\": "\\"}[m.group(1)], text)
 
 
 def coerce(fn, kwargs):
@@ -44,9 +49,18 @@ def coerce(fn, kwargs):
         ann = sig.parameters[k].annotation
         if ann is str and not isinstance(v, str):
             v = json.dumps(v) if isinstance(v, bool) else str(v)
+        elif ann is int and isinstance(v, str):
+            try:
+                v = int(v, 0)  # "0xB0" or "176"
+            except ValueError:
+                raise SystemExit("%s=%r: expected an integer (decimal, or hex with 0x)" % (k, v))
         elif ann is float and isinstance(v, int) and not isinstance(v, bool):
             v = float(v)
         out[k] = v
+    missing = [n for n, prm in sig.parameters.items() if prm.default is inspect.Parameter.empty and n not in out]
+    if missing:
+        raise SystemExit("%s needs %s; parameters: %s" % (fn.__name__, ", ".join("%s=..." % m for m in missing),
+                                                         ", ".join(sig.parameters)))
     return out
 
 
@@ -75,6 +89,8 @@ async def call(tool_name, kwargs, image_dir):
 
 
 def main():
+    if hasattr(signal, "SIGPIPE"):  # exit quietly when piped into head and the like
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", type=int, default=int(os.environ.get("BOX86_GDB_PORT", "12345")))
     ap.add_argument("--host", default=os.environ.get("BOX86_GDB_HOST", "127.0.0.1"))

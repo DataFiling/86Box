@@ -35,6 +35,12 @@ class GdbError(Exception):
 class StopEvent:
     """A parsed stop reply such as T05hwbreak:;0:...;"""
 
+    def describe(self):
+        if self.reason == "watchpoint":
+            return "watchpoint triggered (%s access at linear %08X)" % (self.watch_kind, self.watch_addr)
+        return {"breakpoint": "hit breakpoint", "pause": "paused",
+                "trap": "stopped (single step)"}.get(self.reason, self.reason)
+
     def __init__(self, packet):
         self.raw = packet
         self.signal = int(packet[1:3], 16) if packet[:1] in "TS" else None
@@ -83,8 +89,33 @@ class GdbClient:
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
         self.request("qSupported:swbreak+;hwbreak+")
-        # The stub pauses the CPU when it starts; reflect that.
+        # The stub pauses the CPU when a client connects, unless an earlier
+        # client asked it to hold the run state across connections.
         self.running = False
+        if self.query_running():
+            self.resume()  # re-arms stop reporting for this connection
+        else:
+            self.last_stop = self.query_stop()
+
+    def query_running(self):
+        """Whether the CPU is running (False on builds without "state")."""
+        try:
+            return self.monitor("state").split() == ["running", "1"]
+        except GdbError as e:
+            if "unknown" in str(e):
+                return False
+            raise
+
+    def query_stop(self):
+        """Why the CPU is stopped, as a StopEvent, or None if the stub doesn't say."""
+        with self.lock:
+            self._expect_stop_reply = True
+            try:
+                self._send_packet("?")
+                reply = self._get_reply()
+            finally:
+                self._expect_stop_reply = False
+        return StopEvent(reply) if reply[:1] in ("T", "S") else None
 
     def close(self):
         if self.sock:

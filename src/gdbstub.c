@@ -376,6 +376,9 @@ static int       frame_snap_len;
    between commands. */
 static int hold_on_disconnect;
 
+/* Whether the CPU was stopped at the end of the last time slice. */
+static int was_stopped;
+
 /* Set by the client thread when the last client leaves; acted on by the
    emulation thread, which owns the breakpoint lists and input state. */
 static volatile int cleanup_pending;
@@ -1343,6 +1346,12 @@ e00:
                         FAST_RESPONSE("OK");
                     }
                     break;
+                } else if (!strcmp(p, "state")) {
+                    /* Report whether the CPU is running, for clients that connect while holding. */
+                    client->packet_pos   = sprintf(client->packet, "running %d\n", gdbstub_step == GDBSTUB_EXEC);
+                    client->response_pos = 0;
+                    gdbstub_client_respond_hex(client, (uint8_t *) client->packet, client->packet_pos);
+                    break;
                 } else if (!strcmp(p, "hold")) {
                     /* Set or show whether a paused CPU stays paused after the last client leaves. */
                     if ((p = strtok_r(NULL, " ", &strtok_save))) {
@@ -1482,7 +1491,9 @@ e00:
                         "- mm dx dy [dz] - Move the mouse (decimal, relative)\n"
                         "- mb buttons - Set the mouse buttons held (hex mask: 1 left, 2 right, 4 middle)\n"
                         "- sg - Show segment descriptor caches, descriptor tables and code/stack size\n"
-                        "- hold [0|1] - Keep a paused CPU paused, and breakpoints set, when the last client disconnects\n"
+                        "- hold [0|1] - Keep the CPU's run state and breakpoints when the last client disconnects,\n"
+                        "  and don't pause it when the next one connects\n"
+                        "- state - Show whether the CPU is running\n"
                         "- bl - List breakpoints and watchpoints: {Z type} {address} {length}\n");
                     break;
                 } else {
@@ -1671,7 +1682,8 @@ gdbstub_cpu_exec(int32_t cycs)
     }
 
     /* Handle CPU execution if it isn't paused. */
-    if (gdbstub_step <= GDBSTUB_SSTEP) {
+    int ran = (gdbstub_step <= GDBSTUB_SSTEP);
+    if (ran) {
         /* Swap in any software breakpoints. */
         gdbstub_breakpoint_t *swbreak = first_swbreak;
         while (swbreak) {
@@ -1697,9 +1709,17 @@ gdbstub_cpu_exec(int32_t cycs)
         }
     }
 
-    /* Populate stop reason if we have stopped. */
-    stop_reason_len = 0;
-    if (gdbstub_step > GDBSTUB_EXEC) {
+    /* Populate the stop reason when the CPU has just stopped, and keep it while
+       the CPU stays stopped, so that a client connecting later can still ask
+       ("?") why. */
+    if (gdbstub_step <= GDBSTUB_EXEC) {
+        stop_reason_len = 0;
+        was_stopped     = 0;
+    } else if (!ran && was_stopped) {
+        gdbstub_step = GDBSTUB_BREAK;
+    } else {
+        was_stopped     = 1;
+        stop_reason_len = 0;
         /* Assemble stop reason manually, avoiding sprintf and friends for performance. */
         stop_reason[stop_reason_len++] = 'T';
         stop_reason[stop_reason_len++] = '0';
@@ -1966,8 +1986,10 @@ gdbstub_server_thread(void *priv)
         }
         thread_release_mutex(client_list_mutex);
 
-        /* Pause CPU execution. */
-        gdbstub_break();
+        /* Pause CPU execution, as GDB expects on attach, unless the last
+           client asked to hold the CPU's state across connections. */
+        if (!hold_on_disconnect)
+            gdbstub_break();
 
         /* Start client thread. */
         thread_create(gdbstub_client_thread, client);

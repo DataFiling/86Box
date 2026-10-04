@@ -116,11 +116,9 @@ def _state_report(stop=None, code_lines=6):
     regs = _regs()
     parts = []
     if stop is not None:
-        why = {"breakpoint": "hit breakpoint", "watchpoint": "watchpoint triggered",
-               "pause": "paused", "trap": "stopped (single step)"}.get(stop.reason, stop.reason)
-        if stop.reason == "watchpoint":
-            why += " (%s access at linear %08X)" % (stop.watch_kind, stop.watch_addr)
-        parts.append("STOP: " + why)
+        parts.append("STOP: " + stop.describe())
+    elif not c.running and c.last_stop is not None:
+        parts.append("CPU is stopped. Last stop: " + c.last_stop.describe())
     parts.append(dos.format_registers(regs))
     parts.append("Next instructions:\n" + _code_at(regs, regs["eip"], code_lines))
     if c.running:
@@ -248,6 +246,47 @@ def _run_to(linear, timeout):
 
 
 @tool
+def step_out(max_steps: int = 20000) -> str:
+    """Run until the current function returns: steps through it, running over
+    calls and interrupts, and stops after its RET/RETF/IRET. Gives up after
+    max_steps instructions (each takes a round trip, about 1 ms)."""
+    c = client()
+    if c.running:
+        c.pause()
+    if dos.capstone is None:
+        return "step_out needs capstone (pip install capstone)."
+    md = dos.capstone.Cs(dos.capstone.CS_ARCH_X86, dos.capstone.CS_MODE_16)
+    for n in range(max(1, max_steps)):
+        regs = _regs()
+        md.mode = dos.capstone.CS_MODE_16 if dos.code_bits(regs) == 16 else dos.capstone.CS_MODE_32
+        insn = next(md.disasm(c.read_memory(regs["eip"], 15), 0), None)
+        word = insn.mnemonic.split()[0] if insn is not None else ""
+        if word in ("ret", "retf", "iret", "iretd", "retn"):
+            return "Returned after %d instruction(s).\n\n%s" % (n + 1, _state_report(c.step()))
+        if word in ("call", "lcall", "int", "int1", "int3", "into"):
+            stop = None
+            target = regs["eip"] + insn.size
+            temp = (BP_HARDWARE, target) not in _points
+            if temp:
+                c.set_point(BP_HARDWARE, target)
+            try:
+                c.resume()
+                stop = c.wait_stop(timeout=30)
+            finally:
+                if stop is None:
+                    c.pause()
+                if temp:
+                    c.clear_point(BP_HARDWARE, target)
+            if stop is None or stop.reason != "breakpoint" or _regs()["eip"] != target:
+                return "Stopped inside a call before the function returned.\n\n" + _state_report(stop)
+        else:
+            stop = c.step()
+            if stop is None or stop.reason not in ("trap", "pause"):
+                return _state_report(stop)
+    return "Still inside the function after %d steps.\n\n%s" % (max_steps, _state_report())
+
+
+@tool
 def run_until(address: str, timeout_seconds: float = 30.0) -> str:
     """Resume until execution reaches `address` (temporary breakpoint), or pause on timeout.
 
@@ -339,7 +378,8 @@ def search_memory(pattern: str, start: str = "0", end: str = "110000", as_text: 
     Default range covers the first 1MB + HMA, i.e. all real-mode memory."""
     c = client()
     regs = _regs()
-    lo, hi = _resolve(start, regs).linear, _resolve(end, regs).linear
+    start_loc = _resolve(start, regs)
+    lo, hi = start_loc.linear, _resolve(end, regs).linear
     if as_text:
         needle = [b for b in pattern.encode("cp437")]
     else:
@@ -367,6 +407,8 @@ def search_memory(pattern: str, start: str = "0", end: str = "110000", as_text: 
     real = dos.segmented(regs)
 
     def seg_note(a):
+        if start_loc.sel is not None and 0 <= a - start_loc.base <= 0xFFFFFFFF:
+            return " (%s)" % dos._label(start_loc, a)
         if not real:
             return ""
         if a < 0x100000:
@@ -442,18 +484,24 @@ def set_watchpoint(address: str, length: int = 1, kind: str = "write") -> str:
 
 
 @tool
-def clear_breakpoint(address: str = "all") -> str:
-    """Remove the breakpoint/watchpoints at `address`, or every one with "all"."""
+def clear_breakpoint(address: str) -> str:
+    """Remove the breakpoint/watchpoints at `address`, or every one with address="all".
+
+    Breakpoints persist until cleared (also across run_tool.py commands)."""
     c = client()
     if address == "all":
         targets = list(_points)
     else:
         linear = _resolve(address, _regs()).linear
         targets = [key for key in _points if key[1] == linear]
+    removed = []
     for key in targets:
         p = _points.pop(key)
         c.clear_point(p["kind"], p["address"], p["length"])
-    return "Removed %d point(s)." % len(targets)
+        removed.append("%s at %08X (%s)" % (KIND_NAMES[p["kind"]], p["address"], p["expr"]))
+    if not removed:
+        return "Nothing to remove at %s." % address
+    return "Removed %d point(s):\n%s" % (len(removed), "\n".join(removed))
 
 
 @tool
@@ -468,9 +516,15 @@ def list_breakpoints() -> str:
 # ---- PC / DOS views ---------------------------------------------------------
 
 @tool
-def read_text_screen(include_attributes: bool = False) -> dict:
-    """Read the current text-mode screen (from the BIOS video mode and video RAM)."""
-    return dos.read_text_screen(client(), include_attributes)
+def read_text_screen(include_attributes: bool = False, plain: bool = False):
+    """Read the current text-mode screen (from the BIOS video mode and video RAM).
+
+    Returns JSON (mode, size, cursor, text); plain=true returns just the text,
+    one screen row per line."""
+    result = dos.read_text_screen(client(), include_attributes)
+    if plain:
+        return result["text"] if result.get("text") is not None else result["note"]
+    return result
 
 
 @tool
@@ -540,9 +594,11 @@ def io_write(port: str, value: str, width: str = "b") -> str:
 def screenshot(downscale: int = 1, save_path: str = "") -> list:
     """Capture the emulated display as a PNG (the last completed frame).
 
-    Games that clear and redraw the screen without double buffering can be
-    caught mid-redraw (flicker, as on real hardware): if something you
-    expect is missing, take another screenshot before concluding it is gone.
+    This is the last frame the video card scanned out, so pixels drawn since
+    the last vertical retrace (e.g. just before a breakpoint) only show after
+    the guest runs a moment longer (run_for 0.1). Games that redraw without
+    double buffering can also be caught mid-redraw (flicker, as on real
+    hardware): if something you expect is missing, take another screenshot.
     downscale: integer factor to shrink large frames (2 halves each side).
     save_path: optionally also write the PNG to this host path."""
     w, h, seq, rgb = pcinput.grab_frame(client())
@@ -567,6 +623,16 @@ def _ensure_running():
     return ""
 
 
+def _stopped_during_input(done, total, what):
+    """If a breakpoint/watchpoint stopped the guest while we were injecting
+    input, say so (the rest of the input is not sent)."""
+    c = client()
+    if c.running:
+        return None
+    return ("Sent %d of %d %s, then the CPU stopped, so the rest was not sent.\n\n%s"
+            % (done, total, what, _state_report(c.last_stop)))
+
+
 @tool
 def press_keys(keys: str, hold_ms: int = 80, gap_ms: int = 60) -> str:
     """Press keys or chords in sequence, e.g. "enter", "ctrl+c", "alt+f x", "up up right space".
@@ -578,9 +644,12 @@ def press_keys(keys: str, hold_ms: int = 80, gap_ms: int = 60) -> str:
     c = client()
     combos = [pcinput.parse_combo(k) for k in keys.split()]
     note = _ensure_running()
-    for scans in combos:
+    for n, scans in enumerate(combos):
         pcinput.press_combo(c, scans, hold_ms / 1000.0)
         time.sleep(gap_ms / 1000.0)
+        stopped = _stopped_during_input(n + 1, len(combos), "key presses")
+        if stopped:
+            return stopped
     return "Pressed %d key(s)%s." % (len(combos), note)
 
 
@@ -591,9 +660,12 @@ def type_text(text: str, delay_ms: int = 60) -> str:
     plan = [pcinput.char_keys(ch) for ch in text]
     note = _ensure_running()
     shift = pcinput.KEYS["shift"]
-    for needs_shift, scan in plan:
+    for n, (needs_shift, scan) in enumerate(plan):
         pcinput.press_combo(c, [shift, scan] if needs_shift else [scan], delay_ms / 2000.0)
         time.sleep(delay_ms / 2000.0)
+        stopped = _stopped_during_input(n + 1, len(plan), "characters")
+        if stopped:
+            return stopped
     return "Typed %d character(s)%s." % (len(plan), note)
 
 
@@ -646,6 +718,9 @@ def mouse_click(button: str = "left", double: bool = False, hold_ms: int = 80) -
         time.sleep(hold_ms / 1000.0)
         pcinput.mouse_buttons(c, 0)
         time.sleep(0.08)
+    stopped = _stopped_during_input(1, 1, "clicks")
+    if stopped:
+        return stopped
     return "%s-clicked%s%s." % (button, " twice" if double else "", note)
 
 

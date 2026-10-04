@@ -360,7 +360,11 @@ def disassemble(data, linear, bits=16, loc=None, count=None):
     lines = []
     for insn in md.disasm(data, (linear - seg_base) & 0xFFFFFFFF):
         addr = _label(loc, seg_base + insn.address)
-        lines.append("%s  %-20s %s %s" % (addr, insn.bytes.hex().upper(), insn.mnemonic, insn.op_str))
+        mnemonic = insn.mnemonic
+        if bits == 16 and insn.bytes[-1:] in (b"\x98", b"\x99") and len(insn.bytes) == 1:
+            # Capstone 5 decodes 98h/99h as CWDE/CDQ in 16-bit code.
+            mnemonic = "cbw" if insn.bytes == b"\x98" else "cwd"
+        lines.append("%s  %-20s %s %s" % (addr, insn.bytes.hex().upper(), mnemonic, insn.op_str))
         if count and len(lines) >= count:
             break
     return "\n".join(lines) if lines else "(could not decode)"

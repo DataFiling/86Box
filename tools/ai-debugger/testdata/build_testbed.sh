@@ -50,9 +50,9 @@ sed -i 's/^\t\tsay\tS_mousetype\[si\]/\t\tmov\tdi,S_mousetype[si]\n\t\tcall\tsay
 wlink format dos com name ../CTMOUSE.COM file ctmouse.obj option quiet
 cd .. && rm -rf ctm
 
-# Boot files.
+# Boot files. CTMOUSE /O enables wheel detection.
 printf 'FILES=20\r\nBUFFERS=20\r\nSHELL=COMMAND.COM /E:512 /P\r\n' > FDCONFIG.SYS
-printf '@ECHO OFF\r\nPROMPT $P$G\r\nCTMOUSE\r\nECHO READY\r\n' > AUTOEXEC.BAT
+printf '@ECHO OFF\r\nPROMPT $P$G\r\nCTMOUSE /O\r\nECHO READY\r\n' > AUTOEXEC.BAT
 
 "$HERE/build_floppy.sh" "$OUT/boot.img" "$FDOS_KERNEL_DIR/bin/kernel.sys" "$FREECOM/command.com" \
     FDCONFIG.SYS AUTOEXEC.BAT CTMOUSE.COM txtgame.exe vgagame.exe pmgame.exe mousetst.exe bench.exe DOS4GW.EXE
