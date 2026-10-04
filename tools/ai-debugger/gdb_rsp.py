@@ -295,6 +295,18 @@ class GdbClient:
             raise GdbError("could not clear point at %08X: %s" % (addr, reply or "not set"))
 
     # ---- monitor commands (I/O ports, reset) ----------------------------
+    def set_hold(self, on):
+        """Ask the stub to keep a paused CPU paused when this client
+        disconnects (instead of resuming it). Returns False on 86Box builds
+        without the "hold" monitor command."""
+        try:
+            self.monitor("hold %d" % (1 if on else 0))
+            return True
+        except GdbError as e:
+            if "unknown" in str(e):
+                return False
+            raise
+
     def monitor(self, command, raw=False):
         """Run a stub monitor command; returns its text output (bytes if raw)."""
         with self.lock:
