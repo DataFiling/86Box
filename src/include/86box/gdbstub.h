@@ -62,6 +62,7 @@ extern int  gdbstub_int3(void);
 extern void gdbstub_mem_access(uint32_t *addrs, int access);
 extern void gdbstub_init(void);
 extern void gdbstub_close(void);
+extern void gdbstub_frame_blit(int monitor_index, int x, int y, int w, int h);
 
 #else
 
@@ -77,6 +78,7 @@ extern void gdbstub_close(void);
 #    define gdbstub_int3()        0
 #    define gdbstub_init()
 #    define gdbstub_close()
+#    define gdbstub_frame_blit(monitor_index, x, y, w, h)
 
 #endif
 

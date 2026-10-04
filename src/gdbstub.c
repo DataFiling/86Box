@@ -31,6 +31,8 @@
 #else
 #    include <unistd.h>
 #    include <arpa/inet.h>
+#    include <netinet/in.h>
+#    include <netinet/tcp.h>
 #    include <sys/socket.h>
 #    include <errno.h>
 #endif
@@ -48,6 +50,9 @@
 #include <86box/plat.h>
 #include <86box/thread.h>
 #include <86box/gdbstub.h>
+#include <86box/keyboard.h>
+#include <86box/mouse.h>
+#include <86box/video.h>
 
 #define FAST_RESPONSE(s)         \
     strcpy(client->response, s); \
@@ -343,6 +348,19 @@ static char     stop_reason[2048];
 static gdbstub_client_t *first_client = NULL;
 static gdbstub_client_t *last_client = NULL;
 static mutex_t          *client_list_mutex;
+
+/* The last frame the first monitor's output completed, kept while a client is
+   connected so that it can be fetched as a screenshot, and the RGB snapshot
+   of it that "fb" serves. Like client packets, these are only touched from
+   the emulation thread. */
+static uint32_t *frame_last;
+static int       frame_last_w;
+static int       frame_last_h;
+static int       frame_last_size;
+static uint32_t  frame_last_seq;
+static uint8_t  *frame_snap;
+static int       frame_snap_size;
+static int       frame_snap_len;
 
 static void (*cpu_exec_shadow)(int32_t cycs);
 static gdbstub_breakpoint_t *first_swbreak = NULL;
@@ -1207,7 +1225,62 @@ e00:
                 i = strlen(p) - 1; /* get last character offset */
 
                 /* Interpret the command. */
-                if (p[0] == 'i') {
+                if (!strcmp(p, "fi")) {
+                    /* Freeze the last completed frame as RGB for "fb" and report its size. */
+                    frame_snap_len = frame_last_w * frame_last_h * 3;
+                    if (frame_snap_len > frame_snap_size) {
+                        free(frame_snap);
+                        frame_snap      = (uint8_t *) malloc(frame_snap_len);
+                        frame_snap_size = frame_snap ? frame_snap_len : 0;
+                    }
+                    if (!frame_snap)
+                        frame_snap_len = 0;
+                    for (i = 0; i < (frame_snap_len / 3); i++) {
+                        uint32_t pixel          = video_color_transform(frame_last[i]);
+                        frame_snap[(i * 3)]     = (pixel >> 16) & 0xff;
+                        frame_snap[(i * 3) + 1] = (pixel >> 8) & 0xff;
+                        frame_snap[(i * 3) + 2] = pixel & 0xff;
+                    }
+                    if (frame_snap_len)
+                        client->packet_pos = sprintf(client->packet, "%d %d %u\n", frame_last_w, frame_last_h, frame_last_seq);
+                    else
+                        client->packet_pos = sprintf(client->packet, "0 0 0\n");
+                    client->response_pos = 0;
+                    gdbstub_client_respond_hex(client, (uint8_t *) client->packet, client->packet_pos);
+                    break;
+                } else if (!strcmp(p, "fb")) {
+                    /* Stream the frozen RGB frame as partial responses, which
+                       each take one round trip instead of one CPU time slice. */
+                    if (!frame_snap_len)
+                        goto e22;
+                    k = ((sizeof(client->response) - 2) >> 1) - 1;
+                    for (j = 0; j < frame_snap_len; j += k) {
+                        client->response_pos                     = 0;
+                        client->response[client->response_pos++] = 'O';
+                        gdbstub_client_respond_hex(client, &frame_snap[j], MIN(k, frame_snap_len - j));
+                        gdbstub_client_respond_partial(client);
+                    }
+                } else if (!strcmp(p, "kd") || !strcmp(p, "ku")) {
+                    /* Press or release a key by its set 1 scan code (E0xx for extended keys). */
+                    l = (p[1] == 'd');
+                    if (!(p = strtok_r(NULL, " ", &strtok_save)) || !gdbstub_num_decode(p, &j, GDB_MODE_HEX) || (j < 0) || (j > 0xffff))
+                        goto e22;
+                    keyboard_input(l, j);
+                } else if (!strcmp(p, "mm")) {
+                    /* Move the mouse by a relative amount, optionally turning the wheel. */
+                    if (!(p = strtok_r(NULL, " ", &strtok_save)) || !gdbstub_num_decode(p, &j, GDB_MODE_BASE10) || !(p = strtok_r(NULL, " ", &strtok_save)) || !gdbstub_num_decode(p, &k, GDB_MODE_BASE10))
+                        goto e22;
+                    mouse_injected = 1;
+                    mouse_scale(j, k);
+                    if ((p = strtok_r(NULL, " ", &strtok_save)) && gdbstub_num_decode(p, &j, GDB_MODE_BASE10))
+                        mouse_set_z(j);
+                } else if (!strcmp(p, "mb")) {
+                    /* Set the mouse buttons held (bit 0 left, bit 1 right, bit 2 middle). */
+                    if (!(p = strtok_r(NULL, " ", &strtok_save)) || !gdbstub_num_decode(p, &j, GDB_MODE_HEX))
+                        goto e22;
+                    mouse_injected = 1;
+                    mouse_set_buttons_ex(j);
+                } else if (p[0] == 'i') {
                     /* Read I/O operation width. */
                     l = (i < 1) ? '\0' : p[i];
 
@@ -1322,7 +1395,12 @@ e00:
                         "Commands:\n"
                         "- ib/iw/il [port [length]] - Read {length} (default 1) I/O ports starting from {port} (default last)\n"
                         "- ob/ow/ol [[port] value] - Write {value} to I/O {port} (both default last)\n"
-                        "- r - Hard reset the emulated machine\n");
+                        "- r - Hard reset the emulated machine\n"
+                        "- fi - Freeze the last frame for fb; prints {width} {height} {frame number}\n"
+                        "- fb - Read the frozen frame as RGB bytes\n"
+                        "- kd/ku scancode - Press/release a key (hex set 1 scan code, E0xx if extended)\n"
+                        "- mm dx dy [dz] - Move the mouse (decimal, relative)\n"
+                        "- mb buttons - Set the mouse buttons held (hex mask: 1 left, 2 right, 4 middle)\n");
                     break;
                 } else {
 unknown:
@@ -1689,6 +1767,7 @@ gdbstub_client_thread(void *priv)
         if (first_client == NULL) {
             last_client  = NULL;
             gdbstub_step = GDBSTUB_EXEC; /* unpause CPU when all clients are disconnected */
+            mouse_injected = 0;            /* return the mouse to the host */
         }
 #ifdef GDBSTUB_ALLOW_MULTI_CLIENTS
     } else {
@@ -1729,6 +1808,17 @@ gdbstub_server_thread(void *priv)
         client->socket = accept(gdbstub_socket, (struct sockaddr *) &client->addr, &sl);
         if (client->socket < 0)
             break;
+
+        /* Responses are written in several small pieces; don't let Nagle's
+           algorithm hold each one back until the client's delayed ACK. */
+        int nodelay = 1;
+        setsockopt(client->socket, IPPROTO_TCP, TCP_NODELAY,
+#ifdef _WIN32
+                   (const char *) &nodelay,
+#else
+                   &nodelay,
+#endif
+                   sizeof(nodelay));
 
         /* Add to client list. */
         thread_wait_mutex(client_list_mutex);
@@ -1876,6 +1966,32 @@ gdbstub_mem_access(uint32_t *addrs, int access)
             }
         }
     }
+}
+
+void
+gdbstub_frame_blit(int monitor_index, int x, int y, int w, int h)
+{
+    const bitmap_t *buf = monitors[monitor_index].target_buffer;
+
+    /* Only keep frames when someone may ask for them. */
+    if ((monitor_index != 0) || !first_client || !buf || (w <= 0) || (h <= 0))
+        return;
+
+    if ((w * h) > frame_last_size) {
+        free(frame_last);
+        frame_last      = (uint32_t *) malloc(w * h * sizeof(uint32_t));
+        frame_last_size = frame_last ? (w * h) : 0;
+        if (!frame_last) {
+            frame_last_w = frame_last_h = 0;
+            return;
+        }
+    }
+
+    for (int row = 0; row < h; row++)
+        memcpy(&frame_last[row * w], &buf->line[y + row][x], w * sizeof(uint32_t));
+    frame_last_w = w;
+    frame_last_h = h;
+    frame_last_seq++;
 }
 
 void
