@@ -5,12 +5,16 @@ An [MCP](https://modelcontextprotocol.io) server that lets an AI client
 software live. It can pause, step, set breakpoints and watchpoints, read and
 patch memory, disassemble, see the screen in any video mode, and type and use
 the mouse, in real, V86 and protected mode (including 16-bit protected mode).
+It knows about DOS: the programs in memory, a log of the DOS, DPMI, BIOS and
+mouse calls a program makes (with file names and results), stopping at a
+program's first instruction (also the 32-bit entry of DOS/4GW games), and
+cheat-finder style searches for variables such as lives or score.
 
 ```
 Claude ──MCP (stdio)──> server.py ──GDB remote protocol (TCP 12345)──> 86Box gdbstub
 ```
 
-It covers steps 1 to 3 of a larger plan (see [Roadmap](#roadmap)).
+It covers steps 1 to 5 of a larger plan (see [Roadmap](#roadmap)).
 
 ## 1. Build 86Box with the GDB stub
 
@@ -86,6 +90,8 @@ python3 tools/ai-debugger/run_tool.py --port 12345 get_state
 python3 tools/ai-debugger/run_tool.py read_memory address=ds:0026 length=16
 python3 tools/ai-debugger/run_tool.py press_keys keys="up up space"
 python3 tools/ai-debugger/run_tool.py screenshot      # prints the PNG's path
+python3 tools/ai-debugger/run_tool.py help            # the tools, and how they fit together
+python3 tools/ai-debugger/run_tool.py help scan_next  # one tool's parameters and description
 ```
 
 Values are JSON when they parse as JSON, else strings (where `\n`, `\t` and
@@ -101,6 +107,9 @@ can also be imported directly from Python.
 | Area | Tools |
 |---|---|
 | Execution | `status`, `pause`, `resume`, `run_for`, `wait_for_stop`, `step`, `step_over`, `step_out`, `run_until`, `hard_reset` |
+| DOS programs | `dos_memory_map` (MCB chain, programs, which one is running), `wait_for_program_start` (stop at a program's first instruction; `protected_mode` for a DOS/4GW-style program's 32-bit entry; `command` types the command that starts it) |
+| Interrupt calls | `log_interrupts` + `read_interrupt_log` (INT 21h DOS, 31h DPMI, 10h video, 33h mouse... with decoded arguments, file names, buffers and results), `catch_interrupt` (stop on a call or its return), `clear_interrupt_catches` |
+| Finding variables | `scan_memory` + `scan_next` (value, changed, decreased, -1...), `snapshot_memory` + `diff_memory`, `restore_memory` |
 | State | `get_state` (registers, CPU mode, next instructions), `set_register`, `read_stack` |
 | Protected mode | `get_segments` (descriptor caches, code/stack size, CPL, GDTR/IDTR/LDTR/TR), `read_descriptor_table` (decoded GDT, LDT or IDT entries) |
 | Memory | `read_memory` (hex/words/dwords/text), `write_memory`, `search_memory` (hex with `??` wildcards, or text), `disassemble` |
@@ -120,6 +129,9 @@ match the segment.
 
 Example prompts:
 
+- "GAME.EXE says it can't load its data. Log the DOS calls while it starts and tell me what fails."
+- "Stop GAME at its first instruction, then find where it keeps the score."
+
 - "Run the game for 5 seconds, then tell me what code it's spending its time in."
 - "Lives are 3. Search memory for them, I'll lose a life, then narrow it down
   and set a write watchpoint to find the code that decrements lives."
@@ -130,8 +142,23 @@ Example prompts:
 
 - **Protected mode:** breakpoints and watchpoints are on linear addresses
   (virtual ones when paging is on), so one set on a selector whose base later
-  changes stays at the old place. The bridge doesn't yet know about DOS
-  extenders themselves (where the program was loaded, its DPMI calls).
+  changes stays at the old place. DOS-extender support is generic: DPMI calls
+  are logged and decoded, and `wait_for_program_start(protected_mode=true)`
+  finds the 32-bit entry of extenders that allocate the program's memory
+  through DPMI (DOS/4GW does; tested with it only). It doesn't read the
+  program's LE/LX object table.
+- **No machine save states.** 86Box can't save and restore a running
+  machine's device state, so the bridge can't either; `restore_memory` puts
+  back memory from a snapshot (a variable, a patched routine), which is not
+  the same as rewinding the machine.
+- `INT n` calls are logged and caught when made with an `INT` instruction
+  (as DOS programs call DOS, the BIOS and drivers); hardware interrupts and
+  calls made by jumping to a handler (`pushf; call far`) are not. On the 8086
+  cores a call catch stops at the handler's first instruction instead of
+  before the `INT`.
+- The interrupt log keeps the last 4096 calls (identical back-to-back calls
+  count as one); value scans keep their state on disk (in the system temp
+  directory), one scan at a time per emulator.
 - With the stub enabled, 86Box runs the CPU interpreter only. That still
   keeps real time for a Pentium MMX 200 under a CPU-bound load on a modern
   host (measurements in [testdata/README.md](testdata/README.md)); faster
@@ -175,6 +202,18 @@ All of these only take effect in builds with `-DGDBSTUB=ON`.
   PS/2 and bus mice only accept input while the host mouse is captured; a
   `mouse_injected` flag, set by `mm`/`mb` and cleared when the debugger
   disconnects, lets it through without grabbing the user's real mouse.
+- **Software interrupt log and catchpoints** (`src/gdbstub.c`; the `INT n`
+  implementations in `src/cpu/x86_ops_int.h`, `808x.c` and `vx0.c` call
+  `gdbstub_int()`). Monitor commands `tv`/`ts`/`tl`/`tc` log calls to chosen
+  vectors with their registers, the buffers DS:(E)DX, DS:(E)SI and ES:(E)DI
+  point to, and the results when they return (found by return address and
+  stack pointer); `ca`/`cx` stop on calls (before the `INT` runs) or returns;
+  `xr` stops when execution enters a linear range; `mr` reads RAM/ROM without
+  side effects or faults (skipping device memory such as VGA), for memory
+  snapshots. Costs one test per instruction while nothing is logged.
+- **EFLAGS reads and writes respect lazy flags.** The interpreter computes
+  arithmetic flags lazily; the stub read stale ZF/CF/... after e.g. a `cmp`,
+  and a written EFLAGS could be overridden by the pending lazy state.
 - **`TCP_NODELAY` on stub connections.** Replies are sent in small pieces,
   which Nagle's algorithm held back for ~85 ms each; requests now take ~1 ms.
 - **`sg` monitor command** reports the segment descriptor caches (selector,
@@ -197,9 +236,11 @@ All of these only take effect in builds with `-DGDBSTUB=ON`.
 4. **Test setup across three eras (done):** FreeDOS on 386, 486 and Pentium
    machines with test games that have planted bugs, AI debugging exercises
    graded against ground truth, and a speed measurement.
-5. **DOS and extender awareness:** find the running program (PSP, MCB chain,
-   load address), break on program start, named `INT 21h`/`INT 31h` call
-   logs, memory diffing for finding variables, and save/restore of machine state.
+5. **DOS and extender awareness (done):** the running program (MCB chain,
+   PSP, load segment), stopping at program start (real mode and DOS/4GW
+   32-bit entry), decoded `INT 21h`/`31h`/`10h`/`33h`... call logs and
+   catchpoints, memory snapshots, diffs and value scans. Machine save/restore
+   is not possible (86Box has no save states).
 6. **Speed:** not needed for Pentium-era games (the interpreter keeps real
    time at Pentium MMX 200). If later targets need it: let the dynamic
    recompiler run while no breakpoints, watchpoints or stepping are active.

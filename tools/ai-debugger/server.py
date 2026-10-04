@@ -679,7 +679,7 @@ def press_keys(keys: str, hold_ms: int = 80, gap_ms: int = 60) -> str:
 
 @tool
 def type_text(text: str, delay_ms: int = 60) -> str:
-    """Type text as keystrokes (US layout). Use "\n" for Enter, e.g. "dir\n"."""
+    """Type text as keystrokes (US layout). Use "\\n" for Enter, e.g. "dir\\n"."""
     c = client()
     plan = [pcinput.char_keys(ch) for ch in text]
     note = _ensure_running()
@@ -858,9 +858,6 @@ def dos_memory_map() -> str:
     return "\n".join(lines)
 
 
-_VECTOR_SET_HELP = "hex vectors, e.g. \"21 31 33\" (21h DOS, 31h DPMI, 33h mouse, 10h video, 16h keyboard, 13h disk)"
-
-
 def _parse_vectors(text):
     out = []
     for w in text.replace(",", " ").split():
@@ -875,7 +872,8 @@ def _parse_vectors(text):
 def log_interrupts(vectors: str = "21 31 33", clear: bool = True) -> str:
     """Start logging software interrupt calls (INT n) to these vectors, inside the
     emulator: each call's registers, file names/strings it points to, and its
-    results when it returns. vectors: """ + _VECTOR_SET_HELP + """, or "off".
+    results when it returns. vectors: hex vectors, e.g. "21 31 33" (21h DOS,
+    31h DPMI, 33h mouse, 10h video, 16h keyboard, 13h disk), or "off".
 
     Logging costs nothing noticeable and keeps the last 4096 calls (identical
     back-to-back calls are folded into one). Read it with read_interrupt_log.
@@ -1378,7 +1376,9 @@ def scan_memory(value: str = "", size: int = 1, region: str = "auto", signed: bo
 @tool
 def scan_next(condition: str, limit: int = 20) -> str:
     """Narrow the value scan (scan_memory) by comparing memory now with the
-    previous step. condition: """ + memscan.COND_HELP + """."""
+    previous step. condition: a value ("3", "=3", "!=0", ">100", "<=5"; decimal
+    unless 0x or h), "changed", "unchanged", "increased", "decreased", "+N"
+    (increased by N) or "-N" (decreased by N)."""
     c = client()
     d = _state_dir()
     scan, old = memscan.load(d, "scan"), memscan.load(d, "scan-mem")

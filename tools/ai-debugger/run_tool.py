@@ -67,7 +67,24 @@ def coerce(fn, kwargs):
 async def call(tool_name, kwargs, image_dir):
     import server  # noqa: E402  (reads BOX86_GDB_PORT on first connection)
 
-    names = sorted(t.name for t in server.mcp._tool_manager.list_tools())
+    tools = {t.name: t for t in server.mcp._tool_manager.list_tools()}
+    names = sorted(tools)
+    if tool_name == "help":
+        # help: the server instructions and a line per tool; help TOOL: its full description.
+        wanted = list(kwargs)
+        if wanted:
+            for name in wanted:
+                if name not in tools:
+                    raise SystemExit("unknown tool %r" % name)
+                fn = getattr(server, name)
+                print("%s(%s)\n\n%s\n" % (name, ", ".join(str(p) for p in inspect.signature(fn).parameters.values()),
+                                          inspect.cleandoc(tools[name].description or "")))
+        else:
+            print(server.INSTRUCTIONS)
+            for name in names:
+                print("%-24s %s" % (name, (tools[name].description or "").strip().split("\n")[0]))
+            print("\nrun_tool.py help TOOL shows a tool's parameters and full description.")
+        return
     if tool_name not in names:
         raise SystemExit("unknown tool %r; tools: %s" % (tool_name, ", ".join(names)))
     fn = getattr(server, tool_name)
@@ -103,6 +120,8 @@ def main():
     os.environ["BOX86_GDB_HOST"] = a.host
     os.makedirs(a.image_dir, exist_ok=True)
     kwargs = {}
+    if a.tool == "help":  # "help TOOL..." takes bare tool names
+        a.args = [n + "=" for n in a.args]
     for kv in a.args:
         if "=" not in kv:
             raise SystemExit("arguments are key=value, got %r" % kv)
