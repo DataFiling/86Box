@@ -61,7 +61,8 @@ sets one through the debugger. AMI BIOSes then report a CMOS checksum error
 defaults, which already include the drive; press F1. 86Box keeps the CMOS in
 the VM's `.nvr` file, so this is needed once.
 
-Each machine then boots to `A:\>` with CuteMouse loaded and prints `READY`.
+Each machine then boots to `A:\>` with CuteMouse loaded (`CTMOUSE /O`, so it
+detects the Pentium machine's wheel mouse) and prints `READY`.
 Run a program by typing its name (`type_text text="PMGAME\n"`); DOS/4GW
 programs take several seconds to load from the floppy.
 

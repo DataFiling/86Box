@@ -159,6 +159,85 @@ based at 8100h that increments a word through FS (base 12340h). That covers
 `smoke_test.py --protected-mode` runs it on 386+ machines and hard-resets
 afterwards.
 
+### 7. Review (`8b8756a`, `415974d`, `4eeba0a`)
+A review workflow (88 agents: finders across the stub, the memory hooks and
+the bridge, then adversarial verifiers) confirmed 38 issues, all fixed. The
+main ones:
+- **Stub:** `m`/`M` packets that hit a page fault sent corrupt replies or
+  reported success, and they overwrote the guest's CR2. A watch address at
+  2 GiB or above indexed out of bounds. A quick reconnect could have its new
+  socket closed by the old client's cleanup (descriptor reuse); this is now
+  fixed with a `gone` flag, closing under the client mutex, and `shutdown()`.
+  A send to a departed client could raise SIGPIPE. Streaming a frame (`fb`)
+  deadlocked if the client left.
+- **Memory hooks:** 8086-class instruction prefetch triggered read
+  watchpoints. Fetches now use `read_mem_fetch_*`, which skips the hook.
+- **Bridge:** a NUL strip cut trailing black pixels from frames. `step_over`
+  mishandled `lcall` and `rep` before non-string ops. Several tools were
+  wrong in protected mode or at segment wrap.
+- **New:** `hold`, so `run_tool.py` can leave a paused CPU paused between
+  commands, and `bl`, so a reconnecting bridge knows the stub's breakpoints.
+
+### 8. Test setup across three eras (`6fe825c`, `7d47ede`, `7d0bb99`)
+The DOS tools are built from source, because the network policy blocks the
+usual download sites and only git access to GitHub works: Open Watcom v2,
+the FreeDOS kernel and FreeCOM, JWasm and CuteMouse. `testdata/build_testbed.sh`
+compiles them into one boot floppy. It holds five programs:
+- three with planted bugs (TXTGAME, VGAGAME, PMGAME);
+- MOUSETST, to check INT 33h;
+- BENCH, to measure speed.
+
+There are three VM configs (386, 486, Pentium MMX). Details are in
+[testdata/README.md](testdata/README.md) and the answers in
+`testdata/GROUND_TRUTH.md`.
+
+**Speed:** the interpreter keeps real time at Pentium 100 (59% of one host
+core) and Pentium MMX 200 (0.99x real time, 73%). Pentium-era games
+therefore don't need dynarec support in debug builds.
+
+### 9. AI debugging exercises
+Three agents each got one machine and only the bridge (through
+`run_tool.py`), the user's symptom, and the task: find the cause, find
+where the game keeps lives, propose a fix. None of them saw the source code
+or the ground truth. A separate agent graded each report against
+`GROUND_TRUTH.md`.
+
+| Machine / program | Diagnosis | Lives location | Fix | How it got there |
+|---|---|---|---|---|
+| 386 / TXTGAME | correct | correct (DS:005A) | correct (3DAh) | paused the hang, found a `in al,dx / test al,8 / jnz` spin with DX=3DBh, patched both port words in RAM and saw the game continue |
+| 486 / VGAGAME | correct | correct (DS:0026) | correct (`difficulty - 1`) | write watchpoint on lives, then traced `call [bx+0033]` with BX=6 one past the 3-entry table to a junk target and an invalid opcode |
+| Pentium / PMGAME | correct | correct (linear 14C464h) | correct (`i < MAX_SHOTS`) | reproduced with rapid fire; a write watchpoint on lives caught `fire()` writing `shots[8]`, then it patched `jg` to `jge` and retested |
+
+All three also handled a misleading remark relayed from the user ("a blank
+screen with a yellow box") without letting it skew the diagnosis.
+
+### 10. Fixes from the exercise feedback (`8d4a934`)
+The agents reported friction with the tools, which was fixed:
+- **Stop reason across reconnects.** Each `run_tool.py` call reconnects. The
+  stub then reported a fresh break, so a watchpoint hit seen in one command
+  showed as "signal 5" in the next. The stub now keeps the stop reason while
+  the CPU stays stopped. A new `state` command tells the bridge whether the
+  CPU is running, and `hold` also stops a connection from pausing a running
+  CPU. `status` shows "CPU is stopped. Last stop: write watchpoint at ...".
+- **`step_out`:** runs until the current procedure returns, by stepping over
+  calls until a `ret`/`retf`/`iret` at the starting depth.
+- **Input while stopped.** If a breakpoint hits while keys or clicks are
+  being injected, the tool stops injecting and says so, instead of reporting
+  success.
+- **Small things:**
+  - `clear_breakpoint` needs an address (it used to clear everything when
+    called without one) and says what it removed.
+  - `search_memory` labels hits as SEG:OFF when the start was SEG:OFF.
+  - `read_text_screen plain=true` returns just the text.
+  - 16-bit `98h`/`99h` now disassemble as `cbw`/`cwd`.
+  - `run_tool.py`: unescapes `\n` (so `type_text text="PMGAME\n"` works),
+    accepts `0x` integers, and names missing required parameters.
+- **Mouse wheel.** The PMGAME agent found that the wheel didn't reach
+  MOUSETST. There were two causes, both in the test setup, not the stub. The
+  PS/2 mouse defaults to 2 buttons (no wheel), and CuteMouse only looks for
+  a wheel with `/O`. With `buttons = 4` and `CTMOUSE /O`, 3 clicks read as
+  wheel -3 through INT 33h.
+
 ## Test results
 
 Test machines, built with `-DQT=OFF -DSDL2=ON -DGDBSTUB=ON` and run headless
@@ -177,7 +256,14 @@ under Xvfb:
 | Serial mouse | Injected moves/buttons produce Microsoft-mouse packets on COM1 (e.g. `4C 0B 3C`) |
 | `smoke_test.py --protected-mode` on the 486 | PASS: `CS:IP = 0020:0000` 16-bit and `CS:EIP = 0008:0000802C` 32-bit, `inc word ptr fs:[0]` / `inc dword ptr [0x806e]` decoded at the right size, `fs:0` and `0018:0000` both linear 12340, write watchpoint through FS fired, 32-bit stack at `0010:0009F000`, GDT decoded |
 
-Not yet tested: a real DOS game, and a DOS mouse driver end to end.
+| FreeDOS test floppy on 386, 486, Pentium MMX | Boots to `READY` with CuteMouse on all three |
+| Debugging exercises (section 9) | 3 of 3 graded correct on diagnosis, lives location and fix |
+| CuteMouse end to end | Moves, buttons (serial and PS/2) and wheel (PS/2, `CTMOUSE /O`) reach INT 33h |
+| Speed (BENCH) | Real time at Pentium MMX 200 with the interpreter |
+| Reconnect lifecycle | Breakpoints cleared on disconnect without `hold`, kept with it; paused CPU stays paused; frames advance; run state and stop reason survive reconnects |
+
+Not yet tested: commercial or shareware games (the downloads are blocked in
+this environment), and V86 mode under EMM386.
 
 ## Known limitations
 
@@ -190,23 +276,24 @@ Not yet tested: a real DOS game, and a DOS mouse driver end to end.
   access reports its second byte's address.
 - Pausing from 86Box's own UI stops request servicing (tools time out).
 - One debugger client at a time; US keyboard layout.
-- Interpreter only while the stub is enabled (fine up to ~486 speeds).
+- Interpreter only while the stub is enabled (measured real time up to a
+  Pentium MMX 200).
 
 ## Next steps
 
-1. **Test setup across three eras:** FreeDOS on a 286/386 (early real-mode
-   games), a 486 (DOS-extender games, with Doom shareware as the
-   protected-mode test) and a Pentium machine. One freeware or shareware game
-   each, an automated boot-and-play check, the find-and-patch-the-lives
-   exercise, a DOS mouse driver check, and a speed measurement on the Pentium
-   machine.
-2. **DOS and extender awareness:** find the running program (PSP/MCB chain,
-   extender load address), break on program start, log `INT 21h`/`INT 10h`/
-   `INT 31h` calls with names, memory diffing to find variables,
-   save/restore machine state.
-3. **Speed, only if step 1 shows Pentium-era games are too slow:** let the
-   dynamic recompiler run while no breakpoints, watchpoints or stepping are
-   active.
-4. **Autonomous loop:** an agent that runs a game, detects hangs or crashes,
+1. **DOS and extender awareness:**
+   - find the running program (PSP/MCB chain, extender load address);
+   - break on program start;
+   - log `INT 21h`/`INT 10h`/`INT 31h` calls with names;
+   - memory snapshot and diff to find variables (all three exercise agents
+     asked for this, since searching for a value and then re-searching by
+     hand is slow);
+   - save and restore machine state.
+2. **Real games:** run shareware titles (e.g. Commander Keen, Doom) once
+   network access allows it, or with images supplied by the user.
+3. **Autonomous loop:** an agent that runs a game, detects hangs or crashes,
    and diagnoses them.
+4. **Speed:** let the dynamic recompiler run while no breakpoints,
+   watchpoints or stepping are active. Only needed for targets faster than a
+   Pentium MMX 200.
 5. Offer the emulator fixes upstream (86Box/86Box) as separate pull requests.

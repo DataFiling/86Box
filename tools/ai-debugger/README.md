@@ -88,7 +88,9 @@ python3 tools/ai-debugger/run_tool.py press_keys keys="up up space"
 python3 tools/ai-debugger/run_tool.py screenshot      # prints the PNG's path
 ```
 
-Values are JSON when they parse as JSON, else strings. Each command connects
+Values are JSON when they parse as JSON, else strings (where `\n`, `\t` and
+`\\` are unescaped, so `type_text text="DIR\n"` presses Enter); integer
+parameters also take `0x` hex. Each command connects
 for just that call and asks the stub to *hold*: a CPU left paused stays
 paused between commands (and keeps its breakpoints), while one left running
 keeps running. The bridge's modules (`gdb_rsp.py`, `dos.py`, `pcinput.py`)
@@ -98,12 +100,12 @@ can also be imported directly from Python.
 
 | Area | Tools |
 |---|---|
-| Execution | `status`, `pause`, `resume`, `run_for`, `wait_for_stop`, `step`, `step_over`, `run_until`, `hard_reset` |
+| Execution | `status`, `pause`, `resume`, `run_for`, `wait_for_stop`, `step`, `step_over`, `step_out`, `run_until`, `hard_reset` |
 | State | `get_state` (registers, CPU mode, next instructions), `set_register`, `read_stack` |
 | Protected mode | `get_segments` (descriptor caches, code/stack size, CPL, GDTR/IDTR/LDTR/TR), `read_descriptor_table` (decoded GDT, LDT or IDT entries) |
 | Memory | `read_memory` (hex/words/dwords/text), `write_memory`, `search_memory` (hex with `??` wildcards, or text), `disassemble` |
 | Break/watch | `set_breakpoint`, `set_watchpoint` (write/read/access, any length), `clear_breakpoint`, `list_breakpoints` |
-| Screen | `screenshot` (PNG of the displayed frame, any video mode; optional `downscale`, `save_path`), `read_text_screen` (BIOS mode, page, cursor, CP437 text) |
+| Screen | `screenshot` (PNG of the displayed frame, any video mode; optional `downscale`, `save_path`), `read_text_screen` (BIOS mode, page, cursor, CP437 text; `plain` for the text only) |
 | Input | `press_keys` (`"enter"`, `"ctrl+c"`, `"up up space"`), `type_text`, `key_down`/`key_up` (hold keys), `mouse_move`, `mouse_click`, `mouse_buttons` (drag), `mouse_scroll` |
 | PC/DOS | `read_interrupt_vectors`, `io_read`, `io_write` |
 
@@ -137,8 +139,10 @@ Example prompts:
 - Input tools resume a paused CPU, since the guest must run to read input.
   The keyboard uses the US layout. Mouse movement is relative (mickeys), as
   real mice are; take a screenshot to see where the pointer went.
-- Mouse input reaches the emulated serial, PS/2 and bus mice; it has not yet
-  been checked end to end against a DOS mouse driver.
+- Mouse input reaches the emulated serial, PS/2 and bus mice and has been
+  checked end to end with CuteMouse. The wheel needs a wheel mouse in the VM
+  (PS/2 mouse `buttons = 4` or more, i.e. "Wheel" in Settings) and a driver
+  that looks for one (`CTMOUSE /O`).
 - Watchpoints stop *after* the accessing instruction. On 8-bit-bus CPUs a
   word access reports its second byte's address.
 - Pausing 86Box from its own UI stops the stub from servicing requests, so
@@ -158,8 +162,11 @@ All of these only take effect in builds with `-DGDBSTUB=ON`.
   release keys by scan code (`keyboard_input_injected()`, which works even
   when the keyboard requires capture), `mm`/`mb` move the mouse, turn the
   wheel (`mouse_wheel_clicks()`) and set its buttons, `bl` lists breakpoints
-  and watchpoints, and `hold` keeps a paused CPU paused, with its
-  breakpoints, when the last client disconnects. `src/video/video.c` hands
+  and watchpoints, `state` says whether the CPU is running, and `hold` keeps
+  a paused CPU paused, with its breakpoints, when the last client
+  disconnects (and stops a new connection from pausing a running CPU). The
+  stop reason is kept while the CPU stays stopped, so a client that
+  reconnects learns why it stopped. `src/video/video.c` hands
   each completed frame to the stub, which keeps a copy.
 - **Clean disconnects.** When the last client leaves (and isn't holding),
   its breakpoints and watchpoints are removed so the guest can't stop with
