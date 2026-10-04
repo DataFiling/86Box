@@ -362,6 +362,11 @@ static uint8_t  *frame_snap;
 static int       frame_snap_size;
 static int       frame_snap_len;
 
+/* Keep a paused CPU paused when the last client disconnects ("hold 1"),
+   so that tools which connect once per command don't let the guest run
+   between commands. */
+static int hold_on_disconnect;
+
 static void (*cpu_exec_shadow)(int32_t cycs);
 static gdbstub_breakpoint_t *first_swbreak = NULL;
 static gdbstub_breakpoint_t *first_hwbreak = NULL;
@@ -1292,6 +1297,17 @@ e00:
                     client->response_pos = 0;
                     gdbstub_client_respond_hex(client, (uint8_t *) client->packet, client->packet_pos);
                     break;
+                } else if (!strcmp(p, "hold")) {
+                    /* Set or show whether a paused CPU stays paused after the last client leaves. */
+                    if ((p = strtok_r(NULL, " ", &strtok_save))) {
+                        if (!gdbstub_num_decode(p, &j, GDB_MODE_BASE10))
+                            goto e22;
+                        hold_on_disconnect = !!j;
+                    }
+                    client->packet_pos   = sprintf(client->packet, "hold %d\n", hold_on_disconnect);
+                    client->response_pos = 0;
+                    gdbstub_client_respond_hex(client, (uint8_t *) client->packet, client->packet_pos);
+                    break;
                 } else if (!strcmp(p, "mb")) {
                     /* Set the mouse buttons held (bit 0 left, bit 1 right, bit 2 middle). */
                     if (!(p = strtok_r(NULL, " ", &strtok_save)) || !gdbstub_num_decode(p, &j, GDB_MODE_HEX))
@@ -1419,7 +1435,8 @@ e00:
                         "- kd/ku scancode - Press/release a key (hex set 1 scan code, E0xx if extended)\n"
                         "- mm dx dy [dz] - Move the mouse (decimal, relative)\n"
                         "- mb buttons - Set the mouse buttons held (hex mask: 1 left, 2 right, 4 middle)\n"
-                        "- sg - Show segment descriptor caches, descriptor tables and code/stack size\n");
+                        "- sg - Show segment descriptor caches, descriptor tables and code/stack size\n"
+                        "- hold [0|1] - Keep a paused CPU paused when the last client disconnects\n");
                     break;
                 } else {
 unknown:
@@ -1785,7 +1802,8 @@ gdbstub_client_thread(void *priv)
         first_client = client->next;
         if (first_client == NULL) {
             last_client  = NULL;
-            gdbstub_step = GDBSTUB_EXEC; /* unpause CPU when all clients are disconnected */
+            if (!hold_on_disconnect)
+                gdbstub_step = GDBSTUB_EXEC; /* unpause CPU when all clients are disconnected */
             mouse_injected = 0;            /* return the mouse to the host */
         }
 #ifdef GDBSTUB_ALLOW_MULTI_CLIENTS
