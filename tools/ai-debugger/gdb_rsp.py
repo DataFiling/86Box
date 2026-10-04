@@ -16,6 +16,7 @@ Notes on 86Box's stub (src/gdbstub.c) that this client relies on:
 
 import queue
 import socket
+import struct
 import threading
 
 # Register indices (enum in src/gdbstub.c).
@@ -38,6 +39,10 @@ class StopEvent:
     def describe(self):
         if self.reason == "watchpoint":
             return "watchpoint triggered (%s access at linear %08X)" % (self.watch_kind, self.watch_addr)
+        if self.reason == "catch":
+            return "caught INT %02Xh %s" % (self.int_vector, "returning" if self.int_return else "call (not executed yet)")
+        if self.reason == "range":
+            return "execution entered a watched range at linear %08X" % self.range_addr
         return {"breakpoint": "hit breakpoint", "pause": "paused",
                 "trap": "stopped (single step)"}.get(self.reason, self.reason)
 
@@ -47,6 +52,10 @@ class StopEvent:
         self.reason = "pause" if self.signal == 2 else "trap"
         self.watch_kind = None
         self.watch_addr = None
+        self.int_vector = None  # catchpoint stops
+        self.int_return = False
+        self.int_seq = 0  # the call's INT log record, 0 if not logged
+        self.range_addr = None
         self.regs = {}
         if packet.startswith("T"):
             for field in packet[3:].split(";"):
@@ -59,6 +68,15 @@ class StopEvent:
                     self.watch_addr = int(val, 16)
                 elif key in ("swbreak", "hwbreak"):
                     self.reason = "breakpoint"
+                elif key in ("intcall", "intret"):
+                    self.reason = "catch"
+                    self.int_vector = int(val, 16)
+                    self.int_return = key == "intret"
+                elif key == "seq":
+                    self.int_seq = int(val, 16)
+                elif key == "xrange":
+                    self.reason = "range"
+                    self.range_addr = int(val, 16)
                 else:
                     try:
                         idx = int(key, 16)
@@ -375,18 +393,85 @@ class GdbClient:
         """Run a stub monitor command; returns its text output (bytes if raw)."""
         with self.lock:
             self._send_packet("qRcmd," + command.encode().hex())
-            out = b""
+            parts = []
             while True:
                 reply = self._get_reply()
                 if reply.startswith("O") and reply != "OK":
-                    out += bytes.fromhex(reply[1:])
+                    parts.append(bytes.fromhex(reply[1:]))
                     continue
                 if reply.startswith("E") and len(reply) == 3:
                     raise GdbError("monitor command %r failed (%s); is this 86Box build current?" % (command, reply))
                 if reply and reply != "OK":
-                    out += bytes.fromhex(reply)
-                if not raw:
-                    out = out.rstrip(b"\x00")  # some text replies include the C string's NUL
-                if out == b"Unknown command\n":
+                    parts.append(bytes.fromhex(reply))
+                out = b"".join(parts)  # one join: replies can be megabytes in many packets
+                if out.rstrip(b"\x00") == b"Unknown command\n":
                     raise GdbError("monitor command %r unknown to this 86Box build" % command)
-                return out if raw else out.decode("latin-1")
+                if raw:
+                    return out
+                return out.rstrip(b"\x00").decode("latin-1")  # some text replies include the C string's NUL
+
+    # ---- INT log, catchpoints, range catch, raw memory (86Box stub extensions)
+    def peek(self, addr, length):
+        """Read RAM/ROM without side effects (device memory and unmapped pages
+        are skipped). Returns [(address, bytes or None)] runs covering the range."""
+        raw = self.monitor("mr 0x%x 0x%x" % (addr & 0xFFFFFFFF, length), raw=True)
+        runs, pos = [], 0
+        while pos + 9 <= len(raw):
+            readable = raw[pos]
+            run_addr, n = struct.unpack_from("<II", raw, pos + 1)
+            pos += 9
+            if readable:
+                runs.append((run_addr, raw[pos:pos + n]))
+                pos += n
+            else:
+                runs.append((run_addr, None))
+        return runs
+
+    def int_status(self):
+        """Parse "ts": {"vectors": [...], "first", "next", "record", "pending",
+        "catches": [(vector, ah, al, when)], "ranges": [(lo, hi)], "tsc", "hz"}."""
+        st = {"vectors": [], "catches": [], "ranges": []}
+        for line in self.monitor("ts").splitlines():
+            words = line.split()
+            if not words:
+                continue
+            if words[0] == "vectors":
+                st["vectors"] = [int(w, 16) for w in words[1:]]
+            elif words[0] == "log":
+                for w in words[1:]:
+                    k, v = w.split("=")
+                    st[k] = int(v, 16)
+            elif words[0] == "pending":
+                st["pending"] = int(words[1])
+            elif words[0] == "catch":
+                v, ah, al = (int(w, 16) for w in words[1:4])
+                st["catches"].append((v, None if ah > 0xFF else ah, None if al > 0xFF else al, int(words[4])))
+            elif words[0] == "xrange":
+                st["ranges"].append((int(words[1], 16), int(words[2], 16)))
+            elif words[0] == "tsc":
+                st["tsc"] = int(words[1], 16)
+                st["hz"] = int(words[3])
+        return st
+
+    def int_trace(self, vectors):
+        """Log INT calls to these vectors (replacing the set); [] stops logging."""
+        self.monitor("tv " + (" ".join("%x" % v for v in vectors) if vectors else "off"))
+
+    def int_log(self, first=0, count=None):
+        """Raw log records (bytes each) from sequence number `first` on."""
+        cmd = "tl 0x%x" % first + ("" if count is None else " 0x%x" % count)
+        return self.monitor(cmd, raw=True)
+
+    def int_log_clear(self):
+        self.monitor("tc")
+
+    def catch_int(self, vector, ah=None, al=None, when="call"):
+        self.monitor("ca %x %s %s %s" % (vector, "*" if ah is None else "%x" % ah, "*" if al is None else "%x" % al, when))
+
+    def clear_int_catches(self):
+        self.monitor("cx")
+
+    def set_exec_ranges(self, ranges):
+        """Stop when execution enters any [lo, hi) linear range (up to 8); [] clears."""
+        self.monitor("xr" + "".join(" %x %x" % (lo, hi) for lo, hi in ranges))
+
