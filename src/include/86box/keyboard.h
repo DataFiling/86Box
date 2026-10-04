@@ -223,6 +223,7 @@ extern void     keyboard_process(void);
 extern void     keyboard_process_10x(void);
 extern uint16_t keyboard_convert(int ch);
 extern void     keyboard_input(int down, uint16_t scan);
+extern void     keyboard_input_injected(int down, uint16_t scan);
 extern void     keyboard_all_up(void);
 extern void     keyboard_update_states(uint8_t cl, uint8_t nl, uint8_t sl, uint8_t kl);
 extern uint8_t  keyboard_get_shift(void);

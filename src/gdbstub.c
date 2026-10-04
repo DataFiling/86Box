@@ -36,6 +36,14 @@
 #    include <sys/socket.h>
 #    include <errno.h>
 #endif
+#ifndef MSG_NOSIGNAL /* Windows doesn't signal; macOS uses SO_NOSIGPIPE instead */
+#    define MSG_NOSIGNAL 0
+#endif
+#ifdef _WIN32
+#    define GDBSTUB_SHUT_RDWR SD_BOTH
+#else
+#    define GDBSTUB_SHUT_RDWR SHUT_RDWR
+#endif
 #define HAVE_STDARG_H
 #include <86box/86box.h>
 #include "cpu.h"
@@ -129,6 +137,7 @@ typedef struct _gdbstub_client_ {
     struct sockaddr_in addr;
 
     char    packet[16384], response[16384];
+    volatile int gone; /* the connection is closing; nobody will acknowledge responses */
     uint8_t has_packet : 1;
     uint8_t first_packet_received : 1;
     uint8_t ida_mode : 1;
@@ -366,6 +375,14 @@ static int       frame_snap_len;
    so that tools which connect once per command don't let the guest run
    between commands. */
 static int hold_on_disconnect;
+
+/* Set by the client thread when the last client leaves; acted on by the
+   emulation thread, which owns the breakpoint lists and input state. */
+static volatile int cleanup_pending;
+
+/* Keys pressed with "kd" and not yet released, to release on disconnect. */
+static uint16_t held_keys[32];
+static int      held_keys_count;
 
 static void (*cpu_exec_shadow)(int32_t cycs);
 static gdbstub_breakpoint_t *first_swbreak = NULL;
@@ -654,10 +671,10 @@ gdbstub_client_respond(gdbstub_client_t *client)
     gdbstub_log("GDB Stub: Sending response: %s\n", client->response);
     client->response[994] = i;
 #endif
-    send(client->socket, "$", 1, 0);
-    send(client->socket, client->response, client->response_pos, 0);
+    send(client->socket, "$", 1, MSG_NOSIGNAL);
+    send(client->socket, client->response, client->response_pos, MSG_NOSIGNAL);
     char response_cksum[3] = { '#', gdbstub_hex_encode((checksum >> 4) & 0x0f), gdbstub_hex_encode(checksum & 0x0f) };
-    send(client->socket, response_cksum, sizeof(response_cksum), 0);
+    send(client->socket, response_cksum, sizeof(response_cksum), MSG_NOSIGNAL);
 }
 
 static void
@@ -777,6 +794,7 @@ gdbstub_client_packet(gdbstub_client_t *client)
 
     int     orig_cpu_abrt        = cpu_state.abrt;
     int     orig_cpu_abrt_reason = abrt_error;
+    uint32_t orig_cr2            = cr2;
 
     /* Validate checksum. */
     client->packet_pos -= 2;
@@ -796,7 +814,7 @@ gdbstub_client_packet(gdbstub_client_t *client)
         gdbstub_log("GDB Stub: Received packet with invalid checksum (expected %02X got %02X): %s\n", checksum, rcv_checksum, client->packet);
         client->packet[953] = i;
 #    endif
-        send(client->socket, "-", 1, 0);
+        send(client->socket, "-", 1, MSG_NOSIGNAL);
         return;
     }
 #endif
@@ -808,7 +826,7 @@ gdbstub_client_packet(gdbstub_client_t *client)
     gdbstub_log("GDB Stub: Received packet: %s\n", client->packet);
     client->packet[996] = i;
 #endif
-    send(client->socket, "+", 1, 0);
+    send(client->socket, "+", 1, MSG_NOSIGNAL);
 
     /* Block other responses from being written while this one (if any is produced) isn't acknowledged. */
     if ((client->packet[0] != 'c') && (client->packet[0] != 's') && (client->packet[0] != 'v')) {
@@ -907,6 +925,7 @@ e22:
 
             /* Read by qwords, then by dwords, then by words, then by bytes. */
             i = 0;
+            orig_cr2     = cr2;
             cpl_override = 1;
             if (is386) {
                 for (; i < (k & ~7); i += 8) {
@@ -917,9 +936,7 @@ e22:
                         if (cpu_state.abrt == ABRT_PF) {
                             cpu_state.abrt = orig_cpu_abrt;
                             abrt_error     = orig_cpu_abrt_reason;
-                            cpl_override   = 0;
-                            FAST_RESPONSE("E06");
-                            break;
+                            goto mem_read_fault;
                         }
                     }
                     j += 8;
@@ -933,9 +950,7 @@ e22:
                         if (cpu_state.abrt == ABRT_PF) {
                             cpu_state.abrt = orig_cpu_abrt;
                             abrt_error     = orig_cpu_abrt_reason;
-                            cpl_override   = 0;
-                            FAST_RESPONSE("E06");
-                            break;
+                            goto mem_read_fault;
                         }
                     }
                     j += 4;
@@ -950,9 +965,7 @@ e22:
                     if (cpu_state.abrt == ABRT_PF) {
                         cpu_state.abrt = orig_cpu_abrt;
                         abrt_error     = orig_cpu_abrt_reason;
-                        cpl_override   = 0;
-                        FAST_RESPONSE("E06");
-                        break;
+                        goto mem_read_fault;
                     }
                 }
                 j += 2;
@@ -966,14 +979,23 @@ e22:
                     if (cpu_state.abrt == ABRT_PF) {
                         cpu_state.abrt = orig_cpu_abrt;
                         abrt_error     = orig_cpu_abrt_reason;
-                        cpl_override   = 0;
-                        FAST_RESPONSE("E06");
-                        break;
+                        goto mem_read_fault;
                     }
                 }
                 gdbstub_client_respond_hex(client, buf, 1);
             }
             cpl_override = 0;
+            cr2          = orig_cr2;
+            break;
+
+mem_read_fault:
+            /* Return what was read before the fault, as GDB allows, or an error
+               if nothing was. The guest's CR2 must not see debugger accesses. */
+            cpl_override = 0;
+            cr2          = orig_cr2;
+            if (!client->response_pos) {
+                FAST_RESPONSE("E06");
+            }
             break;
 
         case 'M': /* write memory */
@@ -1008,6 +1030,7 @@ e22:
             /* Write by qwords, then by dwords, then by words, then by bytes. */
             p = client->packet;
             i = 0;
+            orig_cr2     = cr2;
             cpl_override = 1;
             if (is386) {
                 for (; i < (k & ~7); i += 8) {
@@ -1018,9 +1041,7 @@ e22:
                         if (cpu_state.abrt == ABRT_PF) {
                             cpu_state.abrt = orig_cpu_abrt;
                             abrt_error     = orig_cpu_abrt_reason;
-                            cpl_override   = 0;
-                            FAST_RESPONSE("E06");
-                            break;
+                            goto mem_write_fault;
                         }
                     }
                     j += 8;
@@ -1034,9 +1055,7 @@ e22:
                         if (cpu_state.abrt == ABRT_PF) {
                             cpu_state.abrt = orig_cpu_abrt;
                             abrt_error     = orig_cpu_abrt_reason;
-                            cpl_override   = 0;
-                            FAST_RESPONSE("E06");
-                            break;
+                            goto mem_write_fault;
                         }
                     }
                     j += 4;
@@ -1051,9 +1070,7 @@ e22:
                     if (cpu_state.abrt == ABRT_PF) {
                         cpu_state.abrt = orig_cpu_abrt;
                         abrt_error     = orig_cpu_abrt_reason;
-                        cpl_override   = 0;
-                        FAST_RESPONSE("E06");
-                        break;
+                        goto mem_write_fault;
                     }
                 }
                 j += 2;
@@ -1067,17 +1084,22 @@ e22:
                     if (cpu_state.abrt == ABRT_PF) {
                         cpu_state.abrt = orig_cpu_abrt;
                         abrt_error     = orig_cpu_abrt_reason;
-                        cpl_override   = 0;
-                        FAST_RESPONSE("E06");
-                        break;
+                        goto mem_write_fault;
                     }
                 }
                 p++;
             }
             cpl_override = 0;
+            cr2          = orig_cr2;
 
             /* Respond positively. */
             goto ok;
+
+mem_write_fault:
+            cpl_override = 0;
+            cr2          = orig_cr2;
+            FAST_RESPONSE("E06");
+            break;
 
         case 'p': /* read register */
             /* Read register index. */
@@ -1264,13 +1286,21 @@ e00:
                         client->response[client->response_pos++] = 'O';
                         gdbstub_client_respond_hex(client, &frame_snap[j], MIN(k, frame_snap_len - j));
                         gdbstub_client_respond_partial(client);
+                        if (client->gone) /* nobody will acknowledge any more */
+                            break;
                     }
                 } else if (!strcmp(p, "kd") || !strcmp(p, "ku")) {
                     /* Press or release a key by its set 1 scan code (E0xx for extended keys). */
                     l = (p[1] == 'd');
                     if (!(p = strtok_r(NULL, " ", &strtok_save)) || !gdbstub_num_decode(p, &j, GDB_MODE_HEX) || (j < 0) || (j > 0xffff))
                         goto e22;
-                    keyboard_input(l, j);
+                    keyboard_input_injected(l, j);
+                    for (i = 0; (i < held_keys_count) && (held_keys[i] != j); i++)
+                        ;
+                    if (l && (i == held_keys_count) && (held_keys_count < (int) (sizeof(held_keys) / sizeof(held_keys[0]))))
+                        held_keys[held_keys_count++] = j;
+                    else if (!l && (i < held_keys_count))
+                        held_keys[i] = held_keys[--held_keys_count];
                 } else if (!strcmp(p, "mm")) {
                     /* Move the mouse by a relative amount, optionally turning the wheel. */
                     if (!(p = strtok_r(NULL, " ", &strtok_save)) || !gdbstub_num_decode(p, &j, GDB_MODE_BASE10) || !(p = strtok_r(NULL, " ", &strtok_save)) || !gdbstub_num_decode(p, &k, GDB_MODE_BASE10))
@@ -1278,7 +1308,7 @@ e00:
                     mouse_injected = 1;
                     mouse_scale(j, k);
                     if ((p = strtok_r(NULL, " ", &strtok_save)) && gdbstub_num_decode(p, &j, GDB_MODE_BASE10))
-                        mouse_set_z(j);
+                        mouse_wheel_clicks(j);
                 } else if (!strcmp(p, "sg")) {
                     /* Report the segment descriptor caches and descriptor table registers,
                        which the register packets don't carry, for protected mode debugging. */
@@ -1296,6 +1326,22 @@ e00:
                                                   !!use32, !!stack32, CPL);
                     client->response_pos = 0;
                     gdbstub_client_respond_hex(client, (uint8_t *) client->packet, client->packet_pos);
+                    break;
+                } else if (!strcmp(p, "bl")) {
+                    /* List breakpoints and watchpoints: type (Z packet number), address, length. */
+                    static gdbstub_breakpoint_t **lists[] = { &first_swbreak, &first_hwbreak, &first_wwatch, &first_rwatch, &first_awatch };
+                    client->packet_pos = 0;
+                    for (l = 0; l < 5; l++) {
+                        for (breakpoint = *lists[l]; breakpoint && (client->packet_pos < 4000); breakpoint = breakpoint->next)
+                            client->packet_pos += sprintf(&client->packet[client->packet_pos], "%d %08X %X\n", l, breakpoint->addr,
+                                                          (l < 2) ? 1 : (breakpoint->end - breakpoint->addr));
+                    }
+                    client->response_pos = 0;
+                    if (client->packet_pos)
+                        gdbstub_client_respond_hex(client, (uint8_t *) client->packet, client->packet_pos);
+                    else {
+                        FAST_RESPONSE("OK");
+                    }
                     break;
                 } else if (!strcmp(p, "hold")) {
                     /* Set or show whether a paused CPU stays paused after the last client leaves. */
@@ -1436,7 +1482,8 @@ e00:
                         "- mm dx dy [dz] - Move the mouse (decimal, relative)\n"
                         "- mb buttons - Set the mouse buttons held (hex mask: 1 left, 2 right, 4 middle)\n"
                         "- sg - Show segment descriptor caches, descriptor tables and code/stack size\n"
-                        "- hold [0|1] - Keep a paused CPU paused when the last client disconnects\n");
+                        "- hold [0|1] - Keep a paused CPU paused, and breakpoints set, when the last client disconnects\n"
+                        "- bl - List breakpoints and watchpoints: {Z type} {address} {length}\n");
                     break;
                 } else {
 unknown:
@@ -1541,8 +1588,9 @@ unknown:
             if (client->packet[1] >= '2') {
                 /* Clear this watchpoint's corresponding page map groups,
                    as everything is going to be recomputed soon anyway. */
-                memset(&gdbstub_watch_pages[j >> (MEM_GRANULARITY_BITS + 6)], 0,
-                       (((k - 1) >> (MEM_GRANULARITY_BITS + 6)) + 1) * sizeof(gdbstub_watch_pages[0]));
+                memset(&gdbstub_watch_pages[((uint32_t) j) >> (MEM_GRANULARITY_BITS + 6)], 0,
+                       (((((uint32_t) j + (uint32_t) k - 1) >> (MEM_GRANULARITY_BITS + 6))
+                         - (((uint32_t) j) >> (MEM_GRANULARITY_BITS + 6))) + 1) * sizeof(gdbstub_watch_pages[0]));
 
                 /* Go through all watchpoint lists. */
                 l          = 0;
@@ -1581,10 +1629,46 @@ end:
 }
 
 static void
+gdbstub_release_input(void)
+{
+    /* Release keys and mouse buttons a client left held, and return the mouse to the host. */
+    while (held_keys_count)
+        keyboard_input_injected(0, held_keys[--held_keys_count]);
+    if (mouse_injected) {
+        mouse_set_buttons_ex(0);
+        mouse_injected = 0;
+    }
+}
+
+static void
+gdbstub_clear_points(void)
+{
+    gdbstub_breakpoint_t **lists[] = { &first_swbreak, &first_hwbreak, &first_rwatch, &first_wwatch, &first_awatch };
+    gdbstub_breakpoint_t  *breakpoint;
+
+    for (int l = 0; l < 5; l++) {
+        while ((breakpoint = *lists[l])) {
+            *lists[l] = breakpoint->next;
+            free(breakpoint);
+        }
+    }
+    memset(gdbstub_watch_pages, 0, sizeof(gdbstub_watch_pages));
+    flushmmucache();
+}
+
+static void
 gdbstub_cpu_exec(int32_t cycs)
 {
     /* Flag that we're now in the debugger context to avoid triggering watchpoints. */
     in_gdbstub = 1;
+
+    /* Clean up after the last client left. */
+    if (cleanup_pending) {
+        cleanup_pending = 0;
+        gdbstub_release_input();
+        if (!hold_on_disconnect)
+            gdbstub_clear_points();
+    }
 
     /* Handle CPU execution if it isn't paused. */
     if (gdbstub_step <= GDBSTUB_SSTEP) {
@@ -1766,7 +1850,7 @@ gdbstub_client_thread(void *priv)
                             /* Small hack to speed up IDA instruction trace mode. */
                             if (*((uint32_t *) client->packet) == ('H' | ('c' << 8) | ('1' << 16) | ('#' << 24))) {
                                 /* Send pre-computed response. */
-                                send(client->socket, "+$OK#9A", 7, 0);
+                                send(client->socket, "+$OK#9A", 7, MSG_NOSIGNAL);
 
                                 /* Skip processing. */
                                 continue;
@@ -1785,26 +1869,32 @@ gdbstub_client_thread(void *priv)
 
     gdbstub_log("GDB Stub: Connection with %s:%d broken\n", inet_ntoa(client->addr.sin_addr), client->addr.sin_port);
 
-    /* Close socket. */
+    /* Unblock anyone waiting on the response event. */
+    client->gone = 1;
+    thread_set_event(client->response_event);
+
+    /* Close the socket and remove this client from the list. The socket is
+       closed under the list mutex so that the server thread, which kicks out
+       the previous client when a new one connects, can't act on a descriptor
+       that has already been closed and reused for the new connection. */
+    thread_wait_mutex(client_list_mutex);
     if (client->socket != -1) {
         close(client->socket);
         client->socket = -1;
     }
-
-    /* Unblock anyone waiting on the response event. */
-    thread_set_event(client->response_event);
-
-    /* Remove this client from the list. */
-    thread_wait_mutex(client_list_mutex);
 #ifdef GDBSTUB_ALLOW_MULTI_CLIENTS
     if (client == first_client) {
 #endif
         first_client = client->next;
         if (first_client == NULL) {
             last_client  = NULL;
+            /* Unless asked to hold, unpause the CPU when all clients are
+               disconnected, and drop their breakpoints and watchpoints so
+               the guest can't stop with nobody attached. Injected keys and
+               mouse buttons are released either way. */
             if (!hold_on_disconnect)
-                gdbstub_step = GDBSTUB_EXEC; /* unpause CPU when all clients are disconnected */
-            mouse_injected = 0;            /* return the mouse to the host */
+                gdbstub_step = GDBSTUB_EXEC;
+            cleanup_pending = 1;
         }
 #ifdef GDBSTUB_ALLOW_MULTI_CLIENTS
     } else {
@@ -1856,6 +1946,9 @@ gdbstub_server_thread(void *priv)
                    &nodelay,
 #endif
                    sizeof(nodelay));
+#ifdef SO_NOSIGPIPE
+        setsockopt(client->socket, SOL_SOCKET, SO_NOSIGPIPE, &nodelay, sizeof(nodelay));
+#endif
 
         /* Add to client list. */
         thread_wait_mutex(client_list_mutex);
@@ -1865,7 +1958,8 @@ gdbstub_server_thread(void *priv)
             last_client       = client;
 #else
             first_client->next = last_client = client;
-            close(first_client->socket);
+            if (first_client->socket != -1) /* its thread closes it */
+                shutdown(first_client->socket, GDBSTUB_SHUT_RDWR);
 #endif
         } else {
             first_client = last_client = client;
@@ -2010,8 +2104,23 @@ gdbstub_frame_blit(int monitor_index, int x, int y, int w, int h)
 {
     const bitmap_t *buf = monitors[monitor_index].target_buffer;
 
-    /* Only keep frames when someone may ask for them. */
-    if ((monitor_index != 0) || !first_client || !buf || (w <= 0) || (h <= 0))
+    /* Keep every frame, so that a client connecting to a paused machine sees
+       what is on screen. Clip to the buffer as the frontends do. */
+    if ((monitor_index != 0) || !buf)
+        return;
+    if (x < 0) {
+        w += x;
+        x = 0;
+    }
+    if (y < 0) {
+        h += y;
+        y = 0;
+    }
+    if ((x + w) > buf->w)
+        w = buf->w - x;
+    if ((y + h) > buf->h)
+        h = buf->h - y;
+    if ((w <= 0) || (h <= 0))
         return;
 
     if ((w * h) > frame_last_size) {

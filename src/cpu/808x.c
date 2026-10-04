@@ -369,7 +369,7 @@ readmembf(uint32_t a)
     uint8_t ret;
 
     a   = cs + (a & 0xffff);
-    ret = read_mem_b(a);
+    ret = read_mem_fetch_b(a);
 
     return ret;
 }
@@ -401,7 +401,7 @@ readmemwf(uint16_t a)
 {
     uint16_t ret;
 
-    ret = read_mem_w(cs + (a & 0xffff));
+    ret = read_mem_fetch_w(cs + (a & 0xffff));
 
     return ret;
 }

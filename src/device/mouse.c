@@ -548,6 +548,14 @@ mouse_set_z(int z)
     ATOMIC_ADD(mouse_z, z);
 }
 
+/* Turn the wheel by whole clicks, positive away from the user, in the
+   units the host frontends use. */
+void
+mouse_wheel_clicks(int clicks)
+{
+    mouse_set_z(clicks * WHEEL_DELTA);
+}
+
 void
 mouse_clear_z(void)
 {
