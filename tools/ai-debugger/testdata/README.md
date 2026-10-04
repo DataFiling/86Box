@@ -18,6 +18,7 @@ Programs on the floppy (sources in `games/`):
 | TXTGAME | 16-bit, text mode, BIOS keyboard | hangs after 5 gems |
 | VGAGAME | 16-bit, mode 13h, own INT 9 handler | goes wrong at game over |
 | PMGAME | 32-bit DOS/4GW, mode 13h, INT 33h mouse | lives jump after rapid fire |
+| DATAGAME | 16-bit, loads LEVELS.DAT with DOS file I/O | says the data is corrupt |
 | MOUSETST | 16-bit, shows INT 33h state | none (mouse check) |
 | BENCH | 32-bit DOS/4GW, CPU/FPU/memory/VGA workload | none (speed) |
 

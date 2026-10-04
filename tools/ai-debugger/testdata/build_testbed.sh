@@ -28,9 +28,20 @@ G=$HERE/games
 wcl    -zq -ms -bt=dos -0 -os -fm=txtgame.map -fe=txtgame.exe "$G/txtgame.c"
 wcl    -zq -ms -bt=dos -2 -os -fm=vgagame.map -fe=vgagame.exe "$G/vgagame.c"
 wcl    -zq -ms -bt=dos -0 -os -fe=mousetst.exe "$G/mousetst.c"
+wcl    -zq -ms -bt=dos -0 -os -fm=datagame.map -fe=datagame.exe "$G/datagame.c"
 wcl386 -zq -bt=dos -l=dos4g -3r -os -fm=pmgame.map -fe=pmgame.exe "$G/pmgame.c"
 wcl386 -zq -bt=dos -l=dos4g -3r -fp3 -ox -fe=bench.exe "$G/bench.c"
 cp "$WATCOM/binw/dos4gw.exe" DOS4GW.EXE
+
+# DATAGAME's level table: "LVL1", a count, then {char name[12]; u16 enemies, time}.
+python3 - <<'PY'
+import struct
+levels = [(b"MEADOW", 4, 120), (b"CAVERNS", 7, 150), (b"TOWER", 9, 180), (b"CITADEL", 12, 240)]
+with open("LEVELS.DAT", "wb") as f:
+    f.write(b"LVL1" + bytes([len(levels)]))
+    for name, enemies, time in levels:
+        f.write(name.ljust(12, b"\0") + struct.pack("<HH", enemies, time))
+PY
 
 # CuteMouse 2.1b4. Its source targets TASM/older JWasm; JWasm 2.21 needs:
 # case-insensitive include names, "<>" instead of "?" to declare record and
@@ -55,4 +66,5 @@ printf 'FILES=20\r\nBUFFERS=20\r\nSHELL=COMMAND.COM /E:512 /P\r\n' > FDCONFIG.SY
 printf '@ECHO OFF\r\nPROMPT $P$G\r\nCTMOUSE /O\r\nECHO READY\r\n' > AUTOEXEC.BAT
 
 "$HERE/build_floppy.sh" "$OUT/boot.img" "$FDOS_KERNEL_DIR/bin/kernel.sys" "$FREECOM/command.com" \
-    FDCONFIG.SYS AUTOEXEC.BAT CTMOUSE.COM txtgame.exe vgagame.exe pmgame.exe mousetst.exe bench.exe DOS4GW.EXE
+    FDCONFIG.SYS AUTOEXEC.BAT CTMOUSE.COM txtgame.exe vgagame.exe pmgame.exe mousetst.exe bench.exe DOS4GW.EXE \
+    datagame.exe LEVELS.DAT

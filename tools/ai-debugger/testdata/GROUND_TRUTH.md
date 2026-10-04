@@ -63,6 +63,27 @@ triggers while score is 0 (the slot's "free" test reads score as y <= 0). A
 write watchpoint on `g.lives` catches the store in `fire()`; the fix is
 `i < MAX_SHOTS`.
 
+## DATAGAME.EXE (16-bit real mode, DOS file I/O)
+
+| Variable | Where | Type |
+|---|---|---|
+| levels[8] | DS:02E0 | {char name[12]; u16 enemies, time} |
+| level_count | DS:0360 | int, stays 0 |
+
+DGROUP is at load segment + 026Bh.
+
+**Planted bug: "level data corrupt (code 3)" although LEVELS.DAT is fine.**
+`open_data()` looks up the open mode in `open_modes[] = { O_RDONLY, O_WRONLY,
+O_RDWR }` with an access enum whose read value is 1 (`ACCESS_NONE` is 0), so
+LEVELS.DAT is opened **write-only**: INT 21h AX=3D01h (mode 01h). Open
+Watcom's `read()` refuses to read a write-only handle itself (no INT 21h
+AH=3Fh is made), the magic check fails, and `load_levels()` returns 3. An AI
+should find, with the INT 21h log, the open with mode 01h followed by a
+close and no read, and conclude the file is opened for writing. Fix: open it
+read-only (mode 0), e.g. index the table with `access - 1` or start the enum
+at `ACCESS_READ = 0`. A binary patch that makes the open use mode 0 is also
+correct. The file itself (69 bytes, "LVL1", 4 levels) is fine.
+
 ## MOUSETST.EXE and BENCH.EXE
 
 No planted bugs. MOUSETST prints the INT 33h position, buttons and press
