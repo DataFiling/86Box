@@ -85,7 +85,7 @@ doubled from 100 to 200 MHz: `int=2633 fpu=2376 mem=1161` vs
 ## A real game: FastDoom with Freedoom
 
 `build_fastdoom.sh` builds [FastDoom](https://github.com/viti95/FastDoom)
-(a DOS/4GW port of Doom for 386 to Pentium PCs) with Open Watcom, downloads
+(a 32-bit DOS port of Doom for 386 to Pentium PCs, using DOS/4GW or DOS/32A) with Open Watcom, downloads
 the free [Freedoom](https://freedoom.github.io/) game data, and writes a
 64 MB hard disk image, `out/fastdoom-hd.img`, with both on C:. The disk has
 no DOS: its boot record (`mbr_boot_a.asm`) boots the test floppy in A:
@@ -108,3 +108,17 @@ FastDoom bug found with this debugger (DEVLOG.md, section 13): its timer
 interrupt handler corrupts DOS memory, and the game hangs during startup.
 `FASTDOOM_PATCH=0 ./build_fastdoom.sh` builds it unpatched, for the
 exercise in `GROUND_TRUTH.md`.
+
+Other options:
+
+| Variable | Default | |
+|---|---|---|
+| `FASTDOOM_DEBUG` | `1` | `0` builds the release version (registers instead of stack locals; the bug above stays hidden) |
+| `FASTDOOM_EXTENDER` | `dos4gw` | `dos32a` binds the DOS/32A extender (shipped in the FastDoom repository) instead of using DOS4GW.EXE |
+
+For DOS/32A, `bind_dos32a.py` does what DOS/32A's `SB /R` and `SS` tools do
+in DOS (the output is byte-identical). DOS/32A places the objects tightly
+instead of on page boundaries: the release build's code object was at
+linear 100010h and its data object at 165230h. The unpatched `-debug` build
+runs under DOS/32A, because its interrupt stack has base 0 (see
+`GROUND_TRUTH.md`).

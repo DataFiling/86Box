@@ -23,6 +23,15 @@ base 143DF0h in our runs). EBP is then something like 4CA4h, and the handler
 writes `ptr`/`next` (the address of `HeadTask`) over linear 4C9Ch-4CA3h: low DOS
 memory.
 
+It also depends on the DOS extender. FastDoom's own DOS/32A builds hide
+it: when IRQ0 interrupts real-mode code, DOS/32A runs the handler on a
+flat interrupt stack (selector 0018h, base 0, around linear 30068h). The
+stores to EBP-8/EBP-4 then land exactly in the 12 bytes the handler
+reserved for its locals on that stack, and nothing is corrupted. We
+checked this with the same unpatched `-debug` build bound to DOS/32A 9.1.2:
+it loads and plays, and the stores during WAD loading all went to
+3006Ch-30073h. DOS/4GW 1.97 uses a stack with a non-zero base, below.
+
 **Effect seen:** with the FreeDOS kernel (current git, 8086 FAT32 build) those
 addresses are the kernel's disk buffers. Depending on the timing, a buffer header or a cached FAT sector gets
 `A0 FD 20 00 A0 FD 20 00` (twice `&HeadTask`). FreeDOS prints "Run chkdsk: Bad

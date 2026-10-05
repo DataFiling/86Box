@@ -523,6 +523,72 @@ scripts) found and fixed:
   stale code (the exercise agent confirmed patched code took effect at
   once).
 
+### 16. DOS/32A
+
+FastDoom ships DOS/32A 9.1.2, the most common replacement for DOS/4GW; many
+games were rebound to it. I first bound it inside the Pentium VM with
+DOS/32A's own tools (`SB /R`, then `SS` with FastDoom's settings).
+`testdata/bind_dos32a.py` now does the same outside DOS. It rewrites the
+extender's MZ header, appends the LE part with its data-pages offset moved,
+and copies in the settings block. Its output is byte-identical to SB+SS.
+`build_fastdoom.sh` takes `FASTDOOM_EXTENDER=dos32a` and `FASTDOOM_DEBUG=0`.
+
+**What worked unchanged:**
+- `wait_for_program_start(protected_mode=true)` stopped at the 32-bit entry.
+  DOS/32A allocates the program's objects through its own DPMI (0501h,
+  called from inside its loader), so the existing detection applies. It
+  places objects tightly: code at 100010h, data at 165230h.
+- `load_symbols` placed the release map automatically: 617 of 625 call
+  targets landed on its functions.
+- Names in `log_hits`, `find_references` and `what_is` worked. For example,
+  `log_hits address=P_DamageMobj_` named the caller
+  `PTR_ShootTraverse_+343`, and `find_references target=_players+2C` listed
+  every health access by function.
+
+**What needed fixes:**
+- **DPMI calls from DOS/32A's kernel decoded as garbage.** The kernel is
+  16-bit protected-mode code. It passes DOS calls down by asking its DPMI
+  host to simulate a real-mode interrupt (0300h) with ES:EDI. That host
+  serves a 32-bit client, so it uses the full EDI. The stub captured ES:DI,
+  which was right during loading but wrong in game time, when EDI's upper
+  half is set. The stub now takes the full register in protected mode when
+  the upper half is set and the offset is inside the segment's limits.
+- **Every DOS call appeared twice.** DOS/32A passes calls down differently
+  from DOS/4GW: a DPMI 0300h from its kernel, not a real-mode INT 21h. The
+  copy is now recognised as a reflection (`dosinfo.is_reflection`, shared by
+  the INT log and `watch_program`).
+- **Pending calls survived a reset.** A hard reset left the stub's pending
+  calls in place, so every later call nested under an exec that would never
+  return. `resetx86()` now marks them as never returning. A soft reset is
+  left alone: 286 extenders and HIMEM use it to get back to real mode, and
+  their calls do return.
+- **`type_text` lost keys.** Typing ahead while DOS was copying a file
+  overflowed the BIOS's 15-key buffer, and the next command arrived
+  garbled. It now waits while the buffer is nearly full.
+- **False hang.** `watch_program` called DOS/4GW's private calls
+  (INT 21h FF00h/FF01h, which run the whole program) a hang. Calls with
+  AH >= 70h, past the documented DOS functions, no longer count as calls
+  that should return at once.
+- **`what_is` guessed functions for heap data.** It guessed a function for
+  a heap object (a map actor). It now guesses only inside the program's
+  code, and says when an address is outside the program's objects.
+
+**The FastDoom bug under DOS/32A.** The unpatched `-debug` build doesn't
+hang under DOS/32A; it loads and plays. To find out why:
+1. `log_hits` on the faulty store, logging EBP. During WAD loading, EBP was
+   always 30074h.
+2. An access watchpoint on 3006Ch-30073h showed DOS/32A's kernel pushing
+   through those bytes, so they are on its stack.
+3. At the store, the handler's saved stack was 0018:00030068, and
+   selector 0018 has base 0.
+
+The handler reserves its locals on the interrupted stack (`mov ebp,esp;
+sub esp,0Ch`). With a zero-based stack, linear EBP-8 is exactly that
+reserved slot, so the stores are harmless. Under DOS/4GW the interrupt
+stack's base is 143DF0h, and the same stores hit DOS's buffers. The bug
+report and `GROUND_TRUTH.md` now say the bug depends on the extender as
+well as on the build.
+
 ## Test results
 
 Test machines, built with `-DQT=OFF -DSDL2=ON -DGDBSTUB=ON` and run headless
@@ -554,9 +620,8 @@ this environment), and V86 mode under EMM386.
 
 - Breakpoints and watchpoints are on linear addresses, resolved when set; one
   set through a selector whose base later changes stays at the old address.
-- No DOS-extender awareness yet (load address, DPMI calls). V86 mode is
-  handled through the same descriptor caches but hasn't been tested under
-  EMM386 yet.
+- V86 mode is handled through the same descriptor caches but hasn't been
+  tested under EMM386 yet.
 - Watchpoints stop after the accessing instruction; on 8-bit-bus CPUs a word
   access reports its second byte's address.
 - Pausing from 86Box's own UI stops request servicing (tools time out).
@@ -569,8 +634,8 @@ this environment), and V86 mode under EMM386.
 1. **Report the FastDoom bug upstream**: `testdata/fastdoom-bug-report.md` is
    ready to paste (this environment can't post to that repository).
 2. More AI exercises on real software, e.g. a bug hunt without a map.
-3. **More real games and extenders:** the FastDoom repository also ships
-   DOS/32A; other open-source DOS games build with Open Watcom.
+3. **More real games and extenders:** other open-source DOS games build with
+   Open Watcom; EMM386/JEMM386 (V86 mode, VCPI) is untested.
 4. **Read LE/LX object tables** from the program file to place objects
    without a program-start stop.
 5. **Speed:** let the dynamic recompiler run while no breakpoints,

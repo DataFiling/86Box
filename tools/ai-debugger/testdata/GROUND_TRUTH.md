@@ -115,6 +115,13 @@ forever in FreeDOS's `searchblock`. The disk itself is fine.
 Only the `-debug` build is affected: `-d2` keeps `ptr`/`next` in the stack
 frame; the release build keeps them in registers.
 
+It also takes DOS/4GW. The same unpatched `-debug` build bound to DOS/32A
+(`FASTDOOM_EXTENDER=dos32a`) loads and plays. DOS/32A runs the handler, when
+IRQ0 interrupts real mode, on a flat interrupt stack (selector 0018h, base 0,
+ESP about 30068h), so `[ebp-8]`/`[ebp-4]` land on the 12 bytes the handler
+reserved for its locals there (linear 3006Ch-30073h). The faulty stores
+still happen but are harmless.
+
 **Evidence an AI should find:** a DOS call that never returns (watch_program:
 stuck inside INT 21h), the CPU looping in the FreeDOS kernel, "Run chkdsk"
 in the DOS output, corrupted kernel buffers, the value 0020FDA0 in them, and
