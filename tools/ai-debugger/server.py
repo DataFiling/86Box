@@ -498,16 +498,30 @@ def set_breakpoint(address: str) -> str:
 
 
 @tool
-def set_watchpoint(address: str, length: int = 1, kind: str = "write") -> str:
-    """Stop when memory in [address, address+length) is accessed. kind: write, read or access."""
+def set_watchpoint(address: str, length: int = 1, kind: str = "write", cpu_mode: str = "") -> str:
+    """Stop when memory in [address, address+length) is accessed. kind: write, read or access.
+
+    cpu_mode: "protected" or "real" makes ALL watchpoints catch only accesses
+    made in that CPU mode ("any" undoes it; empty leaves it as is). E.g. watch
+    DOS memory with cpu_mode="protected" to find a DOS-extender program writing
+    into it, while DOS's own (real-mode) writes don't stop the CPU."""
     c = client()
     k = {"write": WP_WRITE, "read": WP_READ, "access": WP_ACCESS}[kind]
+    note = ""
+    if cpu_mode:
+        mode = {"protected": "pm", "pm": "pm", "real": "rm", "rm": "rm", "any": "any"}.get(cpu_mode.lower())
+        if mode is None:
+            return "cpu_mode is protected, real or any."
+        c.monitor("wf " + mode)
+        note = " All watchpoints now catch %s accesses." % {"pm": "protected-mode", "rm": "real/V86-mode",
+                                                           "any": "all"}[mode]
     regs = _regs()
     loc = _resolve(address, regs)
     linear = loc.linear
     c.set_point(k, linear, max(1, length))
     _points[(k, linear)] = {"kind": k, "address": linear, "length": max(1, length), "expr": address}
-    return "%s watchpoint on %s, %d byte(s) = %s." % (kind.capitalize(), address, max(1, length), dos.describe(loc, regs))
+    return "%s watchpoint on %s, %d byte(s) = %s.%s" % (kind.capitalize(), address, max(1, length),
+                                                         dos.describe(loc, regs), note)
 
 
 @tool
@@ -543,6 +557,12 @@ def list_breakpoints() -> str:
                                                         {1: "call", 2: "return", 3: "call and return"}[w]))
     except GdbError:
         pass  # older 86Box build without interrupt catches
+    try:
+        wf = client().monitor("wf").split()[-1]
+        if wf != "any" and _points:
+            lines.append("(watchpoints catch %s accesses only)" % {"pm": "protected-mode", "rm": "real/V86-mode"}[wf])
+    except (GdbError, KeyError, IndexError):
+        pass
     return "\n".join(lines) or "None."
 
 

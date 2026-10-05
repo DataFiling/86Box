@@ -89,3 +89,34 @@ correct. The file itself (69 bytes, "LVL1", 4 levels) is fine.
 No planted bugs. MOUSETST prints the INT 33h position, buttons and press
 counts. BENCH prints `BENCH int=... fpu=... mem=... vga=...`, iterations per
 emulated second.
+
+## FastDoom, unpatched (real game, DOS/4GW, built with FASTDOOM_PATCH=0)
+
+**Symptom:** the game hangs near the end of startup, after it switches to
+mode 13h (black screen), always at about the same point.
+
+**Cause:** FastDoom's timer interrupt handler `TS_ServiceSchedule` (in
+`FASTDOOM/ns_task.c`, a Watcom `__interrupt` function) saves the interrupted
+stack, switches SS:ESP to its own zero-based stack, and keeps addressing its
+locals `ptr`/`next` through EBP. When IRQ0 arrives while the CPU is in real
+mode (inside DOS, e.g. reading the WAD), DOS/4GW runs the handler on its own
+interrupt stack, whose selector has a non-zero base (143DF0h in our runs),
+so after the switch `[ebp-8]`/`[ebp-4]` address low linear memory: FreeDOS's
+disk buffers at 2A00h-5200h. The handler writes the address of `HeadTask`
+(the task list head, data offset 10DA0h, linear 20FDA0h) twice there.
+Depending on what it hits, FreeDOS's buffer list becomes a loop without its
+start or a cached FAT sector gets 8 bad bytes; FreeDOS prints "Run chkdsk:
+Bad FAT value/index" and then loops forever in `searchblock` during a file
+call (in our runs, the open of FDOOM.map from FastDoom's debug code). The
+disk itself is fine.
+
+**Evidence an AI should find:** a DOS call that never returns (watch_program:
+stuck inside INT 21h), the CPU looping in the FreeDOS kernel, "Run chkdsk"
+in the DOS output, corrupted kernel buffers, the value 0020FDA0 in them, and
+with a protected-mode-only write watchpoint over the buffers
+(set_watchpoint cpu_mode="protected"), the writing instruction in
+`TS_ServiceSchedule` with EBP pointing into low memory.
+
+**Fix:** don't address locals through EBP after changing SS: make `ptr` and
+`next` static (fastdoom-ns_task-stack.patch), or compute EBP for the new
+stack too.

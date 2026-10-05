@@ -81,3 +81,30 @@ host second) under a CPU-bound load:
 (Host: 4-core cloud VM. BENCH scores, which count work per emulated second,
 doubled from 100 to 200 MHz: `int=2633 fpu=2376 mem=1161` vs
 `int=5564 fpu=4777 mem=2441`.)
+
+## A real game: FastDoom with Freedoom
+
+`build_fastdoom.sh` builds [FastDoom](https://github.com/viti95/FastDoom)
+(a DOS/4GW port of Doom for 386 to Pentium PCs) with Open Watcom, downloads
+the free [Freedoom](https://freedoom.github.io/) game data, and writes a
+64 MB hard disk image, `out/fastdoom-hd.img`, with both on C:. The disk has
+no DOS: its boot record (`mbr_boot_a.asm`) boots the test floppy in A:
+instead. Add it to the Pentium machine:
+
+```ini
+[Hard disks]
+hdd_01_parameters = 63, 16, 130, 0, ide
+hdd_01_fn = fastdoom-hd.img
+hdd_01_ide_channel = 0:0
+```
+
+At the `A:\>` prompt run `C:`, `CD \FDOOM`, `FDOOM`. Loading takes about
+two minutes of emulated time; the game then plays its demos. The build
+keeps the linker map (`out/fastdoom-build/FDOOM.MAP`); under DOS/4GW the
+code object was loaded at linear 174000h and the data object at 1FF000h.
+
+By default the build applies `fastdoom-ns_task-stack.patch`, which fixes a
+FastDoom bug found with this debugger (DEVLOG.md, section 13): its timer
+interrupt handler corrupts DOS memory, and the game hangs during startup.
+`FASTDOOM_PATCH=0 ./build_fastdoom.sh` builds it unpatched, for the
+exercise in `GROUND_TRUTH.md`.
