@@ -153,9 +153,9 @@ Example prompts:
   the same as rewinding the machine.
 - `INT n` calls are logged and caught when made with an `INT` instruction
   (as DOS programs call DOS, the BIOS and drivers); hardware interrupts and
-  calls made by jumping to a handler (`pushf; call far`) are not. On the 8086
-  cores a call catch stops at the handler's first instruction instead of
-  before the `INT`.
+  calls made by jumping to a handler (`pushf; call far`) are not. A call
+  catch is checked before each instruction except the one execution resumes
+  at, so resuming on a caught `INT` runs it.
 - The interrupt log keeps the last 4096 calls (identical back-to-back calls
   count as one); value scans keep their state on disk (in the system temp
   directory), one scan at a time per emulator.
