@@ -240,8 +240,18 @@ def pause() -> str:
 def resume() -> str:
     """Resume execution and return immediately. Use wait_for_stop or run_for afterwards."""
     c = client()
+    _mark_resume(c)
     c.resume()
     return "Resumed."
+
+
+def _mark_resume(c):
+    """Remember the stub's stop count at a resume, so a later wait_for_stop
+    (in another run_tool command) knows a stop since then is new."""
+    try:
+        memscan.save(_state_dir(), "resume-mark", {"stops": c.stub_state()["stops"]})
+    except (GdbError, OSError):
+        pass
 
 
 @tool
@@ -264,6 +274,14 @@ def wait_for_stop(timeout_seconds: float = 30.0) -> str:
     """Wait (while running) until a breakpoint/watchpoint hits. Does not pause on timeout."""
     c = client()
     if not c.running:
+        mark = memscan.load(_state_dir(), "resume-mark") or {}
+        try:
+            stops = c.stub_state()["stops"]
+        except GdbError:
+            stops = None
+        if stops is not None and mark.get("stops") is not None and stops > mark["stops"]:
+            memscan.save(_state_dir(), "resume-mark", {"stops": stops})  # report it once
+            return "Stopped after the last resume, before this call:\n\n" + _state_report(c.last_stop)
         return ("No new stop: the CPU was already stopped (resume it first).\n\n" + _state_report())
     stop = c.wait_stop(timeout=timeout_seconds)
     if stop is None:
@@ -653,7 +671,15 @@ def clear_breakpoint(address: str) -> str:
 @tool
 def list_breakpoints() -> str:
     """List breakpoints, watchpoints and interrupt catches."""
-    lines = ["%-12s %08X len=%d  (%s)" % (KIND_NAMES[p["kind"]], p["address"], p["length"], p["expr"])
+    hits = {}
+    try:
+        client().list_points()
+        hits = getattr(client(), "point_hit_counts", {})
+    except GdbError:
+        pass
+    lines = ["%-12s %08X len=%d  (%s)%s" % (KIND_NAMES[p["kind"]], p["address"], p["length"], p["expr"],
+                                          "  hits=%d" % hits[(p["kind"], p["address"])]
+                                          if (p["kind"], p["address"]) in hits else "")
              for p in _points.values()]
     try:
         for v, ah, al, w in client().int_status()["catches"]:
@@ -784,6 +810,7 @@ def _ensure_running():
     c = client()
     if not c.running:
         last = c.last_stop
+        _mark_resume(c)
         c.resume()
         if last is not None and last.reason not in ("pause", "trap"):
             return (" (NOTE: the CPU was stopped by: %s; resumed it so the guest receives input)"
@@ -2014,74 +2041,155 @@ def find_references(target: str, code: str = "", max_results: int = 50) -> str:
     return "\n".join(lines)
 
 
+_HIT_FMT = struct.Struct("<4I8II6H4III")  # one logpoint record of the stub's "ll" output
+_HIT_REGS = ("eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp")
+
+
+def _parse_hits(raw, size):
+    out = []
+    for k in range(0, len(raw) - size + 1, size):
+        f = _HIT_FMT.unpack_from(raw, k)
+        r = dict(zip(_HIT_REGS, f[4:12]))
+        r["eflags"] = f[12]
+        r.update(zip(dos.SEGS, f[13:19]))
+        out.append({"seq": f[0], "addr": f[1], "tsc": f[2] | (f[3] << 32), "regs": r,
+                    "stack": f[19:23] if f[24] & 1 else None, "mem": f[23] if f[24] & 2 else None,
+                    "mode": (f[24] >> 8) & 3})
+    return out
+
+
+def _logpoint_memory(spec, regs):
+    """(reg, disp) for the stub: "esi+2C", "ds:si", "bx-4" (DS-relative), or a
+    linear address / symbol (reg 8)."""
+    t = spec.strip().lower().replace(" ", "")
+    if t.startswith("ds:"):
+        t = t[3:]
+    m = re.fullmatch(r"\[?(e?[abcd]x|e?[sd]i|e?[bs]p)(?:([+-])(?:0x)?([0-9a-f]+)h?)?\]?", t)
+    if m:
+        reg = m.group(1) if m.group(1).startswith("e") else dos.REG16[m.group(1)]
+        disp = int(m.group(3), 16) if m.group(3) else 0
+        return _HIT_REGS.index(reg), (-disp if m.group(2) == "-" else disp) & 0xFFFFFFFF
+    if re.match(r"[a-z]s:", t):
+        raise ValueError("memory= can be relative to DS only (e.g. \"esi+2C\"), or an address")
+    return 8, _resolve(spec, regs).linear
+
+
+def _looks_like_return(c, ret_lin, target, bits):
+    """Whether ret_lin follows a call (direct to target, or indirect)."""
+    if not 7 <= ret_lin < 0xFFFFFFF0:
+        return False
+    try:
+        b = c.read_memory(ret_lin - 7, 7)
+    except GdbError:
+        return False
+    if len(b) < 7:
+        return False
+    n = 5 if bits == 32 else 3
+    if b[7 - n] == 0xE8:
+        rel = int.from_bytes(b[8 - n:], "little", signed=True)
+        if bits == 32:
+            return (ret_lin + rel) & 0xFFFFFFFF == target
+        return (ret_lin + rel - target) & 0xFFFF == 0  # same code segment: offsets agree mod 64K
+    # Indirect: FF /2 (call r/m) with a 0-, 1-, 4- or 2-byte operand after the ModRM byte.
+    return any(b[7 - k] == 0xFF and (b[8 - k] >> 3) & 7 == 2 for k in (2, 3, 6, 4))
+
+
 @tool
 def log_hits(address: str, seconds: float = 10.0, max_hits: int = 200, registers: str = "eax ebx ecx edx",
              memory: str = "") -> str:
-    """Count and log the times execution reaches `address`, without stopping
-    for you: a temporary breakpoint records each hit (the chosen registers, the
-    return address on the stack, i.e. the caller when `address` is a function
-    entry, and optionally the dword at `memory`: an address, symbol or
-    expression such as "ds:si" or "esi+2C") and continues, for up to `seconds`
-    or `max_hits`. Each hit costs ~1-2 ms of host time."""
+    """Record each time execution reaches `address`, without stopping: the
+    emulator logs every hit itself (the chosen registers, the return address
+    when `address` is a function entry, and optionally the dword at `memory`:
+    an address or symbol, or relative to DS like "esi+2C" or "ds:si") while
+    the program runs at full speed, for `seconds` of real time or until
+    `max_hits`. Times are emulated seconds since the first hit."""
     c = client()
     regs = _regs()
     loc = _resolve(address, regs)
     names = [r.lower() for r in registers.replace(",", " ").split()]
-    temp = (BP_HARDWARE, loc.linear) not in _points
-    if temp:
-        c.set_point(BP_HARDWARE, loc.linear)
-    hits, other, callers = [], None, {}
+    mem = None
+    if memory:
+        try:
+            mem = _logpoint_memory(memory, regs)
+        except ValueError as e:
+            return "memory=%s: %s" % (memory, e)
+    st = c.logpoints("%x" % loc.linear + (" %x %x" % mem if mem else ""))
+    start = st["next"]
     t_end = time.time() + max(0.1, seconds)
+    was_running = c.running
     try:
         if not c.running:
             c.resume()
-        while len(hits) < max_hits:
-            stop = c.wait_stop(timeout=max(0.05, t_end - time.time()))
-            if stop is None:
+        while time.time() < t_end:
+            time.sleep(min(0.25, max(0.0, t_end - time.time())))
+            st = c.logpoints()
+            if st["next"] - start >= max_hits:
                 break
-            r = _regs()
-            if stop.reason != "breakpoint" or r["eip"] != loc.linear:
-                other = stop
+            if not c.running:  # stopped for something else (breakpoint, watchpoint)
                 break
-            # The return address on the stack tells who called (for function entries).
-            ss = dos.seg_cache(r, "ss")["base"]
-            w = 4 if dos.stack_bits(r) == 32 else 2
-            sp = r["esp"] if w == 4 else r["esp"] & 0xFFFF
-            ret = int.from_bytes(c.read_memory(ss + sp, w), "little")
-            ret_lin = ret if w == 4 else dos.seg_cache(r, "cs")["base"] + ret
-            callers[ret_lin] = callers.get(ret_lin, 0) + 1
-            vals = []
-            for n in names:
-                try:
-                    vals.append("%s=%08X" % (n.upper(), dos.reg_value(n, r)))
-                except (KeyError, ValueError):
-                    vals.append("%s=?" % n)
-            if memory:
-                m = _resolve(memory, r).linear
-                vals.append("[%s]=%08X" % (memory, int.from_bytes(c.read_memory(m, 4), "little")))
-            hits.append("%.2fs  %s  ret %08X%s" % (seconds - (t_end - time.time()), " ".join(vals), ret_lin,
-                                                   _sym(ret_lin)))
-            if time.time() >= t_end:
-                break
-            c.resume()
+        stopped = None if c.running else c.last_stop
+        if c.running and not was_running:
+            c.pause()
     finally:
-        if temp:
-            if c.running:
-                c.pause()
-            c.clear_point(BP_HARDWARE, loc.linear)
-            if other is None:
-                c.resume()
-    lines = ["%d hit(s) of %s (linear %08X%s) in %.1fs%s." % (
-        len(hits), address, loc.linear, _sym(loc.linear), seconds, " (max_hits reached)" if len(hits) >= max_hits else "")]
-    if callers:
-        lines.append("Return addresses on the stack (callers, if this is a function entry):")
+        st = c.logpoints("- %x" % loc.linear)
+    total = next((h for a, _, _, h in st["points"] if a == loc.linear), None)
+    hits = [h for h in _parse_hits(c.hit_log(start), st["record"]) if h["addr"] == loc.linear][:max_hits]
+    lost = max(0, st["first"] - start)
+    hz = st.get("hz") or 1
+    head = "%d hit(s) of %s (linear %08X%s) in %.1fs of real time" % (
+        len(hits), address, loc.linear, _sym(loc.linear), seconds - max(0.0, t_end - time.time()))
+    if hits:
+        head += ", %.2f emulated seconds" % ((hits[-1]["tsc"] - hits[0]["tsc"]) / hz)
+    head += " (max_hits reached)." if len(hits) >= max_hits else "."
+    lines = [head]
+    if lost:
+        lines.append("(the oldest %d hit(s) were overwritten in the stub's buffer)" % lost)
+    # Return addresses, when the address is a function entry (the stack top
+    # then holds a return address just after a call).
+    rets = []
+    for h in hits:
+        if h["stack"] is None:
+            rets.append(None)
+            continue
+        r = h["regs"]
+        if h["mode"] == 3 or (h["mode"] == 2 and dos.stack_bits(regs) == 32):
+            rets.append(h["stack"][0])
+        else:
+            ip = h["stack"][0] & 0xFFFF
+            cs_base = r["cs"] * 16 if h["mode"] < 2 else dos.seg_cache(regs, "cs")["base"]
+            rets.append(cs_base + ip)
+    sample = [(a, h) for a, h in zip(rets, hits) if a is not None][:20]
+    bits = _linear_code_bits(regs, loc.linear)
+    entry = bool(sample) and sum(_looks_like_return(c, a, loc.linear, bits) for a, _ in sample) * 2 > len(sample)
+    if entry:
+        callers = {}
+        for a in rets:
+            if a is not None:
+                callers[a] = callers.get(a, 0) + 1
+        lines.append("Callers (return addresses on the stack):")
         for a, n in sorted(callers.items(), key=lambda kv: -kv[1])[:10]:
             lines.append("  %08X%s  x%d" % (a, _sym(a), n))
-    lines += hits[:60]
-    if len(hits) > 60:
-        lines.append("... %d more hits" % (len(hits) - 60))
-    if other is not None:
-        lines += ["", "Stopped for another reason:", _state_report(other)]
+    t0 = hits[0]["tsc"] if hits else 0
+    out = []
+    for h, a in zip(hits, rets):
+        vals = []
+        for n in names:
+            try:
+                width = 2 if n in dos.REG8 else 4 if n in dos.SEGS or n in dos.REG16 else 8
+                vals.append("%s=%0*X" % (n.upper(), width, dos.reg_value(n, h["regs"])))
+            except (KeyError, ValueError):
+                vals.append("%s=?" % n)
+        if mem:
+            vals.append("[%s]=%s" % (memory, "%08X" % h["mem"] if h["mem"] is not None else "?"))
+        out.append("%.4fs  %s%s" % ((h["tsc"] - t0) / hz, " ".join(vals),
+                                    ("  ret %08X%s" % (a, _sym(a))) if entry and a is not None else ""))
+    lines += out[:60]
+    if len(out) > 60:
+        lines.append("... %d more hits (%d shown)" % (len(out) - 60, 60))
+    if total is not None and total > len(hits) + lost:
+        lines.append("(%d hits in all while the logpoint was set)" % total)
+    if stopped is not None:
+        lines += ["", "Stopped for another reason:", _state_report(stopped)]
     return "\n".join(lines)
 
 

@@ -589,6 +589,34 @@ stack's base is 143DF0h, and the same stores hit DOS's buffers. The bug
 report and `GROUND_TRUTH.md` now say the bug depends on the extender as
 well as on the build.
 
+### 17. Logpoints, hit counts, stops between commands
+
+These fix the remaining problems from the exercise feedback and the DOS/32A
+round:
+
+- **`log_hits` stopped the CPU at every hit.** Each stop cost several round
+  trips, so it managed about 9 hits per real second. The stub now has
+  logpoints (`lp`/`ll` monitor commands), which record each hit into a
+  4096-entry ring buffer while the program runs at full speed. Each record
+  holds the registers, segment selectors, 16 bytes at SS:(E)SP and an
+  optional dword at DS:reg+disp or a linear address.
+  - On FastDoom's timer handler it logged 357 hits in 10.16 emulated
+    seconds: Doom's 35 Hz tick.
+  - Times are now emulated seconds.
+  - Callers are listed only when the stack top really is a return address,
+    one just after a call (direct to this address, or indirect). This holds
+    in 16- and 32-bit code; a mid-function address no longer shows junk
+    "callers".
+- **Hit counts:** breakpoints and watchpoints count the times they stopped
+  the CPU (a fourth column in `bl`), and `list_breakpoints` shows them.
+- **`wait_for_stop` across commands:** the stub's `state` reply now includes
+  a stop counter, and `resume` records it. A stop that happened between a
+  `resume` and a later `wait_for_stop` (separate `run_tool` commands) is now
+  reported as that stop. It used to be "No new stop: the CPU was already
+  stopped".
+- **Memory reads at junk addresses:** `read_memory` masks addresses to 32
+  bits and turns an unexpected reply into a GdbError, not a ValueError.
+
 ## Test results
 
 Test machines, built with `-DQT=OFF -DSDL2=ON -DGDBSTUB=ON` and run headless

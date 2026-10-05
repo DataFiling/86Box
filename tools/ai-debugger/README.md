@@ -112,13 +112,13 @@ can also be imported directly from Python.
 | Interrupt calls | `log_interrupts` + `read_interrupt_log` (INT 21h DOS, 31h DPMI, 10h video, 33h mouse... with decoded arguments, file names, buffers and results), `catch_interrupt` (stop on a call or its return), `clear_interrupt_catches` |
 | Symbols | `load_symbols` (an Open Watcom linker map, placed automatically for 16-bit programs and DOS/4GW or DOS/32A objects, checked against the code in memory; `map_path=none` unloads), `lookup_symbol` (`module!name` for duplicated statics); names then work as addresses (`set_breakpoint address=main_`) and appear in disassembly, the CPU state, stacks, the INT log and watch_program |
 | Addresses | `what_is` (symbol, PC memory area, DOS block and owner, DPMI block, the function it is in) |
-| Code | `find_references` (instructions that use an address or call/jump to it), `log_hits` (run and record each time an address executes: registers, memory, callers, without stopping for long), `patch_code` (jmp/call/nop/ret, padded to whole instructions; `undo`) |
+| Code | `find_references` (instructions that use an address or call/jump to it), `log_hits` (the emulator records each time an address executes, without stopping: registers, a memory dword, callers, emulated time), `patch_code` (jmp/call/nop/ret, padded to whole instructions; `undo`) |
 | Unattended runs | `watch_program` (start a program, watch it, and report whether it exited, crashed, hung or waits for input, with evidence) |
 | Finding variables | `scan_memory` + `scan_next` (value, changed, decreased, -1...), `snapshot_memory` + `diff_memory`, `restore_memory` |
 | State | `get_state` (registers, CPU mode, next instructions), `set_register`, `read_stack` |
 | Protected mode | `get_segments` (descriptor caches, code/stack size, CPL, GDTR/IDTR/LDTR/TR), `read_descriptor_table` (decoded GDT, LDT or IDT entries) |
 | Memory | `read_memory` (hex/words/dwords/text), `write_memory`, `search_memory` (hex with `??` wildcards, or quoted text; all RAM by default, without side effects), `disassemble` |
-| Break/watch | `set_breakpoint`, `set_watchpoint` (write/read/access, any length), `clear_breakpoint`, `list_breakpoints` |
+| Break/watch | `set_breakpoint`, `set_watchpoint` (write/read/access, any length), `clear_breakpoint`, `list_breakpoints` (with hit counts) |
 | Screen | `screenshot` (PNG of the displayed frame, any video mode; optional `downscale`, `save_path`), `read_text_screen` (BIOS mode, page, cursor, CP437 text; `plain` for the text only) |
 | Input | `press_keys` (`"enter"`, `"ctrl+c"`, `"up up space"`), `type_text`, `key_down`/`key_up` (hold keys), `mouse_move`, `mouse_click`, `mouse_buttons` (drag), `mouse_scroll` |
 | PC/DOS | `read_interrupt_vectors`, `io_read`, `io_write` |

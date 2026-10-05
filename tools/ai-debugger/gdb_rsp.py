@@ -115,14 +115,27 @@ class GdbClient:
         else:
             self.last_stop = self.query_stop()
 
-    def query_running(self):
-        """Whether the CPU is running (False on builds without "state")."""
+    def stub_state(self):
+        """The stub's "state": {"running": bool, "stops": count or None}
+        ({"running": False} on builds without it)."""
         try:
-            return self.monitor("state").split() == ["running", "1"]
+            text = self.monitor("state")
         except GdbError as e:
             if "unknown" in str(e):
-                return False
+                return {"running": False, "stops": None}
             raise
+        st = {"running": False, "stops": None}
+        for line in text.splitlines():
+            words = line.split()
+            if len(words) == 2 and words[0] == "running":
+                st["running"] = words[1] == "1"
+            elif len(words) == 2 and words[0] == "stops":
+                st["stops"] = int(words[1], 16)
+        return st
+
+    def query_running(self):
+        """Whether the CPU is running (False on builds without "state")."""
+        return self.stub_state()["running"]
 
     def query_stop(self):
         """Why the CPU is stopped, as a StopEvent, or None if the stub doesn't say."""
@@ -327,14 +340,18 @@ class GdbClient:
         into a page the CPU can't read (the stub returns what it read before
         the fault); raises only if nothing at all could be read."""
         out = bytearray()
+        addr &= 0xFFFFFFFF
         while length > 0:
-            n = min(length, self.CHUNK)
+            n = min(length, self.CHUNK, 0x100000000 - addr)
             reply = self.request("m%x,%x" % (addr, n))
             if reply.startswith("E") and len(reply) == 3:
                 if out:
                     break
                 raise GdbError("memory read failed at %08X (%s; page fault?)" % (addr, reply))
-            data = bytes.fromhex(reply)
+            try:
+                data = bytes.fromhex(reply)
+            except ValueError:
+                raise GdbError("unexpected reply to a memory read at %08X: %r" % (addr, reply[:40])) from None
             out += data
             if len(data) < n:  # partial read, e.g. page fault mid-way
                 break
@@ -365,10 +382,13 @@ class GdbClient:
                 return None
             raise
         points = []
+        self.point_hit_counts = {}
         for line in text.splitlines():
             parts = line.split()
-            if len(parts) == 3:
+            if len(parts) >= 3:
                 points.append((int(parts[0]), int(parts[1], 16), int(parts[2], 16)))
+                if len(parts) >= 4:  # newer builds: times it stopped the CPU
+                    self.point_hit_counts[(int(parts[0]), int(parts[1], 16))] = int(parts[3], 16)
         return points
 
     def clear_point(self, kind, addr, length=1):
@@ -461,6 +481,29 @@ class GdbClient:
         """Raw log records (bytes each) from sequence number `first` on."""
         cmd = "tl 0x%x" % first + ("" if count is None else " 0x%x" % count)
         return self.monitor(cmd, raw=True)
+
+    def logpoints(self, cmd=""):
+        """"lp" (with an optional command: "ADDR [REG DISP]", "- ADDR", "off"):
+        {"first", "next", "record", "points": [(addr, reg, disp, hits)], "tsc", "hz"}."""
+        st = {"points": []}
+        for line in self.monitor(("lp " + cmd).strip()).splitlines():
+            words = line.split()
+            if not words:
+                continue
+            if words[0] == "log":
+                for w in words[1:]:
+                    k, v = w.split("=")
+                    st[k] = int(v, 16)
+            elif words[0] == "lp":
+                st["points"].append((int(words[1], 16), int(words[2]), int(words[3], 16), int(words[4], 16)))
+            elif words[0] == "tsc":
+                st["tsc"] = int(words[1], 16)
+                st["hz"] = int(words[3])
+        return st
+
+    def hit_log(self, first=0, count=None):
+        """Raw logpoint records from sequence number `first` on."""
+        return self.monitor("ll 0x%x" % first + ("" if count is None else " 0x%x" % count), raw=True)
 
     def int_log_clear(self):
         self.monitor("tc")

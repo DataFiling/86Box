@@ -163,6 +163,7 @@ typedef struct _gdbstub_breakpoint_ {
         uint8_t  orig_val;
         uint32_t end;
     };
+    uint32_t hits; /* times it stopped the CPU */
 
     struct _gdbstub_breakpoint_ *next;
 } gdbstub_breakpoint_t;
@@ -352,6 +353,7 @@ static WSADATA wsa;
 #endif
 static int      gdbstub_socket = -1;
 static int      stop_reason_len = 0;
+static uint32_t stop_count      = 0; /* stops so far, so clients can tell a new one from an old one */
 static int      in_gdbstub = 0;
 static uint32_t watch_addr;
 static char     stop_reason[2048];
@@ -443,6 +445,37 @@ static int                  catch_count;
 static int                  catch_stop_vector;
 static int                  catch_stop_return;
 static uint32_t             catch_stop_seq;
+
+/* Logpoints ("lp"/"ll"): addresses whose execution is recorded without
+   stopping, with the registers, the top of the stack and optionally a dword
+   of memory, into a ring buffer read with "ll". The record layout is part of
+   the "ll" output, so fields are only ever appended. */
+#define HITLOG_SIZE   4096 /* records, power of 2 */
+#define LOGPOINTS_MAX 8
+
+typedef struct {
+    uint32_t seq, addr;
+    uint32_t tsc_lo, tsc_hi;
+    uint32_t regs[8]; /* EAX EBX ECX EDX ESI EDI EBP ESP */
+    uint32_t eflags;
+    uint16_t sel[6];   /* CS SS DS ES FS GS */
+    uint32_t stack[4]; /* 16 bytes at SS:(E)SP */
+    uint32_t mem;      /* the dword at the logpoint's memory operand */
+    uint32_t flags;    /* bit 0 stack read, bit 1 memory read, bits 8-9 mode (0 real, 1 V86, 2 PM16, 3 PM32) */
+} gdbstub_hitlog_t;
+
+typedef struct {
+    uint32_t addr;
+    int      mem_reg; /* -1 none, 0-7 EAX EBX ECX EDX ESI EDI EBP ESP (DS-relative), 8 linear */
+    uint32_t mem_disp;
+    uint32_t hits;
+} gdbstub_logpoint_t;
+
+static gdbstub_hitlog_t  *hitlog;
+static uint32_t           hitlog_next  = 1;
+static uint32_t           hitlog_first = 1;
+static gdbstub_logpoint_t logpoints[LOGPOINTS_MAX];
+static int                logpoint_count;
 static uint32_t             xrange_lo[8], xrange_hi[8];
 static int                  xrange_count;
 static uint32_t             xrange_hit;
@@ -1435,13 +1468,13 @@ e00:
                     gdbstub_client_respond_hex(client, (uint8_t *) client->packet, client->packet_pos);
                     break;
                 } else if (!strcmp(p, "bl")) {
-                    /* List breakpoints and watchpoints: type (Z packet number), address, length. */
+                    /* List breakpoints and watchpoints: type (Z packet number), address, length, hits. */
                     static gdbstub_breakpoint_t **lists[] = { &first_swbreak, &first_hwbreak, &first_wwatch, &first_rwatch, &first_awatch };
                     client->packet_pos = 0;
                     for (l = 0; l < 5; l++) {
                         for (breakpoint = *lists[l]; breakpoint && (client->packet_pos < 4000); breakpoint = breakpoint->next)
-                            client->packet_pos += sprintf(&client->packet[client->packet_pos], "%d %08X %X\n", l, breakpoint->addr,
-                                                          (l < 2) ? 1 : (breakpoint->end - breakpoint->addr));
+                            client->packet_pos += sprintf(&client->packet[client->packet_pos], "%d %08X %X %X\n", l, breakpoint->addr,
+                                                          (l < 2) ? 1 : (breakpoint->end - breakpoint->addr), breakpoint->hits);
                     }
                     client->response_pos = 0;
                     if (client->packet_pos)
@@ -1500,6 +1533,75 @@ e00:
                         client->response[client->response_pos++] = 'O';
                         for (j = 0; (j < k) && max && ((int32_t) (intlog_next - from) > 0); j++, max--, from++)
                             gdbstub_client_respond_hex(client, (uint8_t *) &intlog[from & (INTLOG_SIZE - 1)], sizeof(gdbstub_intlog_t));
+                        gdbstub_client_respond_partial(client);
+                        if (client->gone)
+                            break;
+                    }
+                } else if (!strcmp(p, "lp")) {
+                    /* Logpoints: "lp ADDR [REG DISP]" adds one (REG 0-7 EAX EBX ECX EDX ESI EDI
+                       EBP ESP for a dword at DS:REG+DISP, 8 for the linear DISP), "lp - ADDR"
+                       removes one, "lp off" removes all; always shows the state. */
+                    if ((p = strtok_r(NULL, " ", &strtok_save))) {
+                        uint32_t addr, reg = (uint32_t) -1, disp = 0;
+                        if (!strcmp(p, "off"))
+                            logpoint_count = 0;
+                        else if (!strcmp(p, "-")) {
+                            if (!(p = strtok_r(NULL, " ", &strtok_save)) || !gdbstub_parse_hex(p, &addr))
+                                goto e22;
+                            for (i = 0; i < logpoint_count; i++) {
+                                if (logpoints[i].addr == addr) {
+                                    memmove(&logpoints[i], &logpoints[i + 1], (logpoint_count - i - 1) * sizeof(gdbstub_logpoint_t));
+                                    logpoint_count--;
+                                    break;
+                                }
+                            }
+                        } else {
+                            if (!gdbstub_parse_hex(p, &addr))
+                                goto e22;
+                            if ((p = strtok_r(NULL, " ", &strtok_save))) {
+                                if (!gdbstub_parse_hex(p, &reg) || (reg > 8) || !(p = strtok_r(NULL, " ", &strtok_save)) || !gdbstub_parse_hex(p, &disp))
+                                    goto e22;
+                            }
+                            for (i = 0; (i < logpoint_count) && (logpoints[i].addr != addr); i++)
+                                ;
+                            if (i == logpoint_count) {
+                                if (logpoint_count == LOGPOINTS_MAX)
+                                    goto e22;
+                                logpoint_count++;
+                            }
+                            if (!hitlog && !(hitlog = (gdbstub_hitlog_t *) calloc(HITLOG_SIZE, sizeof(gdbstub_hitlog_t))))
+                                goto e22;
+                            logpoints[i].addr     = addr;
+                            logpoints[i].mem_reg  = (int) reg;
+                            logpoints[i].mem_disp = disp;
+                            logpoints[i].hits     = 0;
+                        }
+                    }
+                    client->packet_pos = sprintf(client->packet, "log first=%X next=%X size=%X record=%X\n", hitlog_first, hitlog_next,
+                                                 HITLOG_SIZE, (int) sizeof(gdbstub_hitlog_t));
+                    for (i = 0; i < logpoint_count; i++)
+                        client->packet_pos += sprintf(&client->packet[client->packet_pos], "lp %08X %d %X %X\n", logpoints[i].addr,
+                                                      logpoints[i].mem_reg, logpoints[i].mem_disp, logpoints[i].hits);
+                    client->packet_pos += sprintf(&client->packet[client->packet_pos], "tsc %" PRIX64 " hz %d\n", tsc, cpu_s->rspeed);
+                    client->response_pos = 0;
+                    gdbstub_client_respond_hex(client, (uint8_t *) client->packet, client->packet_pos);
+                    break;
+                } else if (!strcmp(p, "ll")) {
+                    /* Stream logpoint records from a sequence number on, as raw records. */
+                    uint32_t from = hitlog_first;
+                    uint32_t max  = HITLOG_SIZE;
+                    if ((p = strtok_r(NULL, " ", &strtok_save)) && !gdbstub_parse_hex(p, &from))
+                        goto e22;
+                    if ((p = strtok_r(NULL, " ", &strtok_save)) && !gdbstub_parse_hex(p, &max))
+                        goto e22;
+                    if ((int32_t) (from - hitlog_first) < 0)
+                        from = hitlog_first;
+                    k = (((sizeof(client->response) - 2) >> 1) - 1) / sizeof(gdbstub_hitlog_t);
+                    while (hitlog && max && ((int32_t) (hitlog_next - from) > 0)) {
+                        client->response_pos                     = 0;
+                        client->response[client->response_pos++] = 'O';
+                        for (j = 0; (j < k) && max && ((int32_t) (hitlog_next - from) > 0); j++, max--, from++)
+                            gdbstub_client_respond_hex(client, (uint8_t *) &hitlog[from & (HITLOG_SIZE - 1)], sizeof(gdbstub_hitlog_t));
                         gdbstub_client_respond_partial(client);
                         if (client->gone)
                             break;
@@ -1609,7 +1711,7 @@ e00:
                     break;
                 } else if (!strcmp(p, "state")) {
                     /* Report whether the CPU is running, for clients that connect while holding. */
-                    client->packet_pos   = sprintf(client->packet, "running %d\n", gdbstub_step == GDBSTUB_EXEC);
+                    client->packet_pos   = sprintf(client->packet, "running %d\nstops %X\n", gdbstub_step == GDBSTUB_EXEC, stop_count);
                     client->response_pos = 0;
                     gdbstub_client_respond_hex(client, (uint8_t *) client->packet, client->packet_pos);
                     break;
@@ -1991,6 +2093,7 @@ gdbstub_cpu_exec(int32_t cycs)
     } else {
         was_stopped     = 1;
         stop_reason_len = 0;
+        stop_count++;
         /* Assemble stop reason manually, avoiding sprintf and friends for performance. */
         stop_reason[stop_reason_len++] = 'T';
         stop_reason[stop_reason_len++] = '0';
@@ -2369,7 +2472,7 @@ gdbstub_cpu_reset(void)
 static void
 gdbstub_int_clear(void)
 {
-    intlog_on = int_pending_count = catch_count = xrange_count = watch_mode_filter = 0;
+    intlog_on = int_pending_count = catch_count = xrange_count = watch_mode_filter = logpoint_count = 0;
     memset(intlog_vectors, 0, sizeof(intlog_vectors));
     memset(int_ret_hash, 0, sizeof(int_ret_hash));
 }
@@ -2533,6 +2636,44 @@ gdbstub_catch_call(uint32_t addr)
 
 /* Called after every instruction (and interrupt delivery), before the next
    one runs. Nonzero stops the CPU. */
+static void
+gdbstub_logpoint_hit(gdbstub_logpoint_t *lp)
+{
+    uint32_t          seq = hitlog_next++;
+    gdbstub_hitlog_t *rec = &hitlog[seq & (HITLOG_SIZE - 1)];
+    int               old_in_gdbstub = in_gdbstub;
+    uint32_t          sp             = stack32 ? ESP : SP;
+    int               mode           = !(msw & 1) ? 0 : ((cpu_state.eflags & VM_FLAG) ? 1 : (use32 ? 3 : 2));
+    const uint32_t    regs[8]        = { EAX, EBX, ECX, EDX, ESI, EDI, EBP, ESP };
+
+    if ((hitlog_next - hitlog_first) > HITLOG_SIZE)
+        hitlog_first = hitlog_next - HITLOG_SIZE;
+    memset(rec, 0, sizeof(gdbstub_hitlog_t));
+    rec->seq    = seq;
+    rec->addr   = lp->addr;
+    rec->tsc_lo = (uint32_t) tsc;
+    rec->tsc_hi = (uint32_t) (tsc >> 32);
+    memcpy(rec->regs, regs, sizeof(regs));
+    rec->eflags = cpu_state.eflags | (cpu_state.flags & 0xffff);
+    rec->sel[0] = CS;
+    rec->sel[1] = SS;
+    rec->sel[2] = DS;
+    rec->sel[3] = ES;
+    rec->sel[4] = FS;
+    rec->sel[5] = GS;
+    rec->flags  = mode << 8;
+    in_gdbstub  = 1;
+    if (gdbstub_peek(ss + sp, (uint8_t *) rec->stack, sizeof(rec->stack)) == sizeof(rec->stack))
+        rec->flags |= 1;
+    if (lp->mem_reg >= 0) {
+        uint32_t lin = (lp->mem_reg == 8) ? lp->mem_disp : (ds + regs[lp->mem_reg] + lp->mem_disp);
+        if (gdbstub_peek(lin, (uint8_t *) &rec->mem, 4) == 4)
+            rec->flags |= 2;
+    }
+    in_gdbstub = old_in_gdbstub;
+    lp->hits++;
+}
+
 int
 gdbstub_instruction(void)
 {
@@ -2564,6 +2705,15 @@ gdbstub_instruction(void)
     if (stopped)
         return 1;
 
+    /* Logpoints: record and carry on. */
+    if (logpoint_count) {
+        uint32_t addr = gdbstub_pc();
+        for (int i = 0; i < logpoint_count; i++) {
+            if (logpoints[i].addr == addr)
+                gdbstub_logpoint_hit(&logpoints[i]);
+        }
+    }
+
     /* Check hardware breakpoints if any are present. */
     gdbstub_breakpoint_t *breakpoint = first_hwbreak;
     if (breakpoint) {
@@ -2575,6 +2725,7 @@ gdbstub_instruction(void)
             /* Check if the breakpoint coincides with this address. */
             if (breakpoint->addr == wanted_addr) {
                 gdbstub_log("GDB Stub: Hardware breakpoint at %08X\n", wanted_addr);
+                breakpoint->hits++;
 
                 /* Flag that we're in a hardware breakpoint. */
                 gdbstub_step = GDBSTUB_BREAK_HW;
@@ -2608,6 +2759,7 @@ gdbstub_int3(void)
             /* Check if the breakpoint coincides with this address. */
             if (breakpoint->addr == wanted_addr) {
                 gdbstub_log("GDB Stub: Software breakpoint at %08X\n", wanted_addr);
+                breakpoint->hits++;
 
                 /* Move EIP back to where the break instruction was. */
                 cpu_state.pc = new_pc;
@@ -2657,6 +2809,8 @@ gdbstub_mem_access(uint32_t *addrs, int access)
             }
             if (i < width) {
                 gdbstub_log("GDB Stub: %s watchpoint at %08X\n", (access & GDBSTUB_MEM_AWATCH) ? "Access" : ((access & GDBSTUB_MEM_WRITE) ? "Write" : "Read"), watch_addr);
+
+                watchpoint->hits++;
 
                 /* Flag that we're in a read/write watchpoint. */
                 gdbstub_step = (access & GDBSTUB_MEM_AWATCH) ? GDBSTUB_BREAK_AWATCH : ((access & GDBSTUB_MEM_WRITE) ? GDBSTUB_BREAK_WWATCH : GDBSTUB_BREAK_RWATCH);
