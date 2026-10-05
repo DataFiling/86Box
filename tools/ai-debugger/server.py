@@ -18,6 +18,7 @@ import dos
 import dosinfo
 import memscan
 import pcinput
+import watchdog
 from gdb_rsp import (BP_HARDWARE, BP_SOFTWARE, WP_ACCESS, WP_READ, WP_WRITE, GdbClient, GdbError)
 
 INSTRUCTIONS = """\
@@ -1443,6 +1444,154 @@ def restore_memory(snapshot: str, address: str, length: int) -> str:
     c.write_memory(loc.linear, data)
     return "Restored %d byte(s) at %s from %r: %s" % (length, dos.describe(loc, regs), snapshot,
                                                      data[:32].hex(" ").upper() + (" ..." if length > 32 else ""))
+
+
+# ---- unattended runs ---------------------------------------------------------------
+
+@tool
+def watch_program(command: str = "", seconds: float = 60.0, hang_seconds: float = 8.0,
+                  stop_when: str = "exit,crash,hang") -> str:
+    """Run a program unattended and report what happened: it exited (and with
+    which code), crashed (error/exception text, e.g. "Invalid Opcode" or a DOS
+    extender's exception dump), hung (the CPU stuck in one small loop, and which
+    DOS/BIOS call it is stuck inside), is waiting for a key, or still runs.
+
+    command: typed first to start it (e.g. "GAME" plus newline); empty watches
+    whatever runs now. seconds: how long to watch at most. hang_seconds: how
+    long the CPU must stay in one small loop to count as hung. stop_when: which
+    outcomes end the watch early (exit, crash, hang, waiting); the CPU is
+    paused when a hang or crash ends it, so it can be inspected.
+
+    The report has the outcome with evidence (CPU position, the calls in
+    progress, disassembly), key events from the INT log (program starts, video
+    modes, files, failed calls), and the text the program printed."""
+    c = client()
+    st0 = c.int_status()
+    traced = list(st0["vectors"])
+    want = sorted(set(traced) | set(watchdog.LOG_VECTORS))
+    if want != sorted(traced):
+        c.int_trace(want)
+    start_seq = st0["next"]
+    stops = {w.strip() for w in stop_when.lower().split(",") if w.strip()}
+    _type_command(c, command)
+    if not c.running and c.stops.empty():
+        c.resume()
+    t0 = time.time()
+    samples, calls, outcome, detail, sigs = [], {}, None, "", []
+    shell_psp, prog_psp, prog_name, last_check, shell_ranges = None, None, "", 0.0, []
+    try:
+        while True:
+            now = time.time() - t0
+            if not c.running:
+                stop = c.last_stop
+                outcome, detail = "stopped", "the CPU stopped: %s" % (stop.describe() if stop else "paused")
+                break
+            regs = _regs()
+            st = c.int_status()
+            tail = dosinfo.parse_log(c.int_log(st["next"] - 1, 1)) if st["next"] > st["first"] else []
+            activity = (st["next"], tail[0].count if tail else 0)
+            samples.append(watchdog.Sample(now, regs["eip"], watchdog.cs_ip_text(regs), st["next"], activity))
+            if now - last_check >= 2.0 or now >= seconds:
+                last_check = now
+                # The whole log: calls still in progress may have started before the watch.
+                for x in dosinfo.parse_log(c.int_log(st["first"])):
+                    calls[x.seq] = x
+                ordered = [calls[k] for k in sorted(calls) if k >= start_seq]
+                mem, chain, top, progs = _dos_state(c)
+                psp, _ = dosinfo.current_psp(mem, chain, progs)
+                if shell_psp is None:
+                    shell_psp = next((p.psp for p in progs.values() if p.parent == p.psp), None)
+                    if shell_psp is not None:
+                        shell_ranges = [(b.start * 16, b.end * 16) for b in progs[shell_psp].blocks]
+                execs = [x for x in ordered if x.vector == 0x21 and x.r("ah") == 0x4B and x.r("al") == 0]
+                if psp is not None and psp != shell_psp and prog_psp is None:
+                    prog_psp, prog_name = psp, progs[psp].name
+                elif execs and prog_psp is None:
+                    prog_psp = -1  # started and maybe already ended between two checks
+                    prog_name = dosinfo.asciiz(execs[0].data["dx"]).replace("/", "\\").rsplit("\\", 1)[-1]
+                if psp is not None and psp in progs and dos.segmented(regs):
+                    region = [(b.start * 16, b.end * 16) for b in progs[psp].blocks if b.kind != "environment"]
+                else:
+                    region = [(0, 0xA0000), (0x100000, 0x10000000)]
+                ss_base = dos.seg_cache(regs, "ss")["base"]
+                sp = regs["esp"] if dos.stack_bits(regs) == 32 else regs["esp"] & 0xFFFF
+                sigs.append((now, watchdog.progress_signature(c, region, ss_base + sp)))
+                text = watchdog.output_text(ordered)
+                bad = watchdog.crash_lines(text)
+                exits = [x for x in watchdog.own_calls(ordered, shell_ranges)
+                         if x.vector == 0x21 and x.r("ah") in (0x4C, 0x31) and
+                         (not execs or x.seq > execs[0].seq)]
+                if prog_psp is not None and psp == shell_psp and exits:
+                    code = exits[-1].r("al")
+                    errs = watchdog.error_lines(text)
+                    outcome = "crashed" if bad else ("exited with error" if code or errs else "exited")
+                    detail = "%s ended (INT 21h AH=%02Xh) with exit code %d" % (
+                        prog_name or "the program", exits[-1].r("ah"), code)
+                    if bad or errs:
+                        detail += '; it printed: "%s"' % '" | "'.join((bad or errs)[-3:])
+                    break
+                if bad and "crash" in stops:
+                    outcome, detail = "crashed", 'it printed: "%s"' % '" | "'.join(bad[-3:])
+                    break
+            kind, why = watchdog.classify(samples, [calls[k] for k in sorted(calls)], hang_seconds, sigs,
+                                          st.get("tsc", 0), st.get("hz", 0))
+            if kind in ("hung", "waiting") and kind.replace("hung", "hang") in stops:
+                outcome, detail = kind, why
+                break
+            if now >= seconds:
+                outcome, detail = kind if kind != "unknown" else "running", why
+                break
+            time.sleep(0.5)
+    finally:
+        if want != sorted(traced):
+            try:
+                c.int_trace(traced)
+            except (GdbError, OSError):
+                pass
+    for x in dosinfo.parse_log(c.int_log(c.int_status()["first"])):
+        calls[x.seq] = x
+    everything = [calls[k] for k in sorted(calls)]
+    ordered = watchdog.own_calls([x for x in everything if x.seq >= start_seq], shell_ranges)
+    if outcome in ("hung", "crashed") and c.running:
+        c.pause()
+    regs = _regs()
+    lines = ["OUTCOME: %s after %.0fs: %s." % (outcome.upper(), time.time() - t0, detail)]
+    inner, chain = watchdog.innermost_pending(everything)
+    if outcome in ("hung", "waiting", "running", "stopped"):
+        lines.append("CPU at %s (%s mode)." % (watchdog.cs_ip_text(regs), dos.cpu_mode(regs)))
+        if chain:
+            lines.append("Calls in progress (outermost first):")
+            for x in chain[-6:]:
+                what, _ = dosinfo.describe(x)
+                lines.append("  #%d INT %02Xh %s  (from %s%s)" % (x.seq, x.vector, what, x.caller(),
+                                                                "" if x.mode == 0 else " [%s]" % dosinfo.MODES[x.mode]))
+    ev = watchdog.summarize(ordered)
+    if ev:
+        lines += ["", "Key events (INT log):"] + ["  " + e for e in ev]
+    failed = watchdog.failed_calls(ordered)
+    if failed:
+        lines += ["", "Failed calls:"]
+        for x in failed[-8:]:
+            what, result = dosinfo.describe(x)
+            lines.append("  #%d INT %02Xh %s -> %s  (from %s)" % (x.seq, x.vector, what, result, x.caller()))
+    text = watchdog.output_text(ordered).rstrip()
+    if text:
+        tail = text.splitlines()[-12:]
+        lines += ["", "Text it printed through DOS/BIOS (last lines):"] + ["  | " + t for t in tail]
+    try:
+        scr = dos.read_text_screen(c, False)
+        if scr.get("text"):
+            rows = [r.rstrip() for r in scr["text"].splitlines() if r.strip()]
+            lines += ["", "Screen (text mode, last rows):"] + ["  | " + r for r in rows[-8:]]
+        else:
+            lines += ["", "Screen: video mode %02Xh (graphics); use screenshot to see it." % scr.get("mode", 0)]
+    except (GdbError, ValueError, KeyError):
+        pass
+    if outcome in ("hung", "crashed", "stopped"):
+        lines += ["", "CPU state (paused for inspection):", _state_report(None, code_lines=10)]
+    else:
+        lines += ["", "The CPU is %s." % ("running" if c.running else "paused")]
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
