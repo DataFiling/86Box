@@ -447,6 +447,10 @@ static uint32_t             xrange_lo[8], xrange_hi[8];
 static int                  xrange_count;
 static uint32_t             xrange_hit;
 
+/* Watchpoints only fire for accesses made in this CPU mode ("wf"). */
+enum { WATCH_ANY_MODE = 0, WATCH_PM_ONLY, WATCH_RM_ONLY };
+static int watch_mode_filter;
+
 #define INT_RET_HASH(a) ((((a) >> 10) ^ (a)) & (INTLOG_HASH - 1))
 
 static void gdbstub_int_clear(void);
@@ -1589,6 +1593,20 @@ e00:
                     memcpy(xrange_lo, lo, sizeof(lo));
                     memcpy(xrange_hi, hi, sizeof(hi));
                     xrange_count = l;
+                } else if (!strcmp(p, "wf")) {
+                    /* Set or show which CPU mode's accesses watchpoints catch. */
+                    static const char *names[] = { "any", "pm", "rm" };
+                    if ((p = strtok_r(NULL, " ", &strtok_save))) {
+                        for (i = 0; (i < 3) && strcmp(p, names[i]); i++)
+                            ;
+                        if (i == 3)
+                            goto e22;
+                        watch_mode_filter = i;
+                    }
+                    client->packet_pos   = sprintf(client->packet, "wf %s\n", names[watch_mode_filter]);
+                    client->response_pos = 0;
+                    gdbstub_client_respond_hex(client, (uint8_t *) client->packet, client->packet_pos);
+                    break;
                 } else if (!strcmp(p, "state")) {
                     /* Report whether the CPU is running, for clients that connect while holding. */
                     client->packet_pos   = sprintf(client->packet, "running %d\n", gdbstub_step == GDBSTUB_EXEC);
@@ -1744,7 +1762,8 @@ e00:
                         "- mr address length - Read RAM/ROM without side effects: {readable} {address} {length} [bytes] records\n"
                         "- ca vector [ah|*] [al|*] [call|ret|both] - Stop before matching INT calls and/or at their returns\n"
                         "- cx - Remove all INT catchpoints\n"
-                        "- xr [start end]... - Stop when execution enters a linear range (end exclusive); none clears\n");
+                        "- xr [start end]... - Stop when execution enters a linear range (end exclusive); none clears\n"
+                        "- wf [any|pm|rm] - Watchpoints catch accesses in any mode, protected mode only or real/V86 mode only\n");
                     break;
                 } else {
 unknown:
@@ -2326,7 +2345,7 @@ gdbstub_int_pop(int index, int status)
 static void
 gdbstub_int_clear(void)
 {
-    intlog_on = int_pending_count = catch_count = xrange_count = 0;
+    intlog_on = int_pending_count = catch_count = xrange_count = watch_mode_filter = 0;
     memset(intlog_vectors, 0, sizeof(intlog_vectors));
     memset(int_ret_hash, 0, sizeof(int_ret_hash));
 }
@@ -2590,6 +2609,13 @@ gdbstub_mem_access(uint32_t *addrs, int access)
     /* Stop if we're in the debugger context. */
     if (in_gdbstub)
         return;
+
+    /* Apply the CPU mode filter: protected mode proper, or real/V86 mode. */
+    if (watch_mode_filter) {
+        int pm = (msw & 1) && !(cpu_state.eflags & VM_FLAG);
+        if (pm != (watch_mode_filter == WATCH_PM_ONLY))
+            return;
+    }
 
     int width = access & (GDBSTUB_MEM_WRITE - 1);
     int i;
