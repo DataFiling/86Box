@@ -49,6 +49,9 @@ a DOS-extender (DOS/4GW...) program's 32-bit entry. log_interrupts +
 read_interrupt_log record DOS/DPMI/BIOS/mouse calls with decoded arguments,
 file names and results (e.g. a failing file open); catch_interrupt stops on a
 chosen call (e.g. INT 21h AH=3Dh opens, INT 10h AH=00h mode sets).
+watch_program runs a program unattended and says whether it exited, crashed,
+hung (and inside which call) or waits for input: a good first step for "it
+hangs" or "it crashes" reports.
 
 `screenshot` shows the emulated display (any video mode). The input tools
 press_keys, type_text, key_down and mouse_* resume the CPU if it is paused,
