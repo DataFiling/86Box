@@ -105,10 +105,15 @@ so after the switch `[ebp-8]`/`[ebp-4]` address low linear memory: FreeDOS's
 disk buffers at 2A00h-5200h. The handler writes the address of `HeadTask`
 (the task list head, data offset 10DA0h, linear 20FDA0h) twice there.
 Depending on what it hits, FreeDOS's buffer list becomes a loop without its
-start or a cached FAT sector gets 8 bad bytes; FreeDOS prints "Run chkdsk:
-Bad FAT value/index" and then loops forever in `searchblock` during a file
-call (in our runs, the open of FDOOM.map from FastDoom's debug code). The
-disk itself is fine.
+start or a cached FAT sector (holding the WAD's cluster chain) gets 8 bad
+bytes; FreeDOS prints "Run chkdsk: Bad FAT value/index" and WAD reads return
+zeros. An all-zero patch then fails the bounds check in `V_MarkRect`
+(v_video.c:85, X=-1 Y=-1, from `V_DrawPatchScreen0` / `D_Display`), which
+calls `I_Backtrace`; its log write to `fdoom.log` (a seek from the end) loops
+forever in FreeDOS's `searchblock`. The disk itself is fine.
+
+Only the `-debug` build is affected: `-d2` keeps `ptr`/`next` in the stack
+frame; the release build keeps them in registers.
 
 **Evidence an AI should find:** a DOS call that never returns (watch_program:
 stuck inside INT 21h), the CPU looping in the FreeDOS kernel, "Run chkdsk"

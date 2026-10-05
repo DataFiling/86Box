@@ -46,6 +46,15 @@ def coerce(fn, kwargs):
     """Match values to the tool's annotated parameter types, as MCP would."""
     sig = inspect.signature(inspect.unwrap(fn))
     out = {}
+    aliases = {"count": ("entries", "length", "limit"), "length": ("count", "entries"), "entries": ("count",),
+               "name": ("query", "address", "map_path"), "path": ("save_path", "map_path"),
+               "data": ("hex_bytes",), "bytes": ("hex_bytes",), "addr": ("address",), "timeout": ("timeout_seconds",)}
+    for k, v in list(kwargs.items()):
+        if k not in sig.parameters:
+            alt = next((a for a in aliases.get(k, ()) if a in sig.parameters and a not in kwargs), None)
+            if alt:
+                del kwargs[k]
+                kwargs[alt] = v
     for k, v in kwargs.items():
         if k not in sig.parameters:
             raise SystemExit("%s has no parameter %r; parameters: %s" % (fn.__name__, k, ", ".join(sig.parameters)))

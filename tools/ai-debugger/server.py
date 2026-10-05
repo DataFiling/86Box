@@ -200,6 +200,10 @@ def _state_report(stop=None, code_lines=6):
     parts.append(dos.format_registers(regs))
     if dos.namer and dos.namer(regs["eip"], 0x10000):
         parts[-1] = parts[-1].replace("\n", "   in %s\n" % dos.namer(regs["eip"], 0x10000), 1)
+    if not dos.segmented(regs) and dos.stack_bits(regs) == 32 and abs(regs["ebp"] - regs["esp"]) > 0x100000 \
+            and regs["ebp"] > 0x10:
+        parts[-1] += ("\nNOTE: EBP (%08X) is far from ESP (%08X): the frame pointer may belong to another stack "
+                      "(e.g. after a stack switch, EBP-based locals use the new SS)." % (regs["ebp"], regs["esp"]))
     parts.append("Next instructions:\n" + _code_at(regs, regs["eip"], code_lines))
     if c.running:
         parts.insert(0, "NOTE: CPU is running; register values are a moving snapshot.")
@@ -670,10 +674,17 @@ def get_segments() -> str:
 
 
 @tool
-def read_descriptor_table(table: str = "gdt", first: int = 0, count: int = 32) -> str:
+def read_descriptor_table(table: str = "gdt", first: str = "0", count: int = 32, selector: str = "") -> str:
     """Decode entries of the GDT, LDT or IDT (table: gdt, ldt or idt).
 
-    first/count are entry indexes (GDT selector = index * 8; IDT index = interrupt number)."""
+    first: entry index (hex, like other numbers here; GDT index = selector / 8,
+    IDT index = interrupt number); count: how many. selector: decode just this
+    selector instead (e.g. "00B0"; its TI bit picks GDT or LDT)."""
+    if selector:
+        sel = dos.parse_number(selector)
+        table, first, count = ("ldt" if sel & 4 else "gdt"), sel >> 3, 1
+    else:
+        first = dos.parse_number(str(first))
     table = table.lower()
     if table not in ("gdt", "ldt", "idt"):
         return "table must be gdt, ldt or idt."
@@ -1773,6 +1784,55 @@ def lookup_symbol(query: str, limit: int = 30) -> str:
         return "Not a known symbol or address: %s" % e
     n = table.name_at(loc.linear, 0x10000)
     return "%08X is %s" % (loc.linear, n or "not within 64 KiB after any symbol (heap, stack or another program)")
+
+
+
+_AREAS = [(0x0, 0x400, "real-mode interrupt vector table"), (0x400, 0x500, "BIOS data area"),
+          (0x500, 0x600, "DOS communication area"), (0xA0000, 0xC0000, "video memory"),
+          (0xC0000, 0xC8000, "video BIOS ROM"), (0xC8000, 0xF0000, "adapter ROM / upper memory"),
+          (0xF0000, 0x100000, "system BIOS ROM"), (0x100000, 0x10FFF0, "high memory area (HMA)")]
+
+
+@tool
+def what_is(address: str) -> str:
+    """Say what an address is: the symbol it belongs to (load_symbols), the PC
+    memory area (vector table, BIOS data, video memory, ROM, HMA), the DOS memory
+    block and its owner (program, environment, DOS system data/code, free), and
+    for DOS-extender programs the DPMI block it lies in. Handy after a watchpoint
+    or a crash address."""
+    regs = _regs()
+    loc = _resolve(address, regs)
+    lin = loc.linear
+    out = ["%s = linear %08X" % (address, lin)]
+    table = _symcache["table"] if dos.namer else None
+    if table is not None:
+        n = table.name_at(lin, 0x10000)
+        if n:
+            out.append("symbol: %s" % n)
+    for lo, hi, what in _AREAS:
+        if lo <= lin < hi:
+            extra = " (INT %02Xh vector)" % (lin // 4) if hi == 0x400 else ""
+            out.append("area: %s%s, offset %X" % (what, extra, lin - lo))
+    if lin < 0xA0000 or 0xC0000 <= lin < 0x100000:
+        mem, chain, top, progs = _dos_state(client())
+        for b in chain or []:
+            if b.contains_linear(lin):
+                owner = ("program %s (PSP %04X)" % (b.program, b.owner)) if b.program else ("owner %04X" % b.owner)
+                out.append("DOS memory: %s block %04X-%04X, %s, offset %X into it" % (
+                    b.kind, b.start, b.end, owner if b.owner not in (0, 8) else ("DOS" if b.owner == 8 else "free"),
+                    lin - b.start * 16))
+                break
+        else:
+            if chain and lin < chain[0].mcb * 16:
+                out.append("DOS memory: below the first memory block (DOS kernel data, buffers, device drivers)")
+    start = memscan.load(_state_dir(), "last-start") or {}
+    for i, (lo, hi) in enumerate(start.get("blocks", [])):
+        if lo <= lin < hi:
+            out.append("DPMI block #%d %08X-%08X allocated after %s was opened, offset %X" % (
+                i + 1, lo, hi, start.get("path", "the program"), lin - lo))
+    if len(out) == 1:
+        out.append("nothing known about it (heap, stack, unmapped or another program's memory)")
+    return "\n".join(out)
 
 
 if __name__ == "__main__":

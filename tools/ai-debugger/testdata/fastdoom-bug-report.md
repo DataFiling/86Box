@@ -1,6 +1,6 @@
 # Bug report for viti95/FastDoom (draft, to file at https://github.com/viti95/FastDoom/issues)
 
-**Title:** Timer interrupt handler (`TS_ServiceSchedule`) corrupts DOS memory when IRQ0 interrupts real-mode code
+**Title:** Debug builds: timer interrupt handler (`TS_ServiceSchedule`) corrupts DOS memory when IRQ0 interrupts real-mode code
 
 **Body:**
 
@@ -9,6 +9,11 @@ switch to their own stack with `SetStack(StackSelector, StackPointer)`, then
 keep using their locals `ptr` and `next`. Open Watcom addresses those through
 EBP, and EBP is still an offset into the *interrupted* stack. The new stack is
 zero-based, so the locals are read and written at linear address EBP-8/EBP-4.
+
+This only bites when the compiler keeps `ptr`/`next` in the stack frame, as
+the `-debug` build does (`-d2`, no register allocation). The release build
+(`-omaxtnrih`) keeps them in EDX/ECX and is not affected, but the code relies on
+that.
 
 When IRQ0 arrives while the CPU is in protected mode on the game's flat stack,
 that is harmless: the old stack is zero-based too. But when it arrives while the
@@ -21,8 +26,11 @@ memory.
 **Effect seen:** with the FreeDOS kernel (current git, 8086 FAT32 build) those
 addresses are the kernel's disk buffers. Depending on the timing, a buffer header or a cached FAT sector gets
 `A0 FD 20 00 A0 FD 20 00` (twice `&HeadTask`). FreeDOS prints "Run chkdsk: Bad
-FAT value/index" and loops forever in its buffer search on a later file call, so
-FastDoom hangs during startup, after setting mode 13h. Other DOS versions keep
+FAT value/index", and reads of the WAD that cross the broken FAT chain return
+zeros. In our runs an all-zero patch then failed the bounds check in
+`V_MarkRect` (v_video.c:85, X=-1 Y=-1) from `V_DrawPatchScreen0` /
+`D_Display`; `I_Backtrace` appended to `fdoom.log`, and that file call looped
+forever in FreeDOS's buffer search. FastDoom hangs on a black mode 13h screen. Other DOS versions keep
 other data there, so the symptom will vary or stay hidden (e.g. with buffers in
 the HMA).
 

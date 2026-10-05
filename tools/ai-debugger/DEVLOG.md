@@ -378,11 +378,57 @@ debugger traced it to a FastDoom bug:
    keeps using EBP for its locals, so they land in low memory whenever IRQ0
    interrupts real-mode code (DOS reading the WAD).
 
+The exercise agent (section 14) later traced the rest of the chain: the
+corrupted FAT sector made WAD reads return zeros, a bounds check in
+`V_MarkRect` called `I_Backtrace`, and its log write is the DOS call that
+hangs. It also noticed that only the `-debug` build (`-d2`) keeps the locals
+on the stack; a clean release build keeps them in EDX/ECX (checked with
+wdis), so the bug is latent there.
+
 Making the two locals static (`testdata/fastdoom-ns_task-stack.diff`) fixes
 it: the game loads and plays its demos under the debugger on the Pentium MMX
 machine. The bug should be reported upstream (viti95/FastDoom). Its
 write-up is in `GROUND_TRUTH.md`, so the unpatched build can serve as a
 real-world exercise.
+
+### 14. Symbols, and an AI exercise on a real bug
+**Symbols:** `load_symbols` reads an Open Watcom linker map and places it.
+- 16-bit programs go at their load segment.
+- DOS/4GW objects are placed from the entry point (the map's entry offset)
+  and from the DPMI block whose size matches each object; checked against
+  `HeadTask` being a valid list head.
+- Names then work as addresses, and name+offset appears in:
+  - disassembly (function labels, branch targets, memory operands relative
+    to DS);
+  - the CPU state and stack dumps (code symbols only, within code segments);
+  - the INT log and `watch_program`.
+
+**Exercise:** a fresh agent got the unpatched FastDoom build, its source and
+linker map, and only the symptom: "freezes on the black screen after
+loading". It had no access to these notes. In about 7½ minutes and 33 tool
+calls it found:
+1. With `watch_program`: the game hung inside an `INT 21h` seek, and DOS had
+   printed "Bad FAT" messages.
+2. With `set_watchpoint` over DOS memory and `cpu_mode="protected"`: the
+   first hit was `TS_ServiceSchedule_+4E` with EBP=4CA4 and stack 00B0, base
+   143DF0.
+3. With a breakpoint on `I_Backtrace_`: the rest of the chain, which I had
+   missed. The FAT chain corruption makes WAD reads return zeros, a bounds
+   check in `V_MarkRect` fails, and the backtrace's log write is the DOS
+   call that hangs.
+
+It also pointed out that only the `-debug` build keeps the locals on the
+stack, which I confirmed with wdis on a clean release build. That narrowed
+the upstream report.
+
+Graded against `GROUND_TRUTH.md`: cause, evidence and fix correct.
+
+Its tool feedback, all acted on:
+- `read_descriptor_table` takes hex and a `selector`;
+- `run_tool` accepts common parameter aliases (`count`, `name`, `path`);
+- `watch_program` collapses repeated events;
+- a note when EBP is far from ESP (a frame pointer from another stack);
+- a new `what_is` tool (symbol, PC area, DOS block and owner, DPMI block).
 
 ## Test results
 
@@ -427,14 +473,14 @@ this environment), and V86 mode under EMM386.
 
 ## Next steps
 
-1. **Report the FastDoom bug upstream** with the patch (needs the user's go-ahead).
-2. **AI exercise on the unpatched FastDoom**: a real, multi-layer bug (game,
-   DOS extender, DOS kernel) with known answers.
+1. **Report the FastDoom bug upstream**: `testdata/fastdoom-bug-report.md` is
+   ready to paste (this environment can't post to that repository).
+2. More AI exercises on real software (now that symbols work), including
+   ones without a map.
 3. **More real games and extenders:** the FastDoom repository also ships
    DOS/32A; other open-source DOS games build with Open Watcom.
-4. **Read LE/LX object tables** to name code and data objects automatically,
-   and load linker maps as symbols in the bridge (the FastDoom hunt needed
-   object bases from `wait_for_program_start` plus the map by hand).
+4. **Read LE/LX object tables** from the program file to place objects
+   without a program-start stop.
 5. **Speed:** let the dynamic recompiler run while no breakpoints,
    watchpoints or stepping are active.
 6. Offer the emulator changes upstream (86Box/86Box).

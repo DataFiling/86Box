@@ -126,7 +126,7 @@ def failed_calls(calls):
 
 def summarize(calls, limit=12):
     """Key events: program starts, video modes, files, failures, exits."""
-    ev = []
+    ev, seen = [], {}
     for c in calls:
         what, result = dosinfo.describe(c)
         key = c.vector == 0x21 and c.r("ah") in (0x4B, 0x4C, 0x31, 0x3D, 0x3C, 0x6C, 0x4E, 0x5B)
@@ -134,8 +134,16 @@ def summarize(calls, limit=12):
         key |= c.vector == 0x31 and c.r("ax") in (0x0501, 0x0100)
         key |= c.returned and c.cf() and c.vector in (0x21, 0x31) and c.r("ah") not in (0x4E, 0x4F, 0x71)
         if key:
+            k = (c.vector, what, result, c.caller_linear())
+            if k in seen:  # the same event again: count it on its first line
+                seen[k][1] += c.count
+                continue
+            seen[k] = [len(ev), c.count]
             ev.append("#%d INT %02Xh %s -> %s  (from %s%s)" % (c.seq, c.vector, what, result, c.caller(),
                                                             "" if c.mode == 0 else " [%s]" % dosinfo.MODES[c.mode]))
+    for i, n in seen.values():
+        if n > 1:
+            ev[i] += " (x%d)" % n
     if len(ev) > limit:
         ev = ev[:limit // 2] + ["... %d more ..." % (len(ev) - limit)] + ev[-(limit - limit // 2):]
     return ev
