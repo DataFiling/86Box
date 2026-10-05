@@ -30,7 +30,10 @@ def blocks_legitimately(c):
     """Calls that may take long without anything being wrong."""
     v, ah = c.vector, c.r("ah")
     if v == 0x21:
-        return ah in (0x01, 0x07, 0x08, 0x0A, 0x0C, 0x4B, 0x31) or (ah in (0x3F, 0x40) and c.r("bx") <= 2)
+        # AH >= 70h: past the documented DOS functions (extender and TSR private
+        # calls, e.g. DOS/4GW's FF00h/FF01h, which run the whole program).
+        return (ah in (0x01, 0x07, 0x08, 0x0A, 0x0C, 0x4B, 0x31) or (ah in (0x3F, 0x40) and c.r("bx") <= 2)
+                or ah >= 0x70)
     if v == 0x16:
         return ah in (0x00, 0x10)
     if v == 0x15:
@@ -117,17 +120,15 @@ def innermost_pending(calls):
 
 
 def drop_reflections(calls):
-    """Leave out the real-mode copies of protected-mode calls: a DOS extender
-    passes a protected-mode INT 21h etc. on to real-mode DOS, which logs the
-    same call again one level deeper (its parent in the log)."""
+    """Leave out the copies a DOS extender makes when it passes a protected-mode
+    INT 21h etc. on to real-mode DOS (see dosinfo.is_reflection)."""
     out, parent = [], {}  # depth -> the latest call at that depth
     for c in sorted(calls, key=lambda c: c.seq):
         p = parent.get(c.depth - 1)
         parent[c.depth] = c
         for d in [d for d in parent if d > c.depth]:
             del parent[d]
-        if (p is not None and p.mode >= 2 and c.mode <= 1 and c.vector == p.vector and
-                c.r("ah") == p.r("ah")):
+        if dosinfo.is_reflection(p, c):
             continue
         out.append(c)
     return out

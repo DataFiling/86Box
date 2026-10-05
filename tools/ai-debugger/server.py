@@ -824,18 +824,44 @@ def press_keys(keys: str, hold_ms: int = 80, gap_ms: int = 60) -> str:
 
 @tool
 def type_text(text: str, delay_ms: int = 60) -> str:
-    """Type text as keystrokes (US layout). Use "\\n" for Enter, e.g. "dir\\n"."""
+    """Type text as keystrokes (US layout). Use "\\n" for Enter, e.g. "dir\\n".
+    Typing ahead is fine: it waits while the BIOS keyboard buffer is nearly
+    full, so keys aren't lost while a command is still running."""
     c = client()
     plan = [pcinput.char_keys(ch) for ch in text]
     note = _ensure_running()
     shift = pcinput.KEYS["shift"]
     for n, (needs_shift, scan) in enumerate(plan):
+        _wait_key_buffer(c)
         pcinput.press_combo(c, [shift, scan] if needs_shift else [scan], delay_ms / 2000.0)
         time.sleep(delay_ms / 2000.0)
         stopped = _stopped_during_input(n + 1, len(plan), "characters")
         if stopped:
             return stopped
     return "Typed %d character(s)%s." % (len(plan), note)
+
+
+def _wait_key_buffer(c, limit=8, timeout=30.0):
+    """Wait while the BIOS keyboard buffer holds `limit` or more keys: a busy
+    program (DOS copying a file) doesn't read them, and the BIOS drops keys
+    once its 15-key buffer is full. Programs with their own keyboard handler
+    don't use the buffer, so it stays empty and this returns at once."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            bda = c.read_memory(0x41A, 4) + c.read_memory(0x480, 4)
+        except GdbError:
+            return
+        if len(bda) < 8:
+            return
+        head, tail, start, end = (int.from_bytes(bda[i:i + 2], "little") for i in (0, 2, 4, 6))
+        if not (0x1E <= start < end <= 0x200 and start <= head < end and start <= tail < end):
+            start, end = 0x1E, 0x3E  # BIOS default when 0040:0080/0082 aren't set
+            if not (start <= head < end and start <= tail < end):
+                return
+        if ((tail - head) % (end - start)) // 2 < limit:
+            return
+        time.sleep(0.1)
 
 
 @tool
@@ -1038,13 +1064,6 @@ def log_interrupts(vectors: str = "21 31 33", clear: bool = True) -> str:
                                                  "running" if c.running else "paused; resume to collect calls")
 
 
-def _is_reflection(parent, cur):
-    """A DOS extender passing a protected-mode call down to real mode makes the
-    same call again, nested inside it (several times when it splits a transfer)."""
-    return (parent is not None and cur.vector == parent.vector and cur.mode != parent.mode and
-            dosinfo.function_number(cur) == dosinfo.function_number(parent))
-
-
 @tool
 def read_interrupt_log(filter: str = "", since: int = 0, limit: int = 60, collapse: bool = True,
                        show_polling: bool = False, show_reflections: bool = False) -> str:
@@ -1075,7 +1094,7 @@ def read_interrupt_log(filter: str = "", since: int = 0, limit: int = 60, collap
     now = st.get("tsc", 0)
     shown, hidden_poll, hidden_refl, at_depth = [], 0, 0, {}
     for x in calls:
-        refl = _is_reflection(at_depth.get(x.depth - 1), x)
+        refl = dosinfo.is_reflection(at_depth.get(x.depth - 1), x)
         at_depth[x.depth] = x  # the latest call at each nesting depth encloses deeper ones
         if not dosinfo.matches_filter(x, flt):
             continue
@@ -1378,7 +1397,7 @@ def wait_for_program_start(name: str = "", command: str = "", timeout_seconds: f
         lines = ["32-bit code of %s started: stopped at its first instruction (linear %08X)." % (opened, regs["eip"]),
                  "DPMI memory allocated after the extender opened it: " +
                  ", ".join("%08X-%08X%s" % (a, b, " (code entered here)" if (a, b) in inside else "") for a, b in blocks),
-                 "Under DOS/4GW-style flat models, linear = offset (segment bases 0); the program's objects "
+                 "In the flat model of DOS/4GW, DOS/32A and similar extenders, linear = offset (segment bases 0); the program's objects "
                  "(code, data) are in these blocks."]
         return "\n".join(lines) + "\n\n" + _entry_report(stop)
     finally:
@@ -1896,7 +1915,13 @@ def what_is(address: str) -> str:
         if lo <= lin < hi:
             out.append("DPMI block #%d %08X-%08X allocated after %s was opened, offset %X" % (
                 i + 1, lo, hi, start.get("path", "the program"), lin - lo))
-    if table is None or not table.name_at(lin, 0x10000):
+    in_blocks = any(lo <= lin < hi for lo, hi in start.get("blocks", []))
+    if table is not None and table.name_at(lin, 0x10000) is None and lin >= 0x110000 and not in_blocks:
+        out.append("outside the program's code and data: memory it allocated later (heap), or another "
+                   "program's")
+    # Guess a function only where code can be: not when the symbols already
+    # say, and not in memory outside the program (heap objects aren't code).
+    if table is None and (in_blocks or lin < 0x110000):
         try:
             lo, hi, bits = _code_region(regs, lin)
             if lo <= lin < hi and hi - lo <= 0x200000:

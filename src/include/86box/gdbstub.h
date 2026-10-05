@@ -62,6 +62,7 @@ extern void gdbstub_cpu_init(void);
 extern int  gdbstub_instruction(void);
 extern int  gdbstub_int3(void);
 extern void gdbstub_int(uint8_t vector);
+extern void gdbstub_cpu_reset(void);
 extern void gdbstub_mem_access(uint32_t *addrs, int access);
 extern void gdbstub_init(void);
 extern void gdbstub_close(void);
@@ -80,6 +81,7 @@ extern void gdbstub_frame_blit(int monitor_index, int x, int y, int w, int h);
 #    define gdbstub_instruction() 0
 #    define gdbstub_int3()        0
 #    define gdbstub_int(vector)
+#    define gdbstub_cpu_reset()
 #    define gdbstub_init()
 #    define gdbstub_close()
 #    define gdbstub_frame_blit(monitor_index, x, y, w, h)

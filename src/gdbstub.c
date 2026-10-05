@@ -2342,6 +2342,30 @@ gdbstub_int_pop(int index, int status)
     int_pending_count--;
 }
 
+/* The offset a buffer register gives for an INT call's arguments. 16-bit
+   protected-mode code can still pass a 32-bit offset: a DOS extender's
+   16-bit kernel asking its DPMI host (which serves a 32-bit program) to
+   simulate a real-mode interrupt passes ES:EDI. Take the full register when
+   its upper half is set and it lies within the segment's limits. */
+static uint32_t
+gdbstub_int_offset(uint32_t reg, uint32_t mask, const x86seg *seg)
+{
+    if ((reg & ~mask) && (cr0 & 1) && !(cpu_state.eflags & VM_FLAG) && (reg >= seg->limit_low) && (reg <= seg->limit_high))
+        return reg;
+    return reg & mask;
+}
+
+/* A hard reset: calls in progress will never return. Keep the log, but mark
+   them so, and start nesting from scratch. (Not on a soft reset: 286 DOS
+   extenders and HIMEM reset the CPU to get back to real mode, and their
+   calls do return.) */
+void
+gdbstub_cpu_reset(void)
+{
+    while (int_pending_count)
+        gdbstub_int_pop(int_pending_count - 1, INTLOG_NO_RETURN);
+}
+
 static void
 gdbstub_int_clear(void)
 {
@@ -2398,9 +2422,9 @@ gdbstub_int(uint8_t vector)
         rec->in[3]   = EDX;
         rec->in[4]   = ESI;
         rec->in[5]   = EDI;
-        rec->lin[0]  = ds + (EDX & mask);
-        rec->lin[1]  = ds + (ESI & mask);
-        rec->lin[2]  = es + (EDI & mask);
+        rec->lin[0]  = ds + gdbstub_int_offset(EDX, mask, &cpu_state.seg_ds);
+        rec->lin[1]  = ds + gdbstub_int_offset(ESI, mask, &cpu_state.seg_ds);
+        rec->lin[2]  = es + gdbstub_int_offset(EDI, mask, &cpu_state.seg_es);
         in_gdbstub   = 1;
         rec->lens    = gdbstub_peek(rec->lin[0], rec->bytes[0], INTLOG_BYTES) | (gdbstub_peek(rec->lin[1], rec->bytes[1], INTLOG_BYTES) << 8) | (gdbstub_peek(rec->lin[2], rec->bytes[2], INTLOG_BYTES) << 16);
         in_gdbstub   = old_in_gdbstub;

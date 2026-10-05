@@ -648,6 +648,24 @@ def function_number(c):
     return c.r("ax") if c.vector in (0x31, 0x33, 0x2F) else c.r("ah")
 
 
+def is_reflection(parent, cur):
+    """Whether cur (nested directly inside parent) is a DOS extender passing
+    the protected-mode call parent down to real mode: the same call again in
+    the other mode (DOS/4GW), or the extender's own DPMI "simulate real-mode
+    interrupt" for it (DOS/32A). A split transfer makes several."""
+    if parent is None:
+        return False
+    if cur.vector == parent.vector:
+        return cur.mode != parent.mode and function_number(cur) == function_number(parent)
+    if cur.vector == 0x31 and cur.r("ax") == 0x0300 and cur.r("bl") == parent.vector and parent.mode >= 2:
+        rm = _rm_regs(cur.data.get("di") or b"")
+        if not rm:
+            return True
+        ax = rm["eax"] & 0xFFFF
+        return (ax if parent.vector in (0x31, 0x33, 0x2F) else ax >> 8) == function_number(parent)
+    return False
+
+
 def matches_filter(c, flt):
     if not flt:
         return True

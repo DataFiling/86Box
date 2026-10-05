@@ -41,6 +41,7 @@
 #include <86box/timer.h>
 #include <86box/video.h>
 #include <86box/vid_svga.h>
+#include <86box/gdbstub.h>
 
 /* The opcode of the instruction currently being executed. */
 uint8_t opcode;
@@ -395,6 +396,8 @@ resetx86(void)
     reset_common(1);
 
     soft_reset_mask = 0;
+
+    gdbstub_cpu_reset();
 }
 
 /* Soft reset. */
