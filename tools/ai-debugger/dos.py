@@ -350,7 +350,43 @@ def hexdump(data, linear, loc=None):
     return "\n".join(lines)
 
 
-def disassemble(data, linear, bits=16, loc=None, count=None):
+# Optional symbol lookup set by the bridge when a linker map is loaded:
+# namer(linear, max_distance) -> "name" / "name+off" / None.
+namer = None
+_HEX = re.compile(r"0x[0-9a-f]+")
+_BRANCH = ("call", "lcall", "jmp", "ljmp", "loop") + tuple("j" + c for c in
+                                                         ("a", "ae", "b", "be", "e", "ne", "g", "ge", "l", "le",
+                                                          "o", "no", "s", "ns", "p", "np", "cxz", "ecxz"))
+
+
+def _symbol_comment(mnemonic, op_str, seg_base, bits, data_base):
+    """'; name' for an operand that is a known symbol: branch targets (in the
+    code segment), memory operands (in the data segment, DS unless overridden)
+    and, in 32-bit code, immediates that may be addresses."""
+    if namer is None:
+        return ""
+    branch = mnemonic.split()[-1] in _BRANCH or mnemonic.startswith("j")
+    names = []
+    for m in _HEX.finditer(op_str):
+        v = int(m.group(0), 16)
+        if v < 0x100:
+            continue
+        if branch:
+            n = namer((seg_base + v) & 0xFFFFFFFF, 0x10000)
+        else:
+            in_memory = "[" in op_str[:m.start()] and "]" in op_str[m.end():]
+            if data_base is None or (bits == 16 and not in_memory):
+                continue
+            seg = re.search(r"\b([cdefgs]s):\[", op_str)
+            if seg and seg.group(1) != "ds" and bits == 16:
+                continue  # another segment: base unknown here
+            n = namer((data_base + v) & 0xFFFFFFFF, 0x40)
+        if n:
+            names.append(n)
+    return ("  ; " + ", ".join(names)) if names else ""
+
+
+def disassemble(data, linear, bits=16, loc=None, count=None, data_base=None):
     if capstone is None:
         return "capstone is not installed (pip install capstone); raw bytes:\n" + hexdump(data, linear, loc)
     mode = {16: capstone.CS_MODE_16, 32: capstone.CS_MODE_32}[bits]
@@ -365,8 +401,14 @@ def disassemble(data, linear, bits=16, loc=None, count=None):
         if bits == 16 and insn.bytes[-1:] in (b"\x98", b"\x99") and len(insn.bytes) == 1:
             # Capstone 5 decodes 98h/99h as CWDE/CDQ in 16-bit code.
             mnemonic = "cbw" if insn.bytes == b"\x98" else "cwd"
-        lines.append("%s  %-20s %s %s" % (addr, insn.bytes.hex().upper(), mnemonic, insn.op_str))
-        if count and len(lines) >= count:
+        lin = (seg_base + insn.address) & 0xFFFFFFFF
+        if namer is not None:
+            here = namer(lin, 0)
+            if here:
+                lines.append("%s:" % here)
+        lines.append("%s  %-20s %s %s%s" % (addr, insn.bytes.hex().upper(), mnemonic, insn.op_str,
+                                             _symbol_comment(mnemonic, insn.op_str, seg_base, bits, data_base)))
+        if count and len([x for x in lines if not x.endswith(":")]) >= count:
             break
     return "\n".join(lines) if lines else "(could not decode)"
 

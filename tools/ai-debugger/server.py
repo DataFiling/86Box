@@ -7,6 +7,7 @@ Env:  BOX86_GDB_HOST (default 127.0.0.1), BOX86_GDB_PORT (default 12345)
 
 import functools
 import os
+import re
 import struct
 import threading
 import time
@@ -18,6 +19,7 @@ import dos
 import dosinfo
 import memscan
 import pcinput
+import symbols
 import watchdog
 from gdb_rsp import (BP_HARDWARE, BP_SOFTWARE, WP_ACCESS, WP_READ, WP_WRITE, GdbClient, GdbError)
 
@@ -49,6 +51,9 @@ a DOS-extender (DOS/4GW...) program's 32-bit entry. log_interrupts +
 read_interrupt_log record DOS/DPMI/BIOS/mouse calls with decoded arguments,
 file names and results (e.g. a failing file open); catch_interrupt stops on a
 chosen call (e.g. INT 21h AH=3Dh opens, INT 10h AH=00h mode sets).
+With the program's linker map, load_symbols lets you use names as addresses
+and shows name+offset everywhere (after wait_for_program_start for automatic
+placement).
 watch_program runs a program unattended and says whether it exited, crashed,
 hung (and inside which call) or waits for input: a good first step for "it
 hangs" or "it crashes" reports.
@@ -95,19 +100,70 @@ def tool(fn):
 
     @functools.wraps(fn)
     async def wrapper(*args, **kwargs):
-        return await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
+        return await anyio.to_thread.run_sync(functools.partial(_with_symbols, fn, *args, **kwargs))
 
     return mcp.tool()(wrapper)
 
 
 # ---- helpers ------------------------------------------------------------
 
+_symcache = {"key": None, "table": None}
+
+
+def _symbols():
+    """The loaded symbol table (load_symbols), kept on disk between run_tool
+    commands; None if none is loaded."""
+    try:
+        d = memscan.state_dir(client().host, client().port)
+    except Exception:
+        return None
+    info = memscan.load(d, "symbols")
+    if not info:
+        _symcache.update(key=None, table=None)
+        return None
+    try:
+        key = (info["path"], os.path.getmtime(info["path"]), tuple(sorted(info["bases"].items())))
+    except OSError:
+        return None
+    if _symcache["key"] != key:
+        _symcache.update(key=key, table=symbols.SymbolTable(symbols.MapFile(info["path"]), info["bases"]))
+    return _symcache["table"]
+
+
+def _with_symbols(fn, *args, **kwargs):
+    table = None
+    try:
+        table = _symbols()
+    except (GdbError, OSError, ValueError):
+        pass
+    dos.namer = (lambda lin, dist: table.name_at(lin, dist)) if table else None
+    return fn(*args, **kwargs)
+
+
+def _sym(linear, dist=0x10000):
+    """' (name+off)' for a linear address, or ''."""
+    return " (%s)" % dos.namer(linear, dist) if dos.namer and dos.namer(linear, dist) else ""
+
 def _regs():
     return client().read_registers()
 
 
 def _resolve(address, regs):
+    table = _symcache["table"] if dos.namer else None
+    if table is not None:
+        head = address.strip().split("+")[0].split("-")[0].strip()
+        if head and not dos.is_register(head):
+            lin = table.lookup(address)
+            if lin is not None:
+                return dos.Loc(lin, None, None, 32 if table.map.wide else None)
     return dos.resolve(address, regs, client())
+
+
+def _ds_base(regs):
+    try:
+        return dos.seg_cache(regs, "ds")["base"]
+    except ValueError:
+        return None
 
 
 def _cs_loc(regs, linear):
@@ -124,7 +180,7 @@ def _cs_loc(regs, linear):
 def _code_at(regs, linear, count):
     c = client()
     data = c.read_memory(linear, count * 15)
-    return dos.disassemble(data, linear, dos.code_bits(regs), _cs_loc(regs, linear), count)
+    return dos.disassemble(data, linear, dos.code_bits(regs), _cs_loc(regs, linear), count, _ds_base(regs))
 
 
 def _state_report(stop=None, code_lines=6):
@@ -142,6 +198,8 @@ def _state_report(stop=None, code_lines=6):
         except (GdbError, ValueError, KeyError) as e:
             parts[-1] += "\n(could not decode the call: %s)" % e
     parts.append(dos.format_registers(regs))
+    if dos.namer and dos.namer(regs["eip"], 0x10000):
+        parts[-1] = parts[-1].replace("\n", "   in %s\n" % dos.namer(regs["eip"], 0x10000), 1)
     parts.append("Next instructions:\n" + _code_at(regs, regs["eip"], code_lines))
     if c.running:
         parts.insert(0, "NOTE: CPU is running; register values are a moving snapshot.")
@@ -458,7 +516,7 @@ def disassemble(address: str = "cs:eip", count: int = 20, bits: int = 0) -> str:
         note = ("NOTE: the CPU is in %s mode, so %s was taken as segment*16+offset; a protected-mode "
                 "selector can only be looked up while the CPU is in protected mode (or pass the linear "
                 "address and bits=32).\n" % (dos.cpu_mode(regs), address))
-    return note + dos.disassemble(data, loc.linear, bits, loc, count)
+    return note + dos.disassemble(data, loc.linear, bits, loc, count, _ds_base(regs))
 
 
 @tool
@@ -477,7 +535,15 @@ def read_stack(entries: int = 16) -> str:
         off = (sp + i * w) & mask  # a 16-bit stack wraps within its 64 KiB segment
         data = c.read_memory((ss["base"] + off) & 0xFFFFFFFF, w)
         val = int.from_bytes(data, "little") if len(data) == w else None
-        lines.append(fmt % (ss["sel"], off, val) if val is not None else (fmt[:-6] % (ss["sel"], off)) + "  ??")
+        line = fmt % (ss["sel"], off, val) if val is not None else (fmt[:-6] % (ss["sel"], off)) + "  ??"
+        if val is not None and val >= 0x100:
+            # A 16-bit stack's values are near offsets in CS; 32-bit ones are flat.
+            lin = (dos.seg_cache(regs, "cs")["base"] + val) if w == 2 else val
+            table = _symcache["table"] if dos.namer else None
+            n = table.code_name_at(lin) if table else None
+            if n:
+                line += " (%s)" % n
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -1005,8 +1071,9 @@ def read_interrupt_log(filter: str = "", since: int = 0, limit: int = 60, collap
         if g["n"] > 1:
             rep = " (x%d%s)" % (g["n"], ", first #%d" % g["first"].seq if g["first"] is not x else "")
         mode = "" if x.mode == 0 else " [%s]" % dosinfo.MODES.get(x.mode, "?")
-        lines.append("#%-6d %8.3fs %sINT %02Xh %s -> %s%s  (from %s%s)" % (
-            x.seq, ago, "  " * min(x.depth - base_depth, 6), x.vector, g["what"], g["result"], rep, x.caller(), mode))
+        lines.append("#%-6d %8.3fs %sINT %02Xh %s -> %s%s  (from %s%s%s)" % (
+            x.seq, ago, "  " * min(x.depth - base_depth, 6), x.vector, g["what"], g["result"], rep, x.caller(),
+            _sym(x.caller_linear()), mode))
     head = ("INT log: logging %s; %d call record(s) read (#%d..#%d); times are seconds before now (emulated); "
             "(xN, first #M) = N identical calls shown once." % (
         " ".join("%02Xh" % v for v in st["vectors"]) or "nothing (stopped)", len(calls), first, st["next"] - 1))
@@ -1204,6 +1271,8 @@ def wait_for_program_start(name: str = "", command: str = "", timeout_seconds: f
             p = dosinfo.program_at(progs, regs["eip"])
             lines = ["Program %s started: stopped at its first instruction." % path]
             if p:
+                memscan.save(_state_dir(), "last-start", {"kind": "real", "path": path, "psp": p.psp,
+                                                          "load": p.load_segment})
                 lines.append("PSP %04X; load segment %04X (PSP+10h; add it to segment values from the "
                              "program's linker map or EXE header). DS=ES=PSP at entry." % (p.psp, p.load_segment))
                 lines.append("Memory: " + ", ".join("%04X-%04X %s" % (b.start, b.end, b.kind) for b in p.blocks))
@@ -1258,6 +1327,8 @@ def wait_for_program_start(name: str = "", command: str = "", timeout_seconds: f
                     c.set_exec_ranges(sorted(blocks, key=lambda b: b[0] - b[1])[:8])
         regs = _regs()
         inside = [b for b in blocks if b[0] <= regs["eip"] < b[1]]
+        memscan.save(_state_dir(), "last-start", {"kind": "protected", "path": opened, "entry": regs["eip"],
+                                                  "blocks": blocks})
         lines = ["32-bit code of %s started: stopped at its first instruction (linear %08X)." % (opened, regs["eip"]),
                  "DPMI memory allocated after the extender opened it: " +
                  ", ".join("%08X-%08X%s" % (a, b, " (code entered here)" if (a, b) in inside else "") for a, b in blocks),
@@ -1581,12 +1652,12 @@ def watch_program(command: str = "", seconds: float = 60.0, hang_seconds: float 
     lines = ["OUTCOME: %s after %.0fs: %s." % (outcome.upper(), time.time() - t0, detail)]
     inner, chain = watchdog.innermost_pending(everything)
     if outcome in ("hung", "waiting", "running", "stopped"):
-        lines.append("CPU at %s (%s mode)." % (watchdog.cs_ip_text(regs), dos.cpu_mode(regs)))
+        lines.append("CPU at %s%s (%s mode)." % (watchdog.cs_ip_text(regs), _sym(regs["eip"]), dos.cpu_mode(regs)))
         if chain:
             lines.append("Calls in progress (outermost first):")
             for x in chain[-6:]:
                 what, _ = dosinfo.describe(x)
-                lines.append("  #%d INT %02Xh %s  (from %s%s)" % (x.seq, x.vector, what, x.caller(),
+                lines.append("  #%d INT %02Xh %s  (from %s%s%s)" % (x.seq, x.vector, what, x.caller(), _sym(x.caller_linear()),
                                                                 "" if x.mode == 0 else " [%s]" % dosinfo.MODES[x.mode]))
     ev = watchdog.summarize(ordered)
     if ev:
@@ -1615,6 +1686,93 @@ def watch_program(command: str = "", seconds: float = 60.0, hang_seconds: float 
     else:
         lines += ["", "The CPU is %s." % ("running" if c.running else "paused")]
     return "\n".join(lines)
+
+
+# ---- symbols from linker maps --------------------------------------------------------
+
+def _parse_bases(text):
+    bases = {}
+    for item in text.replace(",", " ").split():
+        k, v = item.split("=")
+        bases["load" if k.lower() in ("load", "seg", "segment") else int(k, 0)] = int(v.rstrip("hH"), 16)
+    return bases
+
+
+@tool
+def load_symbols(map_path: str, bases: str = "auto") -> str:
+    """Load an Open Watcom linker map (.map) so that addresses can be given as
+    names (set_breakpoint address="TS_ServiceSchedule_", read_memory
+    address="_HeadTask") and are shown as name+offset in disassembly, the CPU
+    state and stack dumps. map_path is a file on the machine running the bridge.
+
+    bases: where the program is loaded. "auto" works it out: for a 16-bit
+    program from the last wait_for_program_start or DOS's running program
+    (load segment = PSP+10h); for a 32-bit DOS/4GW-style program from the last
+    wait_for_program_start(protected_mode=true) (entry point and DPMI blocks).
+    Or give them: "load=240E" (16-bit) or "1=174000,2=1FF000" (object bases)."""
+    m = symbols.MapFile(map_path)
+    d = _state_dir()
+    if bases.strip().lower() not in ("", "auto"):
+        b = _parse_bases(bases)
+        how = "as given"
+    else:
+        start = memscan.load(d, "last-start") or {}
+        image = os.path.splitext(os.path.basename(m.image or map_path))[0].upper()
+        started = os.path.splitext(start.get("path", "").replace("/", "\\").rsplit("\\", 1)[-1])[0].upper()
+        if m.wide:
+            if start.get("kind") != "protected":
+                return ("Can't place a 32-bit map automatically: run wait_for_program_start(name, "
+                        "protected_mode=true) first, or give bases like \"1=174000,2=1FF000\".")
+            b = symbols.guess_object_bases(m, start["entry"], start["blocks"])
+            how = "from the entry point and DPMI blocks of %s" % start["path"]
+            if image and started and image != started:
+                how += " (NOTE: the map is for %s)" % image
+            missing = sorted(set(m.object_sizes()) - set(b))
+            if missing:
+                how += "; no block found for object(s) %s" % ", ".join(map(str, missing))
+        else:
+            if start.get("kind") == "real" and (not image or image == started):
+                b, how = {"load": start["load"]}, "from the start of %s" % start["path"]
+            else:
+                regs = _regs()
+                mem, chain, top, progs = _dos_state(c := client())
+                p = next((p for p in progs.values() if p.name.upper() == image), None)
+                if p is None:
+                    p, _ = _current_program(regs, progs, mem, chain)
+                if p is None:
+                    return "Can't find the program in DOS memory; give bases like \"load=240E\"."
+                b, how = {"load": p.load_segment}, "from %s in DOS memory (PSP %04X)" % (p.name, p.psp)
+    memscan.save(d, "symbols", {"path": os.path.abspath(map_path), "bases": b})
+    _symcache["key"] = None
+    table = _symbols()
+    dos.namer = lambda lin, dist: table.name_at(lin, dist)
+    return "Loaded %d symbols from %s; %s (%s)." % (len(table.by_addr), map_path, table.describe_bases(), how)
+
+
+@tool
+def lookup_symbol(query: str, limit: int = 30) -> str:
+    """Find symbols: a name ("HeadTask", "_HeadTask+8"), a pattern with * ("TS_*",
+    "*score*"), or an address (shows the symbol it falls in)."""
+    table = _symbols()
+    if table is None:
+        return "No symbols loaded; use load_symbols."
+    q = query.strip()
+    if "*" in q or "?" in q:
+        rx = re.compile("^" + re.escape(q).replace(r"\*", ".*").replace(r"\?", ".") + "$", re.I)
+        hits = [(a, n) for a, n in table.by_addr if rx.match(n)]
+        lines = ["%08X  %s" % h for h in hits[:limit]]
+        if len(hits) > limit:
+            lines.append("... %d more" % (len(hits) - limit))
+        return "\n".join(lines) or "No match."
+    lin = table.lookup(q)
+    if lin is not None:
+        return "%s = linear %08X" % (q, lin)
+    try:
+        loc = dos.resolve(q, _regs(), client())
+    except ValueError as e:
+        return "Not a known symbol or address: %s" % e
+    n = table.name_at(loc.linear, 0x10000)
+    return "%08X is %s" % (loc.linear, n or "not within 64 KiB after any symbol (heap, stack or another program)")
 
 
 if __name__ == "__main__":

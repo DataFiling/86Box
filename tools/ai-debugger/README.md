@@ -109,6 +109,7 @@ can also be imported directly from Python.
 | Execution | `status`, `pause`, `resume`, `run_for`, `wait_for_stop`, `step`, `step_over`, `step_out`, `run_until`, `hard_reset` |
 | DOS programs | `dos_memory_map` (MCB chain, programs, which one is running), `wait_for_program_start` (stop at a program's first instruction; `protected_mode` for a DOS/4GW-style program's 32-bit entry; `command` types the command that starts it) |
 | Interrupt calls | `log_interrupts` + `read_interrupt_log` (INT 21h DOS, 31h DPMI, 10h video, 33h mouse... with decoded arguments, file names, buffers and results), `catch_interrupt` (stop on a call or its return), `clear_interrupt_catches` |
+| Symbols | `load_symbols` (an Open Watcom linker map, placed automatically for 16-bit programs and DOS/4GW-style objects), `lookup_symbol`; names then work as addresses (`set_breakpoint address=main_`) and appear in disassembly, the CPU state, stacks, the INT log and watch_program |
 | Unattended runs | `watch_program` (start a program, watch it, and report whether it exited, crashed, hung or waits for input, with evidence) |
 | Finding variables | `scan_memory` + `scan_next` (value, changed, decreased, -1...), `snapshot_memory` + `diff_memory`, `restore_memory` |
 | State | `get_state` (registers, CPU mode, next instructions), `set_register`, `read_stack` |
