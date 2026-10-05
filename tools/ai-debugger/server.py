@@ -18,6 +18,7 @@ from mcp.server.fastmcp import FastMCP, Image
 import dos
 import dosinfo
 import memscan
+import codeanalysis
 import pcinput
 import symbols
 import watchdog
@@ -134,8 +135,13 @@ def _with_symbols(fn, *args, **kwargs):
     table = None
     try:
         table = _symbols()
-    except (GdbError, OSError, ValueError):
+    except (GdbError, OSError):
         pass
+    except Exception:  # a broken saved symbol state must not break every tool
+        try:
+            os.remove(os.path.join(_state_dir(), "symbols.pkl"))
+        except OSError:
+            pass
     dos.namer = (lambda lin, dist: table.name_at(lin, dist)) if table else None
     return fn(*args, **kwargs)
 
@@ -152,7 +158,8 @@ def _resolve(address, regs):
     table = _symcache["table"] if dos.namer else None
     if table is not None:
         head = address.strip().split("+")[0].split("-")[0].strip()
-        if head and not dos.is_register(head):
+        # Plain hex numbers stay numbers ("beef" is BEEFh even if a symbol is named so).
+        if head and not dos.is_register(head) and not re.fullmatch(r"(0x)?[0-9a-fA-F]+h?", head):
             lin = table.lookup(address)
             if lin is not None:
                 return dos.Loc(lin, None, None, 32 if table.map.wide else None)
@@ -201,7 +208,7 @@ def _state_report(stop=None, code_lines=6):
     if dos.namer and dos.namer(regs["eip"], 0x10000):
         parts[-1] = parts[-1].replace("\n", "   in %s\n" % dos.namer(regs["eip"], 0x10000), 1)
     if not dos.segmented(regs) and dos.stack_bits(regs) == 32 and abs(regs["ebp"] - regs["esp"]) > 0x100000 \
-            and regs["ebp"] > 0x10:
+            and regs["ebp"] >= 0x1000:  # small values: EBP used as a plain register
         parts[-1] += ("\nNOTE: EBP (%08X) is far from ESP (%08X): the frame pointer may belong to another stack "
                       "(e.g. after a stack switch, EBP-based locals use the new SS)." % (regs["ebp"], regs["esp"]))
     parts.append("Next instructions:\n" + _code_at(regs, regs["eip"], code_lines))
@@ -257,7 +264,7 @@ def wait_for_stop(timeout_seconds: float = 30.0) -> str:
     """Wait (while running) until a breakpoint/watchpoint hits. Does not pause on timeout."""
     c = client()
     if not c.running:
-        return "CPU is not running.\n\n" + _state_report()
+        return ("No new stop: the CPU was already stopped (resume it first).\n\n" + _state_report())
     stop = c.wait_stop(timeout=timeout_seconds)
     if stop is None:
         return "No stop within %.1fs; CPU still running." % timeout_seconds
@@ -386,9 +393,23 @@ def run_until(address: str, timeout_seconds: float = 30.0) -> str:
 
 @tool
 def hard_reset() -> str:
-    """Hard-reset the emulated machine (like pressing the reset button)."""
+    """Hard-reset the emulated machine (like pressing the reset button). Loaded
+    symbols, recorded patches and the last program start are forgotten."""
     client().monitor("r")
-    return "Machine reset."
+    _forget_program()
+    return "Machine reset (symbols, patches and the last program start forgotten)."
+
+
+def _forget_program():
+    """Drop the state that describes the program in memory."""
+    d = _state_dir()
+    for name in ("symbols", "patches", "last-start"):
+        try:
+            os.remove(os.path.join(d, name + ".pkl"))
+        except OSError:
+            pass
+    _symcache.update(key=None, table=None)
+    dos.namer = None
 
 
 # ---- registers / memory -----------------------------------------------------
@@ -455,52 +476,66 @@ def write_memory(address: str, hex_bytes: str) -> str:
 
 
 @tool
-def search_memory(pattern: str, start: str = "0", end: str = "110000", as_text: bool = False,
+def search_memory(pattern: str, start: str = "", end: str = "", as_text: bool = False,
                   max_results: int = 64) -> str:
     """Search guest memory for a byte pattern (hex, "??" wildcard) or text.
 
-    Default range covers the first 1MB + HMA, i.e. all real-mode memory."""
+    Default range: all RAM. Device memory (VGA etc.) is skipped, and searching has no side effects."""
     c = client()
     regs = _regs()
-    start_loc = _resolve(start, regs)
-    lo, hi = start_loc.linear, _resolve(end, regs).linear
+    start_loc = _resolve(start, regs) if start else None
+    if start or end:
+        lo = start_loc.linear if start_loc else 0
+        hi = _resolve(end, regs).linear if end else (lo + 0x110000 if dos.segmented(regs) else 0x10000000)
+        ranges = [(lo, hi)]
+    else:
+        # All RAM, also in real mode: a protected-mode program is often caught
+        # in real mode (inside DOS or its extender), and its data is above 1 MiB.
+        ranges = [(0, 0x10000000)]
+    if len(pattern) >= 2 and pattern[0] == pattern[-1] and pattern[0] in "\"'":
+        pattern, as_text = pattern[1:-1], True  # a quoted pattern is text
     if as_text:
-        needle = [b for b in pattern.encode("cp437")]
+        rx = re.escape(pattern.encode("cp437"))
     else:
         toks = pattern.replace(",", " ").split()
+        if not all(re.fullmatch(r"[0-9a-fA-F]{1,2}|\?\??", t) or re.fullmatch(r"(?:[0-9a-fA-F]{2})+", t)
+                   for t in toks):
+            return ("The pattern is hex bytes (\"B8 00 4C ?? CD 21\"); for text, quote it or pass "
+                    "as_text=true.")
         if len(toks) == 1 and len(toks[0]) > 2:
             toks = [toks[0][i:i + 2] for i in range(0, len(toks[0]), 2)]
-        needle = [None if t in ("??", "?") else int(t, 16) for t in toks]
-    if not needle:
-        return "Empty pattern."
-    hits = []
-    block = 0x10000
-    overlap = len(needle) - 1
-    addr = lo
-    while addr < hi and len(hits) < max_results:
-        n = min(block + overlap, hi - addr)
-        data = c.read_memory(addr, n)
-        for i in range(0, len(data) - len(needle) + 1):
-            if all(b is None or data[i + j] == b for j, b in enumerate(needle)):
-                hits.append(addr + i)
+        if not toks:
+            return "Empty pattern."
+        rx = b"".join(b"." if t in ("??", "?") else re.escape(bytes([int(t, 16)])) for t in toks)
+    rx = re.compile(rx, re.S)
+    hits, searched = [], 0
+    for lo, hi in ranges:
+        snap = memscan.take(c, [(lo, hi)])
+        for a, d in snap.runs:
+            searched += len(d)
+            for m in rx.finditer(d):
+                hits.append(a + m.start())
                 if len(hits) >= max_results:
                     break
-        addr += block
-    if not hits:
-        return "No matches."
+            if len(hits) >= max_results:
+                break
     real = dos.segmented(regs)
+    where = "searched %s KiB of RAM/ROM in %s" % (searched // 1024, ", ".join("%08X-%08X" % r for r in ranges))
+    if not hits:
+        return "No matches (%s)." % where
 
     def seg_note(a):
-        if start_loc.sel is not None and 0 <= a - start_loc.base <= 0xFFFFFFFF:
+        if start_loc is not None and start_loc.sel is not None and 0 <= a - start_loc.base <= 0xFFFFFFFF:
             return " (%s)" % dos._label(start_loc, a)
         if not real:
-            return ""
+            return _sym(a, 0x1000)
         if a < 0x100000:
             return " (%04X:%04X)" % (a >> 4, a & 0xF)
         if a < 0x10FFF0:  # the HMA, reachable as FFFF:xxxx
             return " (FFFF:%04X)" % (a - 0xFFFF0)
         return ""
-    return "%d match(es):\n" % len(hits) + "\n".join("%08X%s" % (h, seg_note(h)) for h in hits)
+    more = " (stopped at max_results)" if len(hits) >= max_results else ""
+    return "%d match(es)%s, %s:\n" % (len(hits), more, where) + "\n".join("%08X%s" % (h, seg_note(h)) for h in hits)
 
 
 @tool
@@ -514,7 +549,7 @@ def disassemble(address: str = "cs:eip", count: int = 20, bits: int = 0) -> str:
     count = max(1, min(count, 200))
     data = client().read_memory(loc.linear, count * 15)
     if bits not in (16, 32):
-        bits = loc.bits or dos.code_bits(regs)
+        bits = loc.bits or _linear_code_bits(regs, loc.linear)
     note = ""
     if dos.segmented(regs) and loc.base is not None and loc.linear - loc.base > 0xFFFF:
         note = ("NOTE: the CPU is in %s mode, so %s was taken as segment*16+offset; a protected-mode "
@@ -1621,12 +1656,13 @@ def watch_program(command: str = "", seconds: float = 60.0, hang_seconds: float 
                 ss_base = dos.seg_cache(regs, "ss")["base"]
                 sp = regs["esp"] if dos.stack_bits(regs) == 32 else regs["esp"] & 0xFFFF
                 sigs.append((now, watchdog.progress_signature(c, region, ss_base + sp)))
-                text = watchdog.output_text(ordered)
+                # The program's output: from its start on (not the shell echoing the command).
+                text = watchdog.output_text([x for x in ordered if not execs or x.seq > execs[0].seq])
                 bad = watchdog.crash_lines(text)
                 exits = [x for x in watchdog.own_calls(ordered, shell_ranges)
                          if x.vector == 0x21 and x.r("ah") in (0x4C, 0x31) and
                          (not execs or x.seq > execs[0].seq)]
-                if prog_psp is not None and psp == shell_psp and exits:
+                if prog_psp is not None and psp == shell_psp and exits and "exit" in stops:
                     code = exits[-1].r("al")
                     errs = watchdog.error_lines(text)
                     outcome = "crashed" if bad else ("exited with error" if code or errs else "exited")
@@ -1676,10 +1712,12 @@ def watch_program(command: str = "", seconds: float = 60.0, hang_seconds: float 
     failed = watchdog.failed_calls(ordered)
     if failed:
         lines += ["", "Failed calls:"]
-        for x in failed[-8:]:
+        for x, n in watchdog.collapse(failed)[-8:]:
             what, result = dosinfo.describe(x)
-            lines.append("  #%d INT %02Xh %s -> %s  (from %s)" % (x.seq, x.vector, what, result, x.caller()))
-    text = watchdog.output_text(ordered).rstrip()
+            lines.append("  #%d INT %02Xh %s -> %s  (from %s)%s" % (x.seq, x.vector, what, result, x.caller(),
+                                                                 " (x%d)" % n if n > 1 else ""))
+    execs = [x for x in ordered if x.vector == 0x21 and x.r("ah") == 0x4B and x.r("al") == 0]
+    text = watchdog.output_text([x for x in ordered if not execs or x.seq > execs[0].seq]).rstrip()
     if text:
         tail = text.splitlines()[-12:]
         lines += ["", "Text it printed through DOS/BIOS (last lines):"] + ["  | " + t for t in tail]
@@ -1703,9 +1741,10 @@ def watch_program(command: str = "", seconds: float = 60.0, hang_seconds: float 
 
 def _parse_bases(text):
     bases = {}
-    for item in text.replace(",", " ").split():
-        k, v = item.split("=")
-        bases["load" if k.lower() in ("load", "seg", "segment") else int(k, 0)] = int(v.rstrip("hH"), 16)
+    for k, v in re.findall(r"(\w+)\s*=\s*(?:0x)?([0-9a-fA-F]+)h?", text):
+        bases["load" if k.lower() in ("load", "seg", "segment", "psp") else int(k, 10)] = int(v, 16)
+    if not bases:
+        raise ValueError("bases look like \"load=240E\" (16-bit) or \"1=174000,2=1FF000\" (objects)")
     return bases
 
 
@@ -1714,15 +1753,25 @@ def load_symbols(map_path: str, bases: str = "auto") -> str:
     """Load an Open Watcom linker map (.map) so that addresses can be given as
     names (set_breakpoint address="TS_ServiceSchedule_", read_memory
     address="_HeadTask") and are shown as name+offset in disassembly, the CPU
-    state and stack dumps. map_path is a file on the machine running the bridge.
+    state and stack dumps. map_path is a file on the machine running the bridge;
+    map_path="none" unloads the symbols. The map is checked against the code in
+    memory (near calls should land on its functions) and refused if it doesn't fit.
 
     bases: where the program is loaded. "auto" works it out: for a 16-bit
     program from the last wait_for_program_start or DOS's running program
     (load segment = PSP+10h); for a 32-bit DOS/4GW-style program from the last
     wait_for_program_start(protected_mode=true) (entry point and DPMI blocks).
     Or give them: "load=240E" (16-bit) or "1=174000,2=1FF000" (object bases)."""
-    m = symbols.MapFile(map_path)
     d = _state_dir()
+    if map_path.strip().lower() in ("", "none", "off"):
+        try:
+            os.remove(os.path.join(d, "symbols.pkl"))
+        except OSError:
+            pass
+        _symcache.update(key=None, table=None)
+        dos.namer = None
+        return "Symbols unloaded."
+    m = symbols.MapFile(map_path)
     if bases.strip().lower() not in ("", "auto"):
         b = _parse_bases(bases)
         how = "as given"
@@ -1744,6 +1793,8 @@ def load_symbols(map_path: str, bases: str = "auto") -> str:
         else:
             if start.get("kind") == "real" and (not image or image == started):
                 b, how = {"load": start["load"]}, "from the start of %s" % start["path"]
+                if m.com:
+                    b["load"] = start["psp"] + 0x10  # SymbolTable counts .COM offsets from load-10h = PSP
             else:
                 regs = _regs()
                 mem, chain, top, progs = _dos_state(c := client())
@@ -1753,11 +1804,23 @@ def load_symbols(map_path: str, bases: str = "auto") -> str:
                 if p is None:
                     return "Can't find the program in DOS memory; give bases like \"load=240E\"."
                 b, how = {"load": p.load_segment}, "from %s in DOS memory (PSP %04X)" % (p.name, p.psp)
+    table = symbols.SymbolTable(m, b)  # validates the bases before anything is saved
+    total, hits = table.check_code(_region_bytes)
+    if total >= 20 and hits < total * 0.3:  # right map: 70%+ (static functions aren't in maps); wrong: ~1%
+        return ("NOT loaded: this map doesn't fit the code in memory with %s: only %d of %d call "
+                "targets found in the code are functions in the map (a different build of the program, "
+                "or wrong bases?). Check the map is from the same build, or give other bases." % (
+                    table.describe_bases(), hits, total)) + (
+                    "\nThe symbols loaded before (%s) are still in use; map_path=\"none\" unloads them."
+                    % _symcache["table"].map.path if _symbols() is not None else "")
+    fit = ("; %d of %d call targets in memory are functions in the map" % (hits, total) if total >= 20
+           else "; could not check it against the code in memory (too few calls found)")
     memscan.save(d, "symbols", {"path": os.path.abspath(map_path), "bases": b})
     _symcache["key"] = None
     table = _symbols()
     dos.namer = lambda lin, dist: table.name_at(lin, dist)
-    return "Loaded %d symbols from %s; %s (%s)." % (len(table.by_addr), map_path, table.describe_bases(), how)
+    return "Loaded %d symbols from %s; %s (%s)%s." % (len(table.by_addr), map_path, table.describe_bases(),
+                                                      how, fit)
 
 
 @tool
@@ -1775,7 +1838,10 @@ def lookup_symbol(query: str, limit: int = 30) -> str:
         if len(hits) > limit:
             lines.append("... %d more" % (len(hits) - limit))
         return "\n".join(lines) or "No match."
-    lin = table.lookup(q)
+    try:
+        lin = table.lookup(q)
+    except ValueError as e:
+        return str(e)
     if lin is not None:
         return "%s = linear %08X" % (q, lin)
     try:
@@ -1830,9 +1896,229 @@ def what_is(address: str) -> str:
         if lo <= lin < hi:
             out.append("DPMI block #%d %08X-%08X allocated after %s was opened, offset %X" % (
                 i + 1, lo, hi, start.get("path", "the program"), lin - lo))
+    if table is None or not table.name_at(lin, 0x10000):
+        try:
+            lo, hi, bits = _code_region(regs, lin)
+            if lo <= lin < hi and hi - lo <= 0x200000:
+                f = codeanalysis.function_start(codeanalysis.call_targets(_region_bytes(lo, hi), lo, bits), lin)
+                if f is not None:
+                    out.append("if this is code: probably in the function starting at %08X (+%X), a call "
+                               "target" % (f, lin - f))
+        except (GdbError, ValueError):
+            pass
     if len(out) == 1:
         out.append("nothing known about it (heap, stack, unmapped or another program's memory)")
     return "\n".join(out)
+
+
+
+# ---- code analysis and patching -------------------------------------------------------
+
+def _linear_code_bits(regs, linear):
+    """Code size for a bare linear address: the program's (from its extender
+    blocks or loaded symbols) if it is in there; 32 above the real-mode 1 MiB
+    (+HMA) while the CPU happens to be in real or V86 mode (the program was
+    interrupted by DOS or the extender's real-mode code); else the current size."""
+    start = memscan.load(_state_dir(), "last-start") or {}
+    if any(lo <= linear < hi for lo, hi in start.get("blocks", [])):
+        return 32
+    table = _symcache["table"] if dos.namer else None
+    if table is not None and any(lo <= linear < hi for lo, hi in table.code_ranges):
+        return 32 if table.map.wide else 16
+    if dos.segmented(regs) and linear >= 0x110000:
+        return 32
+    return dos.code_bits(regs)
+
+
+def _code_region(regs, linear):
+    """(lo, hi, bits) of the code to analyse around `linear`: the extender's
+    memory block holding it (from wait_for_program_start), the DOS program
+    block, or the 64 KiB code segment in real mode; else 1 MiB around it."""
+    start = memscan.load(_state_dir(), "last-start") or {}
+    for lo, hi in start.get("blocks", []):
+        if lo <= linear < hi:
+            return lo, hi, 32
+    table = _symcache["table"] if dos.namer else None
+    if table is not None:
+        for lo, hi in table.code_ranges:
+            if lo <= linear < hi:
+                return lo, hi, 32 if table.map.wide else 16
+    if dos.segmented(regs) and linear < 0x110000:
+        cs = dos.seg_cache(regs, "cs")["base"]
+        if cs <= linear < cs + 0x10000:
+            return cs, cs + 0x10000, 16
+        seg = linear & ~0xF
+        return seg, seg + 0x10000, 16
+    return max(0, linear - 0x80000), linear + 0x80000, _linear_code_bits(regs, linear)
+
+
+def _region_bytes(lo, hi):
+    snap = memscan.take(client(), [(lo, hi)])
+    data = bytearray(hi - lo)
+    for a, d in snap.runs:
+        data[a - lo:a - lo + len(d)] = d
+    return bytes(data)
+
+
+@tool
+def find_references(target: str, code: str = "", max_results: int = 50) -> str:
+    """Find the instructions that refer to an address: 32-bit absolute operands
+    (e.g. mov eax,[target], push offset target) and near call/jmp/jcc to it.
+    Use it to find every place that uses a variable, or every caller of a
+    function. code: the address of some code in the program to search (default:
+    the code around target if it is code, else the code at CS:EIP); the search
+    covers that code's memory block or segment (by default the code at CS:EIP,
+    so pause in the program first)."""
+    regs = _regs()
+    tloc = _resolve(target, regs)
+    where = _resolve(code, regs).linear if code else regs["eip"]
+    lo, hi, bits = _code_region(regs, where)
+    data = _region_bytes(lo, hi)
+    refs = codeanalysis.references(data, lo, bits, tloc.linear, max_results)
+    head = "References to %s (linear %08X) in %08X-%08X (%d-bit code):" % (target, tloc.linear, lo, hi, bits)
+    if not refs:
+        return head + "\nNone found (data reached through registers or tables isn't visible to this search)."
+    targets = codeanalysis.call_targets(data, lo, bits)
+    lines = [head]
+    for a, kind, text in refs:
+        fn = dos.namer(a, 0x10000) if dos.namer else None
+        if not fn:
+            f = codeanalysis.function_start(targets, a)
+            fn = "function at %08X+%X" % (f, a - f) if f is not None else ""
+        lines.append("  %08X  %-12s %-36s %s" % (a, kind, text, fn))
+    return "\n".join(lines)
+
+
+@tool
+def log_hits(address: str, seconds: float = 10.0, max_hits: int = 200, registers: str = "eax ebx ecx edx",
+             memory: str = "") -> str:
+    """Count and log the times execution reaches `address`, without stopping
+    for you: a temporary breakpoint records each hit (the chosen registers, the
+    return address on the stack, i.e. the caller when `address` is a function
+    entry, and optionally the dword at `memory`: an address, symbol or
+    expression such as "ds:si" or "esi+2C") and continues, for up to `seconds`
+    or `max_hits`. Each hit costs ~1-2 ms of host time."""
+    c = client()
+    regs = _regs()
+    loc = _resolve(address, regs)
+    names = [r.lower() for r in registers.replace(",", " ").split()]
+    temp = (BP_HARDWARE, loc.linear) not in _points
+    if temp:
+        c.set_point(BP_HARDWARE, loc.linear)
+    hits, other, callers = [], None, {}
+    t_end = time.time() + max(0.1, seconds)
+    try:
+        if not c.running:
+            c.resume()
+        while len(hits) < max_hits:
+            stop = c.wait_stop(timeout=max(0.05, t_end - time.time()))
+            if stop is None:
+                break
+            r = _regs()
+            if stop.reason != "breakpoint" or r["eip"] != loc.linear:
+                other = stop
+                break
+            # The return address on the stack tells who called (for function entries).
+            ss = dos.seg_cache(r, "ss")["base"]
+            w = 4 if dos.stack_bits(r) == 32 else 2
+            sp = r["esp"] if w == 4 else r["esp"] & 0xFFFF
+            ret = int.from_bytes(c.read_memory(ss + sp, w), "little")
+            ret_lin = ret if w == 4 else dos.seg_cache(r, "cs")["base"] + ret
+            callers[ret_lin] = callers.get(ret_lin, 0) + 1
+            vals = []
+            for n in names:
+                try:
+                    vals.append("%s=%08X" % (n.upper(), dos.reg_value(n, r)))
+                except (KeyError, ValueError):
+                    vals.append("%s=?" % n)
+            if memory:
+                m = _resolve(memory, r).linear
+                vals.append("[%s]=%08X" % (memory, int.from_bytes(c.read_memory(m, 4), "little")))
+            hits.append("%.2fs  %s  ret %08X%s" % (seconds - (t_end - time.time()), " ".join(vals), ret_lin,
+                                                   _sym(ret_lin)))
+            if time.time() >= t_end:
+                break
+            c.resume()
+    finally:
+        if temp:
+            if c.running:
+                c.pause()
+            c.clear_point(BP_HARDWARE, loc.linear)
+            if other is None:
+                c.resume()
+    lines = ["%d hit(s) of %s (linear %08X%s) in %.1fs%s." % (
+        len(hits), address, loc.linear, _sym(loc.linear), seconds, " (max_hits reached)" if len(hits) >= max_hits else "")]
+    if callers:
+        lines.append("Return addresses on the stack (callers, if this is a function entry):")
+        for a, n in sorted(callers.items(), key=lambda kv: -kv[1])[:10]:
+            lines.append("  %08X%s  x%d" % (a, _sym(a), n))
+    lines += hits[:60]
+    if len(hits) > 60:
+        lines.append("... %d more hits" % (len(hits) - 60))
+    if other is not None:
+        lines += ["", "Stopped for another reason:", _state_report(other)]
+    return "\n".join(lines)
+
+
+@tool
+def patch_code(address: str, action: str, target: str = "", length: int = 0) -> str:
+    """Patch code in memory: action "jmp" or "call" writes a branch to `target`
+    (offsets computed for you; a short jmp when it fits), "nop" fills `length`
+    bytes with NOPs, "ret" writes a RET, and "undo" puts back the bytes of the
+    last patch at `address`. A patch that ends inside an instruction is padded
+    with NOPs to its end. Shows the code before and after; patches are kept so
+    they can be undone later (also across run_tool commands). Patch whole
+    logical steps: skipping a push without its pop crashes the program. The
+    CPU may keep running; the bytes are written between two instructions."""
+    c = client()
+    regs = _regs()
+    loc = _resolve(address, regs)
+    at = loc.linear
+    bits = loc.bits or _linear_code_bits(regs, at)
+    d = _state_dir()
+    patches = memscan.load(d, "patches") or {}
+    action = action.lower()
+    if action == "undo":
+        if at not in patches:
+            return "No patch recorded at %08X (have: %s)." % (at, ", ".join("%08X" % a for a in patches) or "none")
+        old = patches.pop(at)
+        if isinstance(old, tuple):  # (original bytes, code size at patch time)
+            old, bits = old
+        c.write_memory(at, old)
+        memscan.save(d, "patches", patches)
+        return "Restored %d byte(s) at %08X.\n%s" % (len(old), at, dos.disassemble(c.read_memory(at, 16), at, bits, None, 3))
+    if action in ("jmp", "call"):
+        if not target:
+            return "Give target= for %s." % action
+        new = codeanalysis.encode_branch(action, at, _resolve(target, regs).linear, bits)
+    elif action == "nop":
+        if length < 1:
+            return "Give length= (bytes) for nop."
+        new = b"\x90" * length
+    elif action == "ret":
+        new = b"\xC3"
+    else:
+        return "action is jmp, call, nop, ret or undo."
+    before_bytes = c.read_memory(at, max(32, len(new) + 16))
+    # Keep instructions whole: pad up to the end of the last instruction the
+    # patch touches with NOPs, so no half instruction is left to execute.
+    end, note = codeanalysis.instruction_end(before_bytes, at, bits, len(new)), ""
+    if end is not None and end > len(new):
+        note = " (+%d NOP byte(s) to the end of the instruction it overwrote)" % (end - len(new))
+        new += b"\x90" * (end - len(new))
+    before = dos.disassemble(before_bytes, at, bits, None, 4)
+    if at not in patches:
+        patches[at] = (before_bytes[:len(new)], bits)
+        memscan.save(d, "patches", patches)
+    c.write_memory(at, new)
+    after = dos.disassemble(c.read_memory(at, 16), at, bits, None, 3)
+    warn = ""
+    if action in ("nop", "jmp") and any(i.mnemonic.startswith(("push", "pop", "enter", "leave"))
+                                         for i in codeanalysis.instructions(before_bytes[:len(new)], at, bits)):
+        warn = ("\nWARNING: this removes stack instructions (push/pop/enter/leave); unless the code you skip "
+                "to undoes exactly the same, the stack ends up unbalanced and the program will crash.")
+    return "Patched %d byte(s) at %08X (%s)%s; undo with action=undo.\nBefore:\n%s\nAfter:\n%s%s" % (
+        len(new), at, new.hex(" ").upper(), note, before, after, warn)
 
 
 if __name__ == "__main__":

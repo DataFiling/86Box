@@ -360,26 +360,41 @@ _BRANCH = ("call", "lcall", "jmp", "ljmp", "loop") + tuple("j" + c for c in
 
 
 def _symbol_comment(mnemonic, op_str, seg_base, bits, data_base):
-    """'; name' for an operand that is a known symbol: branch targets (in the
-    code segment), memory operands (in the data segment, DS unless overridden)
-    and, in 32-bit code, immediates that may be addresses."""
+    """'; name' for an operand that is a known symbol: direct branch targets (in
+    the code segment), memory operands with a plain displacement (in the data
+    segment: DS unless overridden; indirect call/jmp [x] included) and, in
+    32-bit code, immediates that may be addresses. Stack-relative operands
+    (BP/ESP/EBP based: locals and arguments) and far branches are skipped."""
     if namer is None:
         return ""
-    branch = mnemonic.split()[-1] in _BRANCH or mnemonic.startswith("j")
+    word = mnemonic.split()[-1]
+    if word in ("lcall", "ljmp") or ("ptr [" not in op_str and "[" not in op_str and ":" in op_str and word in _BRANCH):
+        return ""  # far branch: SEG:OFF, not an offset in this segment
+    branch = word in _BRANCH or word.startswith("j")
     names = []
     for m in _HEX.finditer(op_str):
         v = int(m.group(0), 16)
-        if v < 0x100:
-            continue
-        if branch:
-            n = namer((seg_base + v) & 0xFFFFFFFF, 0x10000)
-        else:
-            in_memory = "[" in op_str[:m.start()] and "]" in op_str[m.end():]
-            if data_base is None or (bits == 16 and not in_memory):
+        open_br = op_str.rfind("[", 0, m.start())
+        in_memory = open_br >= 0 and op_str.find("]", open_br) >= m.end()
+        if in_memory:
+            inside = op_str[open_br + 1:op_str.find("]", open_br)]
+            if re.search(r"\b(e?bp|e?sp)\b", inside) or "- " + m.group(0) in inside:
+                continue  # locals/arguments, or a negative displacement
+            if data_base is None:
                 continue
             seg = re.search(r"\b([cdefgs]s):\[", op_str)
             if seg and seg.group(1) != "ds" and bits == 16:
                 continue  # another segment: base unknown here
+            if v < 0x10 and re.search(r"\b[a-z]{2,3}\b", inside):
+                continue  # small offset from a register: a struct field, not a global
+            n = namer((data_base + v) & 0xFFFFFFFF, 0x40)
+        elif branch:
+            if v < 0x10:
+                continue
+            n = namer((seg_base + v) & 0xFFFFFFFF, 0x10000)
+        else:
+            if bits == 16 or data_base is None or v < 0x1000:
+                continue  # 16-bit immediates are mostly numbers, not addresses
             n = namer((data_base + v) & 0xFFFFFFFF, 0x40)
         if n:
             names.append(n)

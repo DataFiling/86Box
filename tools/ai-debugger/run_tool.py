@@ -42,8 +42,16 @@ def parse_value(text):
         return re.sub(r"\\([nt\\])", lambda m: {"n": "\n", "t": "\t", "\\": "\\"}[m.group(1)], text)
 
 
+RAW_TEXT = {}  # parameter -> the text as typed (escapes processed), for str parameters
+
+
+def _unescape(text):
+    return re.sub(r"\\([nt\\])", lambda m: {"n": "\n", "t": "\t", "\\": "\\"}[m.group(1)], text)
+
+
 def coerce(fn, kwargs):
     """Match values to the tool's annotated parameter types, as MCP would."""
+    raw = RAW_TEXT
     sig = inspect.signature(inspect.unwrap(fn))
     out = {}
     aliases = {"count": ("entries", "length", "limit"), "length": ("count", "entries"), "entries": ("count",),
@@ -55,12 +63,15 @@ def coerce(fn, kwargs):
             if alt:
                 del kwargs[k]
                 kwargs[alt] = v
+                if k in raw:
+                    raw[alt] = raw.pop(k)
     for k, v in kwargs.items():
         if k not in sig.parameters:
             raise SystemExit("%s has no parameter %r; parameters: %s" % (fn.__name__, k, ", ".join(sig.parameters)))
         ann = sig.parameters[k].annotation
         if ann is str and not isinstance(v, str):
-            v = json.dumps(v) if isinstance(v, bool) else str(v)
+            # Keep exactly what was typed ("1.50" stays "1.50", "null" stays "null").
+            v = raw.get(k, json.dumps(v) if isinstance(v, bool) else str(v))
         elif ann is int and isinstance(v, str):
             try:
                 v = int(v, 0)  # "0xB0" or "176"
@@ -139,6 +150,7 @@ def main():
             raise SystemExit("arguments are key=value, got %r" % kv)
         k, v = kv.split("=", 1)
         kwargs[k] = parse_value(v)
+        RAW_TEXT[k] = _unescape(v)
     try:
         asyncio.run(call(a.tool, kwargs, a.image_dir))
     except SystemExit:

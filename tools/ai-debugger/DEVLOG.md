@@ -430,6 +430,99 @@ Its tool feedback, all acted on:
 - a note when EBP is far from ESP (a frame pointer from another stack);
 - a new `what_is` tool (symbol, PC area, DOS block and owner, DPMI block).
 
+### 15. Exercise without symbols, a code review, and code tools
+
+**Exercise (no source, no map):** a fresh agent got the release FastDoom
+running its demos on the Pentium machine, with the task a game trainer has:
+find the player's health, the code that lowers it, and make the player
+invulnerable. In about 8 minutes and 42 tool calls it:
+1. Found health at 001F9D7C (player struct 001F9D50 + 2Ch) with
+   `scan_memory`/`scan_next` in two steps, plus the actor's own copy at
+   mobj+7Ch and the status bar's cached copy.
+2. Found both damage routines: `P_DamageMobj` at 1A1C60, and a second copy
+   at 1A1F38 that damaging floors use. A write watchpoint gave the
+   first one; when health still dropped after patching it, the watchpoint
+   gave the second.
+3. Patched a `jmp` to each routine's epilogue at the start of the player
+   block (1A1D81, 1A1F8A). It verified the patch over 13 hits: health
+   stayed at 100.
+
+Graded correct against the source and map, which the agent never saw. It
+also correctly identified the checks it skipped: the god-mode cheat flag and
+the invulnerability power-up.
+
+Its feedback led to these new tools and fixes:
+- **`find_references`:** lists the instructions that use an address as an
+  absolute operand, or call or jump to it. Each candidate is decoded with
+  capstone and accepted only when the address is that instruction's real
+  displacement or immediate.
+- **`log_hits`:** runs, and records each execution of an address (registers,
+  memory, return addresses) without the agent having to loop over
+  breakpoints.
+- **`patch_code`:**
+  - writes `jmp`/`call` with the offset computed, `nop` or `ret`, and keeps
+    the original bytes so `undo` puts them back;
+  - pads a patch that ends inside an instruction with NOPs;
+  - warns when it removes push/pop instructions.
+- **`what_is`** names the function an address is in when there is no
+  symbol: the nearest call target before it.
+- **`search_memory`:**
+  - searches all RAM by default and says which range it searched (it used to
+    search only the first MiB, and silently found nothing in a DOS/4GW
+    game);
+  - reads without side effects;
+  - takes quoted text.
+- **`wait_for_stop`** says when there was no new stop.
+
+**Code review** of the newest code (an independent agent with test maps and
+scripts) found and fixed:
+- `symbols`:
+  - C++ names with spaces were cut short;
+  - .COM maps were off by 100h;
+  - statics with the same name in several modules silently resolved to one
+    of them (now ambiguous, with `module!name` to pick);
+  - names reached past their segment, so the stack and other programs were
+    labelled as the last symbol + a large offset;
+  - bad bases were saved and broke every later tool.
+- **Disassembly comments:** they named stack-relative and far operands as
+  if they were data symbols.
+- **`watch_program`:**
+  - the program's output included the shell's echo;
+  - backspaces weren't applied;
+  - `stop_when` didn't honour `exit`;
+  - a program waiting at a DOS Abort/Retry prompt was called hung.
+- **`run_tool`:** string parameters lost their exact text (`1.50` became
+  `1.5`).
+
+**Live testing then found:**
+- **`load_symbols` accepted a map from another build.** The debug build's
+  map, loaded against the release build, gave plausible but wrong names.
+  Before loading, it now checks that near calls in the code land on the
+  map's functions:
+
+  | Map | Calls that land on its functions |
+  |---|---|
+  | correct | 70% or more (static functions aren't in maps) |
+  | wrong build | about 1% |
+
+  Below 30% it refuses the map. `hard_reset` now forgets symbols, patches
+  and the last program start, and `map_path=none` unloads symbols.
+- **Wrong code size:** disassembly and `patch_code` undo picked 16-bit code
+  for a 32-bit address when the CPU happened to be in real mode (inside DOS
+  for the game).
+- **Duplicate calls:** `watch_program` listed every DOS call a DOS/4GW game
+  makes twice, once from protected mode and once as the extender's real-mode
+  copy. The copy is now dropped, and identical failures are counted
+  instead of repeated.
+- **False EBP warning:** the EBP note fired when release code used EBP as a
+  general register.
+- **Live patching is dangerous:** NOPing the pushes at a live function's
+  entry crashed the game a few minutes later in the extender's real-mode
+  code. That is why `patch_code` now warns about stack instructions. Writes
+  from the stub go through the CPU's write path, so the recompiler drops
+  stale code (the exercise agent confirmed patched code took effect at
+  once).
+
 ## Test results
 
 Test machines, built with `-DQT=OFF -DSDL2=ON -DGDBSTUB=ON` and run headless
@@ -475,8 +568,7 @@ this environment), and V86 mode under EMM386.
 
 1. **Report the FastDoom bug upstream**: `testdata/fastdoom-bug-report.md` is
    ready to paste (this environment can't post to that repository).
-2. More AI exercises on real software (now that symbols work), including
-   ones without a map.
+2. More AI exercises on real software, e.g. a bug hunt without a map.
 3. **More real games and extenders:** the FastDoom repository also ships
    DOS/32A; other open-source DOS games build with Open Watcom.
 4. **Read LE/LX object tables** from the program file to place objects

@@ -68,8 +68,12 @@ def output_text(calls):
         ah = c.r("ah")
         if ah == 0x0E or (ah in (0x09, 0x0A) and c.r("cx") == 1):
             ch = c.r("al")
-            out.append("\n" if ch == 0x0A else "" if ch in (0x0D, 0x07) else chr(ch) if 32 <= ch < 127 else "?")
-            out.extend(out[-1:] * (c.count - 1))
+            for _ in range(c.count):
+                if ch == 0x08:  # backspace: DOS echoes BS, space, BS when a typed key is deleted
+                    if out and out[-1] != "\n":
+                        out.pop()
+                elif ch not in (0x0D, 0x07):
+                    out.append("\n" if ch == 0x0A else chr(ch) if 32 <= ch < 127 else "?")
     return "".join(out)
 
 
@@ -112,9 +116,39 @@ def innermost_pending(calls):
     return deepest, sorted(pend, key=lambda c: c.depth)
 
 
+def drop_reflections(calls):
+    """Leave out the real-mode copies of protected-mode calls: a DOS extender
+    passes a protected-mode INT 21h etc. on to real-mode DOS, which logs the
+    same call again one level deeper (its parent in the log)."""
+    out, parent = [], {}  # depth -> the latest call at that depth
+    for c in sorted(calls, key=lambda c: c.seq):
+        p = parent.get(c.depth - 1)
+        parent[c.depth] = c
+        for d in [d for d in parent if d > c.depth]:
+            del parent[d]
+        if (p is not None and p.mode >= 2 and c.mode <= 1 and c.vector == p.vector and
+                c.r("ah") == p.r("ah")):
+            continue
+        out.append(c)
+    return out
+
+
+def collapse(calls):
+    """[(call, times)] with identical calls (same function, result and caller)
+    folded into their last occurrence."""
+    import collections
+    groups = collections.OrderedDict()
+    for c in calls:
+        what, result = dosinfo.describe(c)
+        k = (c.vector, what, result, c.caller_linear())
+        n = groups.pop(k, (None, 0))[1]
+        groups[k] = (c, n + c.count)
+    return list(groups.values())
+
+
 def failed_calls(calls):
     out = []
-    for c in calls:
+    for c in drop_reflections(calls):
         if not c.returned or not c.cf():
             continue
         if c.vector == 0x21 and dosinfo._dos_uses_cf(c.r("ah")) and c.r("ah") not in (0x4E, 0x4F, 0x71):
@@ -127,12 +161,13 @@ def failed_calls(calls):
 def summarize(calls, limit=12):
     """Key events: program starts, video modes, files, failures, exits."""
     ev, seen = [], {}
-    for c in calls:
+    for c in drop_reflections(calls):
         what, result = dosinfo.describe(c)
         key = c.vector == 0x21 and c.r("ah") in (0x4B, 0x4C, 0x31, 0x3D, 0x3C, 0x6C, 0x4E, 0x5B)
         key |= c.vector == 0x10 and c.r("ah") == 0x00 or (c.vector == 0x10 and c.r("ax") == 0x4F02)
         key |= c.vector == 0x31 and c.r("ax") in (0x0501, 0x0100)
-        key |= c.returned and c.cf() and c.vector in (0x21, 0x31) and c.r("ah") not in (0x4E, 0x4F, 0x71)
+        key |= c.returned and c.cf() and ((c.vector == 0x21 and dosinfo._dos_uses_cf(c.r("ah")) and
+                                           c.r("ah") not in (0x4E, 0x4F, 0x71)) or c.vector == 0x31)
         if key:
             k = (c.vector, what, result, c.caller_linear())
             if k in seen:  # the same event again: count it on its first line
@@ -191,6 +226,8 @@ def classify(samples, calls, hang_seconds, sigs=(), now_tsc=0, hz=0):
                (c.vector == 0x21 and (c.r("ah") in (0x01, 0x07, 0x08, 0x0A, 0x0C) or
                                       (c.r("ah") == 0x3F and c.r("bx") == 0)))]
     stuck = [c for c in chain if not blocks_legitimately(c) and hz and (now_tsc - c.tsc) / hz > hang_seconds]
+    if reading and stuck and reading[-1].depth > stuck[-1].depth:
+        stuck = []  # e.g. a DOS call waiting at an Abort/Retry/Fail prompt: waiting for a key, not hung
     if stuck and window[-1].t - window[0].t >= hang_seconds * 0.8:
         s = stuck[-1]
         return "hung", ("stuck inside INT %02Xh %s (called from %s%s) for %.0f emulated seconds; a call like "
