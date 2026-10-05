@@ -40,10 +40,7 @@ opINT(uint32_t fetchdat)
     uint8_t temp = getbytef();
 
 #ifdef USE_GDBSTUB
-    if (gdbstub_int(temp, 1)) {
-        cpu_state.pc = cpu_state.oldpc;
-        return 1;
-    }
+    gdbstub_int(temp);
 #endif
 
     if ((cr0 & 1) && (cpu_state.eflags & VM_FLAG) && (IOPL != 3)) {

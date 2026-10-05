@@ -293,7 +293,8 @@ def format_registers(regs):
     lines.append("DS=%04X ES=%04X SS=%04X FS=%04X GS=%04X" % (regs["ds"], regs["es"], regs["ss"], regs["fs"], regs["gs"]))
     seg = regs.get("seg")
     if seg and not segmented(regs):
-        lines.append("Bases: " + " ".join("%s=%08X" % (n.upper(), seg[n]["base"]) for n in SEGS))
+        lines.append("Bases: " + " ".join(("%s=%08X" % (n.upper(), seg[n]["base"])) if seg[n]["sel"] & ~3
+                                          else "%s=(null)" % n.upper() for n in SEGS))
     elif seg and mode == "real":
         big = [n.upper() for n in SEGS if seg[n]["limit"] > 0xFFFF]
         if big:

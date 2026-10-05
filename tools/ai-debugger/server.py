@@ -449,7 +449,12 @@ def disassemble(address: str = "cs:eip", count: int = 20, bits: int = 0) -> str:
     data = client().read_memory(loc.linear, count * 15)
     if bits not in (16, 32):
         bits = loc.bits or dos.code_bits(regs)
-    return dos.disassemble(data, loc.linear, bits, loc, count)
+    note = ""
+    if dos.segmented(regs) and loc.base is not None and loc.linear - loc.base > 0xFFFF:
+        note = ("NOTE: the CPU is in %s mode, so %s was taken as segment*16+offset; a protected-mode "
+                "selector can only be looked up while the CPU is in protected mode (or pass the linear "
+                "address and bits=32).\n" % (dos.cpu_mode(regs), address))
+    return note + dos.disassemble(data, loc.linear, bits, loc, count)
 
 
 @tool
@@ -642,7 +647,11 @@ def screenshot(downscale: int = 1, save_path: str = "") -> list:
 def _ensure_running():
     c = client()
     if not c.running:
+        last = c.last_stop
         c.resume()
+        if last is not None and last.reason not in ("pause", "trap"):
+            return (" (NOTE: the CPU was stopped by: %s; resumed it so the guest receives input)"
+                    % last.describe())
         return " (CPU was paused; resumed it so the guest receives input)"
     return ""
 
@@ -893,9 +902,11 @@ def log_interrupts(vectors: str = "21 31 33", clear: bool = True) -> str:
                                                  "running" if c.running else "paused; resume to collect calls")
 
 
-def _is_reflection(prev, cur):
-    return (prev is not None and cur.depth == prev.depth + 1 and cur.vector == prev.vector and
-            cur.mode != prev.mode and dosinfo.function_number(cur) == dosinfo.function_number(prev))
+def _is_reflection(parent, cur):
+    """A DOS extender passing a protected-mode call down to real mode makes the
+    same call again, nested inside it (several times when it splits a transfer)."""
+    return (parent is not None and cur.vector == parent.vector and cur.mode != parent.mode and
+            dosinfo.function_number(cur) == dosinfo.function_number(parent))
 
 
 @tool
@@ -926,10 +937,10 @@ def read_interrupt_log(filter: str = "", since: int = 0, limit: int = 60, collap
     calls = dosinfo.parse_log(c.int_log(first))
     hz = st.get("hz") or 1
     now = st.get("tsc", 0)
-    shown, hidden_poll, hidden_refl, prev = [], 0, 0, None
+    shown, hidden_poll, hidden_refl, at_depth = [], 0, 0, {}
     for x in calls:
-        refl = _is_reflection(prev, x)
-        prev = x
+        refl = _is_reflection(at_depth.get(x.depth - 1), x)
+        at_depth[x.depth] = x  # the latest call at each nesting depth encloses deeper ones
         if not dosinfo.matches_filter(x, flt):
             continue
         if refl and not show_reflections:
@@ -972,8 +983,9 @@ def read_interrupt_log(filter: str = "", since: int = 0, limit: int = 60, collap
         mode = "" if x.mode == 0 else " [%s]" % dosinfo.MODES.get(x.mode, "?")
         lines.append("#%-6d %8.3fs %sINT %02Xh %s -> %s%s  (from %s%s)" % (
             x.seq, ago, "  " * min(x.depth - base_depth, 6), x.vector, g["what"], g["result"], rep, x.caller(), mode))
-    head = "INT log: logging %s; %d call record(s) read (#%d..#%d); times are seconds before now (emulated)." % (
-        " ".join("%02Xh" % v for v in st["vectors"]) or "nothing (stopped)", len(calls), first, st["next"] - 1)
+    head = ("INT log: logging %s; %d call record(s) read (#%d..#%d); times are seconds before now (emulated); "
+            "(xN, first #M) = N identical calls shown once." % (
+        " ".join("%02Xh" % v for v in st["vectors"]) or "nothing (stopped)", len(calls), first, st["next"] - 1))
     notes = []
     if total > len(groups):
         if since:
@@ -1082,6 +1094,12 @@ def _type_command(c, text):
             return
 
 
+def _entry_report(stop):
+    """State report for a program-start stop, without the internal range-catch wording."""
+    rep = _state_report(stop)
+    return rep.replace("STOP: " + stop.describe(), "STOP: program entry point", 1)
+
+
 def _restore_catches(c, saved):
     c.clear_int_catches()
     for v, ah, al, w in saved["catches"]:
@@ -1095,8 +1113,8 @@ def wait_for_program_start(name: str = "", command: str = "", timeout_seconds: f
 
     name: program file name to wait for (e.g. "GAME" or "GAME.EXE"); empty = the
     next program started. command: text to type once the watch is set up, to
-    start it, e.g. "GAME\\n" at the DOS prompt (or leave empty if something
-    else starts it).
+    start it, e.g. "GAME" plus a newline (Enter) at the DOS prompt; leave it
+    empty if something else starts the program.
 
     protected_mode=true waits instead for a DOS-extender program's 32-bit code
     (DOS/4GW and other DPMI-based extenders): it watches the extender open the
@@ -1112,7 +1130,13 @@ def wait_for_program_start(name: str = "", command: str = "", timeout_seconds: f
         return c.wait_stop(timeout=max(0.05, deadline - time.time()))
 
     def other_stop(stop):
-        return "Stopped for another reason before the program started:\n\n" + _state_report(stop)
+        return ("Stopped for another reason (%s) before the program started:\n\n" % stop.describe()) + _state_report(stop)
+
+    def next_stop():
+        # A stop that came in while typing is still queued: take it rather than resume past it.
+        if not c.running and c.stops.empty():
+            c.resume()
+        return wait()
 
     try:
         c.clear_int_catches()
@@ -1121,9 +1145,7 @@ def wait_for_program_start(name: str = "", command: str = "", timeout_seconds: f
             c.catch_int(0x21, 0x4B, 0x00, "call")
             _type_command(c, command)
             while True:
-                if not c.running:
-                    c.resume()
-                stop = wait()
+                stop = next_stop()
                 if stop is None:
                     return "No program was started within %.0fs (CPU still running)." % timeout_seconds
                 if stop.reason != "catch":
@@ -1138,11 +1160,19 @@ def wait_for_program_start(name: str = "", command: str = "", timeout_seconds: f
             if not free:
                 return "Caught the exec of %s, but found no free DOS memory to watch." % path
             c.clear_int_catches()
+            c.catch_int(0x21, 0x4B, 0x00, "ret")  # a failed exec returns at once
             c.set_exec_ranges(free)
             c.resume()
             stop = wait()
             if stop is None:
                 return "%s was exec'd but didn't start within %.0fs (CPU still running)." % (path, timeout_seconds)
+            if stop.reason == "catch" and stop.int_return:
+                regs = _regs()
+                if regs["eflags"] & 1:
+                    code = regs["eax"] & 0xFFFF
+                    return "Exec of %s failed: error %02Xh (%s).\n\n%s" % (
+                        path, code, dosinfo.DOS_ERRORS.get(code, "unknown"), _state_report(stop))
+                return "%s ran and exited before its start was detected.\n\n%s" % (path, _state_report(stop))
             if stop.reason != "range":
                 return other_stop(stop)
             regs = _regs()
@@ -1155,7 +1185,7 @@ def wait_for_program_start(name: str = "", command: str = "", timeout_seconds: f
                 lines.append("Memory: " + ", ".join("%04X-%04X %s" % (b.start, b.end, b.kind) for b in p.blocks))
             lines.append("If this is a DOS-extender stub (e.g. a DOS/4GW game), call "
                          "wait_for_program_start(protected_mode=true) to continue to its 32-bit code.")
-            return "\n".join(lines) + "\n\n" + _state_report(stop)
+            return "\n".join(lines) + "\n\n" + _entry_report(stop)
 
         # Protected mode: find the extender opening the program, then DPMI blocks allocated after.
         if not {0x21, 0x31} <= set(traced):
@@ -1165,9 +1195,7 @@ def wait_for_program_start(name: str = "", command: str = "", timeout_seconds: f
         _type_command(c, command)
         opened = None
         while opened is None:
-            if not c.running:
-                c.resume()
-            stop = wait()
+            stop = next_stop()
             if stop is None:
                 return "No protected-mode open of %s within %.0fs (CPU still running)." % (name or "an .EXE", timeout_seconds)
             if stop.reason != "catch":
@@ -1211,7 +1239,7 @@ def wait_for_program_start(name: str = "", command: str = "", timeout_seconds: f
                  ", ".join("%08X-%08X%s" % (a, b, " (code entered here)" if (a, b) in inside else "") for a, b in blocks),
                  "Under DOS/4GW-style flat models, linear = offset (segment bases 0); the program's objects "
                  "(code, data) are in these blocks."]
-        return "\n".join(lines) + "\n\n" + _state_report(stop)
+        return "\n".join(lines) + "\n\n" + _entry_report(stop)
     finally:
         try:
             c.set_exec_ranges([])
@@ -1262,7 +1290,7 @@ def _regions(spec, regs):
 
 
 def _label(regs, a, ds_base):
-    if dos.segmented(regs):
+    if dos.segmented(regs) and a < 0x100000:
         if ds_base is not None and 0 <= a - ds_base <= 0xFFFF:
             return "%08X (DS:%04X)" % (a, a - ds_base)
         return "%08X (%04X:%04X)" % (a, a >> 4, a & 0xF)
@@ -1352,10 +1380,14 @@ def _scan_report(scan, snap, regs, prev=None, limit=20):
 
 
 @tool
-def scan_memory(value: str = "", size: int = 1, region: str = "auto", signed: bool = False) -> str:
+def scan_memory(value: str = "", size: int = 1, region: str = "auto", signed: bool = False,
+                aligned: bool = False) -> str:
     """Start a value scan to find where the game keeps a number (lives, score,
     ammo...). value: the number shown now (decimal; 0x.. or ..h for hex), or
     empty if unknown. size: 1, 2 or 4 bytes. region: as for snapshot_memory.
+    aligned: only addresses that are a multiple of size (fewer false hits for
+    32-bit games; 16-bit games often pack variables at odd addresses).
+    A negative value makes the scan signed.
 
     Then change it in the game and call scan_next until one address is left."""
     if size not in (1, 2, 4):
@@ -1363,10 +1395,13 @@ def scan_memory(value: str = "", size: int = 1, region: str = "auto", signed: bo
     c = client()
     regs = _regs()
     ranges, desc, ds_base = _regions(region, regs)
+    number = memscan.parse_number(value) if value.strip() else None
+    if number is not None and number < 0:
+        signed = True
     snap = memscan.take(c, ranges)
-    scan = memscan.Scan(ranges, size, signed, desc)
+    scan = memscan.Scan(ranges, size, signed, desc, aligned)
     scan.ds_base = ds_base
-    scan.start(snap, memscan.parse_number(value) if value.strip() else None)
+    scan.start(snap, number)
     d = _state_dir()
     memscan.save(d, "scan-mem", snap)
     memscan.save(d, "scan", scan)

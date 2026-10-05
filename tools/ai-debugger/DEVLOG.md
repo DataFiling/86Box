@@ -238,6 +238,96 @@ The agents reported friction with the tools, which was fixed:
   a wheel with `/O`. With `buttons = 4` and `CTMOUSE /O`, 3 clicks read as
   wheel -3 through INT 33h.
 
+### 11. DOS and extender awareness
+**Goal:** what the exercise agents asked for and the roadmap's step 5: know
+which program runs and where it is, see the DOS/DPMI/BIOS calls it makes,
+stop at its start, and find variables without manual search loops.
+
+**Emulator** (`src/gdbstub.c`, with `gdbstub_int()` called by `INT n` in the
+386 interpreters and both 8086 cores):
+- Interrupt log (`tv`/`ts`/`tl`/`tc`): records with registers, 64 bytes at
+  DS:(E)DX, DS:(E)SI and ES:(E)DI, and on return the registers and buffers
+  again. A return is detected when execution reaches the instruction after
+  the `INT` with the same SS:SP; a pending list plus a 1024-entry hash keeps
+  this to one table lookup per instruction. Identical back-to-back calls are
+  folded into one record with a count, so DOS's keyboard polling (26,000
+  calls in a few seconds) takes one record.
+- Catchpoints (`ca`/`cx`): a call catch checks the bytes of the next
+  instruction (`CD xx` after prefixes) before it runs, the same way on every
+  core; a return catch stops at the return address.
+- `xr`: stop when execution enters a linear range.
+- `mr`: side-effect-free reads (RAM/ROM only, through the page tables
+  without faulting), so snapshots never touch VGA latches or other devices.
+- EFLAGS reads and writes now account for the interpreter's lazy flags.
+
+**Bridge:** `dosinfo.py` (call decoders, MCB chain, current PSP from DOS's
+swappable data area at DOS data segment + 330h, found through the first-MCB
+pointer at +24h), `memscan.py` (snapshots, diffs, value scans with state on
+disk), and the tools `dos_memory_map`, `log_interrupts`,
+`read_interrupt_log`, `catch_interrupt`, `wait_for_program_start`,
+`snapshot_memory`, `diff_memory`, `scan_memory`, `scan_next` and
+`restore_memory`.
+
+**Program start detection:**
+- Real mode: catch `INT 21h AX=4B00h`, check the file name, then stop at
+  the first instruction executed in memory that was free at that moment.
+  That is the new program's entry, since DOS loads it there and runs no
+  other code there. TXTGAME: `240E:05B2`, Watcom's startup.
+- DOS/4GW: the log showed it loading the program file from 16-bit
+  protected mode and allocating its objects with DPMI `0501h`. So: catch
+  the protected-mode open of the program file, then the returns of
+  `0501h`/`0503h`, and stop when execution first enters one of those
+  blocks. PMGAME: linear `12D5C8` (Watcom's 32-bit startup); data block at
+  `14C000`, as in the answer file.
+
+**Speed:** a 16 MB snapshot or scan step takes 1.2 s. The first version
+took 17 s: replies were accumulated with `bytes +=`, which is quadratic.
+
+**Not possible:** machine save/restore. 86Box has no save states, and
+restoring RAM alone would leave devices out of step; `restore_memory` only
+puts back chosen bytes.
+
+### 12. Review and second exercise round
+A workflow ran 3 reviewers (stub, Python modules, server tools) and 2
+exercise agents, each graded by a separate agent against `GROUND_TRUTH.md`.
+
+| Exercise | Diagnosis | Locations | Fix | Key tool |
+|---|---|---|---|---|
+| 486 / DATAGAME (new: "level data corrupt") | correct (opened write-only, mode 01h) | correct (DS:02E0) | correct (patched `mov dx,1` to 0 in memory, levels listed) | `read_interrupt_log` |
+| Pentium / PMGAME (startup, score, entry) | correct | correct (score 14C468h, `inc` at 12D3FA) | correct (entry 12D5C8h) | `wait_for_program_start protected_mode`, log, watchpoint |
+
+Review findings fixed:
+- **High:** a hardware breakpoint on a caught `INT` made it unpassable (the
+  hardware-break check replaced the catch's stop reason, which dropped its
+  run-once marker).
+- **Medium:** call catches used to abort the `INT` and rewind EIP, so the
+  interpreter could still deliver a pending trap or IRQ before stopping.
+  Both are fixed by the redesign above (check the next instruction instead
+  of aborting).
+- **Medium:** on NEC V20/V30 the stub saw EIP one byte ahead (prefetched
+  opcode), breaking return tracking, ranges and hardware breakpoints.
+- **Low:** the log fold after `tc`; sequence number wraparound; lazy flags
+  rebuilt on 8086 cores; a return catch overriding a watchpoint stop.
+- **Bridge:**
+  - The MCB chain with `DOS=UMB` and the link off.
+  - A stop lost while `wait_for_program_start` was typing.
+  - A failed exec reported as a start.
+  - Reflections split into several calls.
+  - `run_tool` turning `4E00` into a float.
+  - Scan `unchanged` excluding untouched bytes.
+  - Snapshot pickles in a shared temp directory (now a private per-user
+    directory).
+  - Several decoders (INT 33h, INT 13h, DPMI 0003h/0202h/0204h, PSP
+    environment under DPMI).
+
+Exercise feedback acted on:
+- `run_tool.py help`;
+- program-entry wording;
+- a warning when a selector is used while the CPU is in real mode;
+- input tools saying which stop they resume from;
+- null selectors shown without a base;
+- `scan_memory aligned`.
+
 ## Test results
 
 Test machines, built with `-DQT=OFF -DSDL2=ON -DGDBSTUB=ON` and run headless
@@ -281,18 +371,13 @@ this environment), and V86 mode under EMM386.
 
 ## Next steps
 
-1. **DOS and extender awareness:**
-   - find the running program (PSP/MCB chain, extender load address);
-   - break on program start;
-   - log `INT 21h`/`INT 10h`/`INT 31h` calls with names;
-   - memory snapshot and diff to find variables (all three exercise agents
-     asked for this, since searching for a value and then re-searching by
-     hand is slow);
-   - save and restore machine state.
-2. **Real games:** run shareware titles (e.g. Commander Keen, Doom) once
+1. **Real games:** run shareware titles (e.g. Commander Keen, Doom) once
    network access allows it, or with images supplied by the user.
-3. **Autonomous loop:** an agent that runs a game, detects hangs or crashes,
+2. **Autonomous loop:** an agent that runs a game, detects hangs or crashes
+   (stuck loops, invalid opcodes, exceptions, a failing DOS call in the log),
    and diagnoses them.
+3. **More extender knowledge:** read LE/LX object tables to name code and
+   data objects; test other extenders (PMODE/W, DOS32A, CauseWay).
 4. **Speed:** let the dynamic recompiler run while no breakpoints,
    watchpoints or stepping are active. Only needed for targets faster than a
    Pentium MMX 200.

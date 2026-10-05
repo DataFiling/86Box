@@ -33,6 +33,9 @@ def parse_value(text):
     """JSON when it parses ("5", "true", "\"x\""), otherwise the string with
     \\n, \\t and \\\\ escapes turned into newline, tab and backslash (so
     text="DIR\\n" types Enter, as it would through MCP)."""
+    # Only JSON that can't be a hex number or address: 4E00 or 1e3 stay strings.
+    if not re.fullmatch(r"-?\d+|-?\d+\.\d+|true|false|null|[\[{\"].*", text, re.S):
+        return re.sub(r"\\([nt\\])", lambda m: {"n": "\n", "t": "\t", "\\": "\\"}[m.group(1)], text)
     try:
         return json.loads(text)
     except ValueError:

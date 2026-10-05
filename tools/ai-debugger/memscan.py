@@ -54,8 +54,14 @@ def take(client, ranges):
 
 
 def state_dir(host, port):
-    path = os.path.join(tempfile.gettempdir(), "86box-debugger-%s-%d" % (host.replace(":", "_"), port))
-    os.makedirs(path, exist_ok=True)
+    """A per-user directory for snapshots (pickles, so it must not be writable by others)."""
+    user = str(os.getuid()) if hasattr(os, "getuid") else os.environ.get("USERNAME", "user")
+    path = os.path.join(tempfile.gettempdir(), "86box-debugger-%s-%s-%d" % (user, host.replace(":", "_"), port))
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    if hasattr(os, "getuid"):
+        st = os.lstat(path)
+        if not os.path.isdir(path) or os.path.islink(path) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+            raise RuntimeError("refusing to use %s for debugger state: not a private directory of this user" % path)
     return path
 
 
@@ -196,17 +202,22 @@ def check(kind, n, old, new, size):
     return False
 
 
-def find_value(snap, value, size, signed, limit=MAX_CANDIDATES):
-    """Every address (any alignment) holding value; None if over limit."""
-    try:
-        pat = struct.pack("<" + _fmt(size, signed), value)
-    except struct.error:
-        pat = struct.pack("<" + _fmt(size, not signed), value)
+def check_range(value, size, signed):
+    lo, hi = (-(1 << (8 * size - 1)), (1 << (8 * size - 1)) - 1) if signed else (0, (1 << (8 * size)) - 1)
+    if not lo <= value <= hi:
+        raise ValueError("%d doesn't fit a %d-byte %s value (%d..%d)" % (value, size, "signed" if signed else "unsigned", lo, hi))
+
+
+def find_value(snap, value, size, signed, limit=MAX_CANDIDATES, aligned=False):
+    """Every address holding value (any alignment unless aligned); None if over limit."""
+    check_range(value, size, signed)
+    pat = struct.pack("<" + _fmt(size, signed), value)
     out = array.array("I")
     for a, d in snap.runs:
         i = d.find(pat)
         while i >= 0:
-            out.append(a + i)
+            if not aligned or (a + i) % size == 0:
+                out.append(a + i)
             if len(out) > limit:
                 return None
             i = d.find(pat, i + 1)
@@ -225,7 +236,8 @@ class Scan:
     """A value scan: candidate addresses (explicit array, or every address in
     the scanned memory minus `excluded` while no value has been given yet)."""
 
-    def __init__(self, ranges, size, signed, region_desc):
+    def __init__(self, ranges, size, signed, region_desc, aligned=False):
+        self.aligned = aligned
         self.ranges = ranges
         self.size = size
         self.signed = signed
@@ -244,7 +256,7 @@ class Scan:
             self.cands = None
             self.steps.append("start: unknown value, %d bytes of memory" % snap.size)
             return
-        found = find_value(snap, value, self.size, self.signed)
+        found = find_value(snap, value, self.size, self.signed, aligned=self.aligned)
         if found is None:
             raise ValueError("more than %d addresses hold %d; use a larger value size or a smaller region"
                              % (MAX_CANDIDATES, value))
@@ -255,14 +267,15 @@ class Scan:
         size, signed = self.size, self.signed
         if self.cands is None:
             if kind in ("=",):
-                found = find_value(new, n, size, signed)
+                found = find_value(new, n, size, signed, aligned=self.aligned)
                 if found is None:
                     raise ValueError("more than %d addresses hold %d" % (MAX_CANDIDATES, n))
                 self.cands = array.array("I", (a for a in found if a not in self.excluded))
             elif kind == "unchanged":
-                self.excluded |= touched(changed_runs(old, new), size)
+                self.excluded |= touched(changed_runs(old, new, merge_gap=0), size)
             elif kind in ("changed", "increased", "decreased", "inc_by", "dec_by"):
-                pos = sorted(touched(changed_runs(old, new), size) - self.excluded)
+                pos = sorted(a for a in touched(changed_runs(old, new, merge_gap=0), size) - self.excluded
+                             if not self.aligned or a % size == 0)
                 self.cands = array.array("I", (a for a in pos if check(kind, n, value_at(old, a, size, signed),
                                                                        value_at(new, a, size, signed), size)))
             else:

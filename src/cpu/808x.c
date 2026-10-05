@@ -2858,7 +2858,7 @@ execx86_instruction(void)
                 wait_cycs(1, 0);
                 temp = pfq_fetchb();
 #ifdef USE_GDBSTUB
-                gdbstub_int(temp, 0);
+                gdbstub_int(temp);
 #endif
                 interrupt(temp);
                 break;

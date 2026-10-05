@@ -3624,7 +3624,7 @@ execute_instruction(void)
             temp = biu_pfq_fetchb();
             do_cycle_i();
 #ifdef USE_GDBSTUB
-            gdbstub_int(temp, 0);
+            gdbstub_int(temp);
 #endif
             sw_int(temp);
             jump = 1;

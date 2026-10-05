@@ -443,9 +443,6 @@ static int                  catch_count;
 static int                  catch_stop_vector;
 static int                  catch_stop_return;
 static uint32_t             catch_stop_seq;
-static uint32_t             catch_skip_addr; /* an aborted INT to let through once on resume */
-static int                  catch_skip_valid;
-static int                  catch_skip_pending;
 static uint32_t             xrange_lo[8], xrange_hi[8];
 static int                  xrange_count;
 static uint32_t             xrange_hit;
@@ -455,7 +452,29 @@ static uint32_t             xrange_hit;
 static void gdbstub_int_clear(void);
 static int  gdbstub_peek(uint32_t addr, uint8_t *buf, int len);
 
+
 static void (*cpu_exec_shadow)(int32_t cycs);
+
+/* NEC V20/V30 core: has already fetched the next opcode when the stub runs. */
+extern int biu_queue_preload;
+
+/* Linear address of the next instruction to execute. */
+static uint32_t
+gdbstub_pc(void)
+{
+    if (cpu_exec_shadow == execvx0)
+        return cs + ((cpu_state.pc - biu_queue_preload) & 0xffff);
+    return cs + cpu_state.pc;
+}
+
+/* Only the 286+ interpreters compute arithmetic flags lazily; on the 8086
+   cores flags_op is never maintained and may be stale from another machine. */
+static void
+gdbstub_flags_rebuild(void)
+{
+    if (is286)
+        flags_rebuild();
+}
 static gdbstub_breakpoint_t *first_swbreak = NULL;
 static gdbstub_breakpoint_t *first_hwbreak = NULL;
 static gdbstub_breakpoint_t *first_rwatch = NULL;
@@ -657,7 +676,7 @@ gdbstub_client_write_reg(int index, uint8_t *buf)
             break;
 
         case GDB_REG_EFLAGS:
-            flags_rebuild(); /* drop pending lazy flags, which would override the new ones */
+            gdbstub_flags_rebuild(); /* drop pending lazy flags, which would override the new ones */
             cpu_state.flags  = AS_U16(buf[0]);
             cpu_state.eflags = AS_U16(buf[2]);
             break;
@@ -794,7 +813,7 @@ gdbstub_client_read_reg(int index, uint8_t *buf)
             break;
 
         case GDB_REG_EFLAGS:
-            flags_rebuild(); /* the interpreter computes arithmetic flags lazily */
+            gdbstub_flags_rebuild(); /* the interpreter computes arithmetic flags lazily */
             AS_U16(buf[0]) = cpu_state.flags;
             AS_U16(buf[2]) = cpu_state.eflags;
             break;
@@ -1558,8 +1577,7 @@ e00:
                     catches[catch_count++] = c;
                 } else if (!strcmp(p, "cx")) {
                     /* Remove all INT catchpoints. */
-                    catch_count      = 0;
-                    catch_skip_valid = 0;
+                    catch_count = 0;
                 } else if (!strcmp(p, "xr")) {
                     /* Stop when execution enters one of up to 8 linear ranges (start end, end exclusive);
                        no ranges clears them. The ranges are dropped when one is entered. */
@@ -1724,7 +1742,7 @@ e00:
                         "- tl [from [count]] - Read log records from sequence number {from} as raw bytes\n"
                         "- tc - Clear the INT log\n"
                         "- mr address length - Read RAM/ROM without side effects: {readable} {address} {length} [bytes] records\n"
-                        "- ca vector [ah|*] [al|*] [call|ret|both] - Stop on matching INT calls and/or their returns\n"
+                        "- ca vector [ah|*] [al|*] [call|ret|both] - Stop before matching INT calls and/or at their returns\n"
                         "- cx - Remove all INT catchpoints\n"
                         "- xr [start end]... - Stop when execution enters a linear range (end exclusive); none clears\n");
                     break;
@@ -1958,10 +1976,6 @@ gdbstub_cpu_exec(int32_t cycs)
         stop_reason[stop_reason_len++] = 'T';
         stop_reason[stop_reason_len++] = '0';
         stop_reason[stop_reason_len++] = '0' + ((gdbstub_step == GDBSTUB_BREAK) ? GDB_SIGINT : GDB_SIGTRAP);
-
-        /* Let an INT stopped by a call catchpoint through once when resuming. */
-        catch_skip_valid   = catch_skip_pending && (gdbstub_step == GDBSTUB_BREAK_CATCH);
-        catch_skip_pending = 0;
 
         /* Add extended break reason. Catchpoints and range catches are
            reported with keys GDB ignores, on top of a plain SIGTRAP. */
@@ -2313,44 +2327,23 @@ static void
 gdbstub_int_clear(void)
 {
     intlog_on = int_pending_count = catch_count = xrange_count = 0;
-    catch_skip_valid = catch_skip_pending = 0;
     memset(intlog_vectors, 0, sizeof(intlog_vectors));
     memset(int_ret_hash, 0, sizeof(int_ret_hash));
 }
 
-/* Called by INT n instructions with the CPU state at the instruction, EIP
-   already past it. Logs the call and checks the call catchpoints; returns 1
-   if the instruction must be abandoned (and restarted later) to stop before
-   it, which only callers passing can_abort support. */
-int
-gdbstub_int(uint8_t vector, int can_abort)
+/* Called by INT n instructions with EIP already past the instruction: logs
+   the call and remembers where it returns to. */
+void
+gdbstub_int(uint8_t vector)
 {
     if (!intlog_on && !catch_count)
-        return 0;
+        return;
 
-    uint32_t ip       = use32 ? cpu_state.pc : (cpu_state.pc & 0xffff);
-    uint32_t int_addr = cs + ((ip - 2) & (use32 ? 0xffffffff : 0xffff));
-    int      caught   = 0;
-
-    /* Check call catchpoints, letting through the INT a catch stopped on. */
-    if (catch_skip_valid && (int_addr == catch_skip_addr))
-        catch_skip_valid = 0;
-    else if (catch_count && gdbstub_catch_match(vector, AH, AL, 1)) {
-        catch_stop_vector = vector;
-        catch_stop_return = 0;
-        catch_stop_seq    = 0;
-        gdbstub_step      = GDBSTUB_BREAK_CATCH;
-        if (can_abort) {
-            catch_skip_addr    = int_addr;
-            catch_skip_pending = 1;
-            return 1;
-        }
-        caught = 1;
-    }
+    uint32_t ip = use32 ? cpu_state.pc : (cpu_state.pc & 0xffff);
 
     int track = intlog_vectors[vector] || (catch_count && gdbstub_catch_match(vector, AH, AL, 2));
     if (!track)
-        return 0;
+        return;
 
     int      mode = !(msw & 1) ? 0 : ((cpu_state.eflags & VM_FLAG) ? 1 : (use32 ? 3 : 2));
     uint32_t sp   = stack32 ? ESP : SP;
@@ -2362,6 +2355,8 @@ gdbstub_int(uint8_t vector, int can_abort)
         gdbstub_intlog_t *rec;
 
         seq = intlog_next++;
+        if (!seq) /* 0 means "not logged" in the pending list */
+            seq = intlog_next++;
         if ((intlog_next - intlog_first) > INTLOG_SIZE)
             intlog_first = intlog_next - INTLOG_SIZE;
         rec = &intlog[seq & (INTLOG_SIZE - 1)];
@@ -2390,8 +2385,6 @@ gdbstub_int(uint8_t vector, int can_abort)
         in_gdbstub   = 1;
         rec->lens    = gdbstub_peek(rec->lin[0], rec->bytes[0], INTLOG_BYTES) | (gdbstub_peek(rec->lin[1], rec->bytes[1], INTLOG_BYTES) << 8) | (gdbstub_peek(rec->lin[2], rec->bytes[2], INTLOG_BYTES) << 16);
         in_gdbstub   = old_in_gdbstub;
-        if (caught)
-            catch_stop_seq = seq;
     }
 
     /* Remember where the call returns to, to log its results and check return catchpoints. */
@@ -2406,14 +2399,13 @@ gdbstub_int(uint8_t vector, int can_abort)
     pending->ah                   = AH;
     pending->al                   = AL;
     int_ret_hash[INT_RET_HASH(pending->ret)]++;
-
-    return 0;
 }
 
 /* Check whether the instruction about to run is where a pending INT call
-   returns to. Returns 1 if a return catchpoint stops the CPU. */
+   returns to. Returns 1 if a return catchpoint stops the CPU (only when
+   may_stop: another stop reason raised by the same instruction wins). */
 static int
-gdbstub_int_returned(uint32_t addr)
+gdbstub_int_returned(uint32_t addr, int may_stop)
 {
     uint32_t sp = stack32 ? ESP : SP;
     for (int i = int_pending_count - 1; i >= 0; i--) {
@@ -2439,7 +2431,7 @@ gdbstub_int_returned(uint32_t addr)
                 rec->out[3]        = EDX;
                 rec->out[4]        = ESI;
                 rec->out[5]        = EDI;
-                flags_rebuild();
+                gdbstub_flags_rebuild();
                 rec->out[6] = cpu_state.flags | ((uint32_t) cpu_state.eflags << 16);
                 rec->out[7] = DS;
                 rec->out[8] = ES;
@@ -2451,7 +2443,7 @@ gdbstub_int_returned(uint32_t addr)
                 /* Fold a call identical to the one before it, in and out, into that
                    one, so polling loops (INT 16h AH=01h...) don't flood the log. */
                 gdbstub_intlog_t *prev = &intlog[(pending->seq - 1) & (INTLOG_SIZE - 1)];
-                if ((pending->seq == (intlog_next - 1)) && (pending->seq != intlog_first) && (prev->seq == (pending->seq - 1)) && (prev->info == rec->info) && (prev->count < 0xffffffff) && !memcmp(&prev->sel_cs, &rec->sel_cs, offsetof(gdbstub_intlog_t, count) - offsetof(gdbstub_intlog_t, sel_cs)) && !memcmp(prev->bytes, rec->bytes, sizeof(rec->bytes))) {
+                if ((pending->seq == (intlog_next - 1)) && ((int32_t) (pending->seq - intlog_first) > 0) && (prev->seq == (pending->seq - 1)) && (prev->info == rec->info) && (prev->count < 0xffffffff) && !memcmp(&prev->sel_cs, &rec->sel_cs, offsetof(gdbstub_intlog_t, count) - offsetof(gdbstub_intlog_t, sel_cs)) && !memcmp(prev->bytes, rec->bytes, sizeof(rec->bytes))) {
                     prev->count++;
                     intlog_next--;
                     pending->seq--;
@@ -2462,7 +2454,7 @@ gdbstub_int_returned(uint32_t addr)
         int vector = pending->vector, ah = pending->ah, al = pending->al;
         uint32_t seq = pending->seq;
         gdbstub_int_pop(i, INTLOG_RETURNED);
-        if (catch_count && gdbstub_catch_match(vector, ah, al, 2)) {
+        if (may_stop && catch_count && gdbstub_catch_match(vector, ah, al, 2)) {
             catch_stop_vector = vector;
             catch_stop_return = 1;
             catch_stop_seq    = seq;
@@ -2474,30 +2466,66 @@ gdbstub_int_returned(uint32_t addr)
     return 0;
 }
 
+/* Check whether the instruction about to run is an INT matching a call
+   catchpoint, and stop before it if so. */
+static int
+gdbstub_catch_call(uint32_t addr)
+{
+    uint8_t buf[8];
+    int     n = gdbstub_peek(addr, buf, sizeof(buf));
+    int     i;
+
+    for (i = 0; (i < n) && ((buf[i] == 0x26) || (buf[i] == 0x2e) || (buf[i] == 0x36) || (buf[i] == 0x3e) || (buf[i] == 0x64) ||
+                            (buf[i] == 0x65) || (buf[i] == 0x66) || (buf[i] == 0x67) || (buf[i] == 0xf0) || (buf[i] == 0xf2) || (buf[i] == 0xf3));
+         i++)
+        ;
+    if (((i + 1) >= n) || (buf[i] != 0xcd) || !gdbstub_catch_match(buf[i + 1], AH, AL, 1))
+        return 0;
+    catch_stop_vector = buf[i + 1];
+    catch_stop_return = 0;
+    catch_stop_seq    = 0;
+    gdbstub_step      = GDBSTUB_BREAK_CATCH;
+    return 1;
+}
+
+/* Called after every instruction (and interrupt delivery), before the next
+   one runs. Nonzero stops the CPU. */
 int
 gdbstub_instruction(void)
 {
-    /* Check for INT calls returning, and for execution entering a watched range. */
-    if (int_pending_count | xrange_count) {
-        uint32_t addr = cs + cpu_state.pc;
-        if (int_pending_count && int_ret_hash[INT_RET_HASH(addr)] && gdbstub_int_returned(addr))
+    /* A stop raised during the instruction (watchpoint, INT 3) wins over the checks below. */
+    int stopped = (gdbstub_step >= GDBSTUB_BREAK_SW);
+
+    if (int_pending_count | xrange_count | catch_count) {
+        uint32_t addr = gdbstub_pc();
+        /* INT calls returning; their results are logged even when stopping for something else. */
+        if (int_pending_count && int_ret_hash[INT_RET_HASH(addr)] && gdbstub_int_returned(addr, !stopped))
             return 1;
-        for (int i = 0; i < xrange_count; i++) {
-            if ((addr >= xrange_lo[i]) && (addr < xrange_hi[i])) {
-                gdbstub_log("GDB Stub: Execution entered range at %08X\n", addr);
-                xrange_hit   = addr;
-                xrange_count = 0;
-                gdbstub_step = GDBSTUB_BREAK_RANGE;
-                return 1;
+        if (!stopped) {
+            /* Execution entering a watched range. */
+            for (int i = 0; i < xrange_count; i++) {
+                if ((addr >= xrange_lo[i]) && (addr < xrange_hi[i])) {
+                    gdbstub_log("GDB Stub: Execution entered range at %08X\n", addr);
+                    xrange_hit   = addr;
+                    xrange_count = 0;
+                    gdbstub_step = GDBSTUB_BREAK_RANGE;
+                    return 1;
+                }
             }
+            /* An INT about to be called. The instruction a resume starts on isn't
+               checked, so resuming at a caught INT runs it. */
+            if (catch_count && gdbstub_catch_call(addr))
+                return 1;
         }
     }
+    if (stopped)
+        return 1;
 
     /* Check hardware breakpoints if any are present. */
     gdbstub_breakpoint_t *breakpoint = first_hwbreak;
     if (breakpoint) {
         /* Calculate the current instruction's address. */
-        uint32_t wanted_addr = cs + cpu_state.pc;
+        uint32_t wanted_addr = gdbstub_pc();
 
         /* Go through the list of software breakpoints. */
         do {

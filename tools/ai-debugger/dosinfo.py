@@ -318,7 +318,9 @@ def _dpmi(c):
     if ax == 0x0000:
         args = "%d" % c.r("cx")
         res = lambda: "first selector %04X" % o("ax")
-    elif ax in (0x0001, 0x0003, 0x000A, 0x000B, 0x000C):
+    elif ax == 0x0003:
+        res = lambda: "increment %04Xh" % o("ax")
+    elif ax in (0x0001, 0x000A, 0x000B, 0x000C):
         args = "selector %04X" % c.r("bx")
         if ax == 0x000A:
             res = lambda: "alias %04X" % o("ax")
@@ -342,7 +344,7 @@ def _dpmi(c):
     elif ax in (0x0200, 0x0202, 0x0204):
         args = "%s %02Xh" % ("exception" if ax == 0x0202 else "INT", c.r("bl"))
         res = (lambda: "%04X:%04X" % (o("cx"), o("dx"))) if ax == 0x0200 else \
-              (lambda: "%04X:%08X" % (o("cx"), c.r("edx", True)))
+              (lambda: "%04X:%0*X" % (o("cx"), 8 if c.wide else 4, c.off("dx", True)))
     elif ax == 0x0201:
         args = "INT %02Xh -> %04X:%04X" % (c.r("bl"), c.r("cx"), c.r("dx"))
     elif ax in (0x0203, 0x0205):
@@ -486,7 +488,8 @@ def _mouse(c):
     args, res = "", None
     o = lambda r: c.r(r, out=True)
     if ax == 0x00:
-        res = lambda: "%s, %d buttons" % ("installed" if o("ax") == 0xFFFF else "not installed", o("bx"))
+        res = lambda: "%s, %d buttons" % ("installed" if o("ax") == 0xFFFF else "not installed",
+                                          2 if o("bx") == 0xFFFF else o("bx"))
     elif ax == 0x03:
         res = lambda: "x=%d y=%d buttons=%d" % (o("cx"), o("dx"), o("bx"))
     elif ax == 0x04:
@@ -514,7 +517,14 @@ def _disk(c):
             c.r("al"), c.r("dl"), cyl, c.r("dh"), c.r("cl") & 0x3F, c.es & 0xFFFF, c.r("bx"))
     elif ah in (0x00, 0x08, 0x15, 0x41, 0x42, 0x43, 0x48):
         args = "drive %02Xh" % c.r("dl")
-    res = lambda: "status %02Xh" % c.r("ah", True)
+    if ah == 0x15:
+        res = lambda: "type %d (%s)" % (c.r("ah", True), {0: "none", 1: "floppy, no change line", 2: "floppy with change line",
+                                                         3: "hard disk"}.get(c.r("ah", True), "?"))
+    elif ah == 0x41:
+        res = lambda: "extensions %d.%d" % (c.r("ah", True) >> 4, c.r("ah", True) & 15) if c.r("bx", True) == 0xAA55 \
+            else "no extensions"
+    else:
+        res = lambda: "status %02Xh" % c.r("ah", True)
     return name, args, res, True
 
 
@@ -715,7 +725,9 @@ def find_mcb_chain(mem):
         chain = _walk(mem, seg)
         if not chain or len(chain) < 3:
             continue
-        if not any(b.mcb == top - 1 or b.end == top for b in chain):
+        # The chain covers conventional memory up to its top; with DOS=UMB and the
+        # UMB link off, the last block ends at top-1, where the link MCB sits.
+        if not any(b.mcb == top - 1 or b.end in (top, top - 1) for b in chain):
             continue
         if chain[0].owner == 8:
             return chain, top
@@ -743,6 +755,10 @@ def analyze(mem, chain):
             p.env, = struct.unpack_from("<H", mem, base + 0x2C)
             n = mem[base + 0x80]
             p.args = mem[base + 0x81:base + 0x81 + min(n, 126)].decode("cp437", "replace").strip()
+            # Under DPMI, PSP:2Ch becomes a selector; only trust a segment that
+            # is one of this program's blocks.
+            if not any(b.start == p.env for b in p.blocks):
+                p.env = 0
             if p.env and p.env * 16 + 32 < len(mem):
                 env = mem[p.env * 16:p.env * 16 + 32768]
                 end = env.find(b"\0\0")
@@ -751,7 +767,9 @@ def analyze(mem, chain):
         for b in p.blocks:
             if b.start == p.psp:
                 b.kind = "program"
-                p.name = b.name
+                # MCB names exist since DOS 4; before that the field holds leftovers.
+                if b.name and all(32 < ord(ch) < 127 for ch in b.name):
+                    p.name = b.name
             elif b.start == p.env:
                 b.kind = "environment"
             else:
