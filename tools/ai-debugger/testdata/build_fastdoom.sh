@@ -3,7 +3,7 @@
 # port) and the Freedoom game data, as out/fastdoom-hd.img, for the Pentium
 # test machine (vms/pentium.cfg plus the [Hard disks] lines in README.md).
 #
-# FASTDOOM_PATCH=1 (default) applies fastdoom-ns_task-stack.patch, which
+# FASTDOOM_PATCH=1 (default) applies fastdoom-ns_task-stack.diff, which
 # fixes the timer interrupt handler corrupting DOS memory (see DEVLOG.md);
 # FASTDOOM_PATCH=0 builds the unpatched game, which hangs during startup.
 #
@@ -26,7 +26,7 @@ if [ ! -d fastdoom ]; then
 fi
 (cd fastdoom && git checkout -q -f "$FASTDOOM_COMMIT")
 if [ "$FASTDOOM_PATCH" = 1 ]; then
-    (cd fastdoom && git apply "$HERE/fastdoom-ns_task-stack.patch")
+    (cd fastdoom && git apply "$HERE/fastdoom-ns_task-stack.diff")
 fi
 # -debug also keeps the linker map (FDOOM.MAP) for symbolising addresses.
 (cd fastdoom && ./build.sh fdoom.exe -debug > build.log 2>&1) || { tail -20 fastdoom/build.log; exit 1; }

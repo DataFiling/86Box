@@ -118,5 +118,5 @@ with a protected-mode-only write watchpoint over the buffers
 `TS_ServiceSchedule` with EBP pointing into low memory.
 
 **Fix:** don't address locals through EBP after changing SS: make `ptr` and
-`next` static (fastdoom-ns_task-stack.patch), or compute EBP for the new
+`next` static (fastdoom-ns_task-stack.diff), or compute EBP for the new
 stack too.

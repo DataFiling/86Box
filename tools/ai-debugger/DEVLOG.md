@@ -328,6 +328,62 @@ Exercise feedback acted on:
 - null selectors shown without a base;
 - `scan_memory aligned`.
 
+### 13. Unattended runs and a real game (FastDoom)
+**`watch_program`:** starts a program and watches it, then reports whether
+it exited (and with what code and error text), crashed, hung (and inside
+which call), or waits for input, with the evidence. Checks run every
+0.5–2 s:
+- CPU position samples (a small loop);
+- INT call activity (folded repeats count);
+- a hash of the program's memory (minus the area interrupt frames rewrite)
+  and of the screen;
+- how long the innermost DOS/BIOS call has been running, in emulated time.
+
+It caught every test case:
+
+| Program | Outcome |
+|---|---|
+| DATAGAME | exits with code 3 and its error |
+| VGAGAME | "Invalid Opcode" crash |
+| TXTGAME | port-polling hang |
+| the prompt | waits for input |
+
+Two false alarms were fixed on the way: frame-pacing loops looked like hangs
+(fixed with the memory and screen hash), and a missed return looked like a
+call still running (fixed by checking for later calls at the same depth).
+
+**FastDoom:** only GitHub is reachable here, so the real game is FastDoom
+built from source with the free Freedoom data, on a 64 MB hard disk image
+(`testdata/build_fastdoom.sh`). It hung at the end of every startup. The
+debugger traced it to a FastDoom bug:
+1. `watch_program`: stuck for minutes inside an `INT 21h` open, made from
+   FastDoom's 32-bit code and passed down by DOS/4GW; the CPU loops in the
+   FreeDOS kernel; DOS printed "Run chkdsk: Bad FAT value".
+2. Walking FreeDOS's buffer list in guest memory: one header held
+   `next=FDA0 prev=0020`. A later run instead had 8 bad bytes in a cached
+   FAT sector (`A0 FD 20 00` twice). The disk image passes fsck, so memory
+   was being corrupted.
+3. A FreeDOS backtrace from a catchpoint on the "Run chkdsk" output (kernel
+   map symbols): `int21 AH=3Fh` → `DosRWSft` → `rwblock` → `map_cluster` →
+   `next_cluster`, on the WAD's handle, whose SFT was intact.
+4. `0x0020FDA0` in FastDoom's linker map: `HeadTask`, the timer task list
+   head in `ns_task.c`.
+5. A write watchpoint over DOS's buffers was too slow, since DOS writes
+   there constantly. So the stub gained a watchpoint CPU-mode filter
+   (`wf pm`, `set_watchpoint cpu_mode="protected"`). The next run stopped on
+   the write: `TS_ServiceSchedule+4Eh`, `mov [ebp-8],eax`, with
+   EBP=00004CA4.
+6. The interrupted stack was DOS/4GW's interrupt stack, selector 00B0 with
+   base 143DF0h. The handler switches SS to its own zero-based stack but
+   keeps using EBP for its locals, so they land in low memory whenever IRQ0
+   interrupts real-mode code (DOS reading the WAD).
+
+Making the two locals static (`testdata/fastdoom-ns_task-stack.diff`) fixes
+it: the game loads and plays its demos under the debugger on the Pentium MMX
+machine. The bug should be reported upstream (viti95/FastDoom). Its
+write-up is in `GROUND_TRUTH.md`, so the unpatched build can serve as a
+real-world exercise.
+
 ## Test results
 
 Test machines, built with `-DQT=OFF -DSDL2=ON -DGDBSTUB=ON` and run headless
@@ -371,14 +427,14 @@ this environment), and V86 mode under EMM386.
 
 ## Next steps
 
-1. **Real games:** run shareware titles (e.g. Commander Keen, Doom) once
-   network access allows it, or with images supplied by the user.
-2. **Autonomous loop:** an agent that runs a game, detects hangs or crashes
-   (stuck loops, invalid opcodes, exceptions, a failing DOS call in the log),
-   and diagnoses them.
-3. **More extender knowledge:** read LE/LX object tables to name code and
-   data objects; test other extenders (PMODE/W, DOS32A, CauseWay).
-4. **Speed:** let the dynamic recompiler run while no breakpoints,
-   watchpoints or stepping are active. Only needed for targets faster than a
-   Pentium MMX 200.
-5. Offer the emulator fixes upstream (86Box/86Box) as separate pull requests.
+1. **Report the FastDoom bug upstream** with the patch (needs the user's go-ahead).
+2. **AI exercise on the unpatched FastDoom**: a real, multi-layer bug (game,
+   DOS extender, DOS kernel) with known answers.
+3. **More real games and extenders:** the FastDoom repository also ships
+   DOS/32A; other open-source DOS games build with Open Watcom.
+4. **Read LE/LX object tables** to name code and data objects automatically,
+   and load linker maps as symbols in the bridge (the FastDoom hunt needed
+   object bases from `wait_for_program_start` plus the map by hand).
+5. **Speed:** let the dynamic recompiler run while no breakpoints,
+   watchpoints or stepping are active.
+6. Offer the emulator changes upstream (86Box/86Box).

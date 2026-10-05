@@ -103,7 +103,7 @@ two minutes of emulated time; the game then plays its demos. The build
 keeps the linker map (`out/fastdoom-build/FDOOM.MAP`); under DOS/4GW the
 code object was loaded at linear 174000h and the data object at 1FF000h.
 
-By default the build applies `fastdoom-ns_task-stack.patch`, which fixes a
+By default the build applies `fastdoom-ns_task-stack.diff`, which fixes a
 FastDoom bug found with this debugger (DEVLOG.md, section 13): its timer
 interrupt handler corrupts DOS memory, and the game hangs during startup.
 `FASTDOOM_PATCH=0 ./build_fastdoom.sh` builds it unpatched, for the
