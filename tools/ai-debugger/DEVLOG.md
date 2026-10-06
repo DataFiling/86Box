@@ -682,6 +682,58 @@ Logpoints, symbols and `find_references` work under CauseWay's paging. The
 smoke test passes on all four machines (from a DOS prompt; under CauseWay
 the BIOS timer handler it breakpoints doesn't run).
 
+### 19. EMM386 (JemmEx), V86 mode and VCPI
+
+Most 386+ DOS setups loaded EMM386, which runs DOS in V86 mode under a
+32-bit monitor and makes DOS extenders switch to protected mode through VCPI.
+
+**Setup:** I built JemmEx (JEMM386 with its own XMS driver) from source,
+using JWasm, with Open Watcom's `wlink` standing in for JWlink. JWasm had to
+be rebuilt with `_FORTIFY_SOURCE` off: its listing writer overflows a 3-byte
+field, which fortified glibc aborts on. `testdata/build_emm_floppy.sh` makes
+the floppy. A fifth VM (Pentium MMX, port 12349) boots it. `get_state`
+reports V86 mode (paging on, CPL 3), and the smoke test passes there.
+
+**What broke:** program-start detection. Under a V86 monitor, every
+interrupt or I/O trap from V86 code runs the monitor's 32-bit code, so "the
+first 32-bit instruction" was always JEMM's. The block-range catch fired
+there too. Under VCPI each side has its own page tables, so PMODE/W's DPMI
+block at 111008h overlapped the numbers of JEMM's code at 11472Eh. And
+JEMM's VCPI server (DExxh functions) runs in the client's address space,
+under the client's own selector 28h.
+
+**Fix:**
+
+- **Stub:** the 32-bit catch can skip a code segment by selector and base
+  (`skipb`), or a linear range of one address space (`skipr LO HI CR3`).
+  The block ranges honour the skips too.
+- **Bridge:** `wait_for_program_start` reads the monitor's IDT before the
+  program starts. Any protected-mode IDT installed then belongs to the V86
+  monitor. From it, the bridge skips the handlers' code segments and their
+  linear range in the monitor's address space.
+- **Acceptance:** with a monitor present, a stop counts as the entry only
+  with Open Watcom's startup signature; anything else (like the VCPI server
+  under the client's selector) is skipped by selector and base.
+
+Results under JemmEx, all graded against the maps:
+
+| Program | Entry | Map check (calls on functions) |
+|---|---|---|
+| test game, DOS/4GW | 43D5C8h | 24/34 |
+| test game, DOS/32A | 1115D8h | 24/34 |
+| test game, PMODE/W | 265C8h | 24/34 |
+| test game, CauseWay | 4355C8h | 24/34 |
+| FastDoom, DOS/4GW (VCPI) | 4D2170h | 617/625 |
+
+Also checked under JemmEx:
+- FastDoom plays.
+- `log_hits` named its callers.
+- A write watchpoint on the player's health stopped in
+  `P_TouchSpecialThing_` (a health pickup), through the extender's paging.
+
+Without EMM386 every entry is unchanged. The smoke test passes on all five
+machines.
+
 ## Test results
 
 Test machines, built with `-DQT=OFF -DSDL2=ON -DGDBSTUB=ON` and run headless
@@ -713,8 +765,6 @@ this environment), and V86 mode under EMM386.
 
 - Breakpoints and watchpoints are on linear addresses, resolved when set; one
   set through a selector whose base later changes stays at the old address.
-- V86 mode is handled through the same descriptor caches but hasn't been
-  tested under EMM386 yet.
 - Watchpoints stop after the accessing instruction; on 8-bit-bus CPUs a word
   access reports its second byte's address.
 - Pausing from 86Box's own UI stops request servicing (tools time out).
@@ -727,8 +777,7 @@ this environment), and V86 mode under EMM386.
 1. **Report the FastDoom bug upstream**: `testdata/fastdoom-bug-report.md` is
    ready to paste (this environment can't post to that repository).
 2. More AI exercises on real software, e.g. a bug hunt without a map.
-3. **EMM386/JEMM386** (V86 mode, VCPI) is untested; other open-source DOS
-   games build with Open Watcom.
+3. **More real games:** other open-source DOS games build with Open Watcom.
 4. **Read LE/LX object tables** from the program file to place objects
    without a program-start stop.
 5. **Speed:** let the dynamic recompiler run while no breakpoints,

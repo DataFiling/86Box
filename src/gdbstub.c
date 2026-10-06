@@ -480,7 +480,11 @@ static uint32_t             xrange_lo[8], xrange_hi[8];
 static int                  xrange_count;
 static int                  xrange_pm32; /* also stop at the first 32-bit protected-mode instruction */
 static uint16_t             xrange_pm32_skip[16]; /* ...except in these code selectors (an extender's own) */
+static uint32_t             xrange_pm32_skip_base[16]; /* ...with this base (if xrange_pm32_skip_hasbase) */
+static uint8_t              xrange_pm32_skip_hasbase[16];
 static int                  xrange_pm32_skips;
+static uint32_t             xrange_pm32_skip_lo[4], xrange_pm32_skip_hi[4], xrange_pm32_skip_cr3[4]; /* ...and outside these linear ranges of this address space */
+static int                  xrange_pm32_skip_ranges;
 static uint32_t             xrange_hit;
 
 /* Watchpoints only fire for accesses made in this CPU mode ("wf"). */
@@ -1692,16 +1696,30 @@ e00:
                        and with "pm32", at the first instruction of 32-bit protected-mode code (a DOS
                        extender's program entry); no arguments clears them. All are dropped when one hits. */
                     uint32_t lo[8], hi[8], sel;
-                    int      pm32 = 0, skips = 0;
+                    int      pm32 = 0, skips = 0, ranges = 0;
                     for (l = 0; (p = strtok_r(NULL, " ", &strtok_save));) {
                         if (!strcmp(p, "pm32")) {
                             pm32 = 1;
                             continue;
                         }
-                        if (!strcmp(p, "skip")) { /* "skip SEL": not in this code selector */
+                        if (!strcmp(p, "skipr")) { /* "skipr LO HI CR3": not in this linear range of this address space (a V86 monitor's code) */
+                            if ((ranges >= 4) || !(p = strtok_r(NULL, " ", &strtok_save)) || !gdbstub_parse_hex(p, &xrange_pm32_skip_lo[ranges]) ||
+                                !(p = strtok_r(NULL, " ", &strtok_save)) || !gdbstub_parse_hex(p, &xrange_pm32_skip_hi[ranges]) ||
+                                !(p = strtok_r(NULL, " ", &strtok_save)) || !gdbstub_parse_hex(p, &xrange_pm32_skip_cr3[ranges]))
+                                goto e22;
+                            ranges++;
+                            continue;
+                        }
+                        if (!strcmp(p, "skip") || !strcmp(p, "skipb")) { /* "skip SEL" or "skipb SEL BASE": not in this code segment */
+                            uint32_t sbase = 0;
+                            int      hasbase = (p[4] == 'b');
                             if ((skips >= 16) || !(p = strtok_r(NULL, " ", &strtok_save)) || !gdbstub_parse_hex(p, &sel))
                                 goto e22;
-                            xrange_pm32_skip[skips++] = sel;
+                            if (hasbase && (!(p = strtok_r(NULL, " ", &strtok_save)) || !gdbstub_parse_hex(p, &sbase)))
+                                goto e22;
+                            xrange_pm32_skip[skips]           = sel;
+                            xrange_pm32_skip_base[skips]      = sbase;
+                            xrange_pm32_skip_hasbase[skips++] = hasbase;
                             continue;
                         }
                         if ((l >= 8) || !gdbstub_parse_hex(p, &lo[l]) || !(p = strtok_r(NULL, " ", &strtok_save)) || !gdbstub_parse_hex(p, &hi[l]))
@@ -1713,6 +1731,7 @@ e00:
                     xrange_count      = l;
                     xrange_pm32       = pm32;
                     xrange_pm32_skips = skips;
+                    xrange_pm32_skip_ranges = ranges;
                 } else if (!strcmp(p, "wf")) {
                     /* Set or show which CPU mode's accesses watchpoints catch. */
                     static const char *names[] = { "any", "pm", "rm" };
@@ -2693,10 +2712,14 @@ gdbstub_logpoint_hit(gdbstub_logpoint_t *lp)
 }
 
 static int
-gdbstub_pm32_skipped(uint16_t sel)
+gdbstub_pm32_skipped(uint16_t sel, uint32_t addr)
 {
+    for (int i = 0; i < xrange_pm32_skip_ranges; i++) {
+        if ((addr >= xrange_pm32_skip_lo[i]) && (addr < xrange_pm32_skip_hi[i]) && ((cr3 & ~0xfff) == (xrange_pm32_skip_cr3[i] & ~0xfff)))
+            return 1;
+    }
     for (int i = 0; i < xrange_pm32_skips; i++) {
-        if ((xrange_pm32_skip[i] & ~3) == (sel & ~3))
+        if (((xrange_pm32_skip[i] & ~3) == (sel & ~3)) && (!xrange_pm32_skip_hasbase[i] || (xrange_pm32_skip_base[i] == cs)))
             return 1;
     }
     return 0;
@@ -2715,7 +2738,7 @@ gdbstub_instruction(void)
             return 1;
         if (!stopped) {
             /* Execution entering a watched range. */
-            if (xrange_pm32 && (msw & 1) && !(cpu_state.eflags & VM_FLAG) && use32 && !gdbstub_pm32_skipped(CS)) {
+            if (xrange_pm32 && (msw & 1) && !(cpu_state.eflags & VM_FLAG) && use32 && !gdbstub_pm32_skipped(CS, addr)) {
                 gdbstub_log("GDB Stub: 32-bit protected-mode code entered at %08X\n", addr);
                 xrange_hit   = addr;
                 xrange_count = xrange_pm32 = 0;
@@ -2723,7 +2746,7 @@ gdbstub_instruction(void)
                 return 1;
             }
             for (int i = 0; i < xrange_count; i++) {
-                if ((addr >= xrange_lo[i]) && (addr < xrange_hi[i])) {
+                if ((addr >= xrange_lo[i]) && (addr < xrange_hi[i]) && !(xrange_pm32 && gdbstub_pm32_skipped(CS, addr))) {
                     gdbstub_log("GDB Stub: Execution entered range at %08X\n", addr);
                     xrange_hit   = addr;
                     xrange_count = xrange_pm32 = 0;

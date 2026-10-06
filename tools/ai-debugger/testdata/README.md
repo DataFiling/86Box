@@ -131,3 +131,13 @@ Where each extender put the release build:
 | DOS/32A 9.1.2 | 100010h | 165230h | packed DPMI blocks |
 | PMODE/W 1.33 | 101000h | 167000h | the test game's code went to conventional memory (31000h) |
 | CauseWay | 435000h | 49B000h | paging on, CPL 3; runs 32-bit code of its own before the program |
+
+## EMM386 (JemmEx)
+
+`build_emm_floppy.sh` makes `out/boot-emm.img`: the test floppy with
+[JemmEx](https://github.com/Baron-von-Riedesel/Jemm) loaded from
+FDCONFIG.SYS. DOS then runs in V86 mode, and DOS extenders enter protected
+mode through VCPI, as on most 386+ DOS setups of the time. Use it in place of
+`boot.img` (the Pentium test machine with it is `vms/pentium.cfg` with
+`fdd_01_fn = boot-emm.img`). All four extenders (DOS/4GW, DOS/32A, PMODE/W,
+CauseWay) and FastDoom were tested on it.

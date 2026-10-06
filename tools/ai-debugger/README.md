@@ -151,9 +151,10 @@ Example prompts:
   changes stays at the old place. DOS-extender support is generic: DPMI calls
   are logged and decoded, and `wait_for_program_start(protected_mode=true)`
   finds a program's 32-bit entry (tested with DOS/4GW, DOS/32A, PMODE/W and
-  CauseWay). With CauseWay, which runs 32-bit code of its own first, it
-  relies on Open Watcom's startup signature. It doesn't read the program's
-  LE/LX object table.
+  CauseWay), with or without an EMM386-style V86 monitor (tested with
+  JemmEx). With CauseWay or a V86 monitor, which run 32-bit code of their
+  own, it relies on Open Watcom's startup signature. It doesn't read the
+  program's LE/LX object table.
 - **No machine save states.** 86Box can't save and restore a running
   machine's device state, so the bridge can't either; `restore_memory` puts
   back memory from a snapshot (a variable, a patched routine), which is not

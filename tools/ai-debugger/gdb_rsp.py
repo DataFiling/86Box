@@ -517,7 +517,9 @@ class GdbClient:
     def set_exec_ranges(self, ranges, pm32=False, skip=()):
         """Stop when execution enters any [lo, hi) linear range (up to 8), and with
         pm32, at the first 32-bit protected-mode instruction outside the code
-        selectors in `skip` (up to 16); [] clears."""
+        segments in `skip` (up to 16: selectors, (selector, base) pairs, or
+        ("range", lo, hi, cr3) linear ranges of one address space, up to 4); [] clears."""
         self.monitor("xr" + "".join(" %x %x" % (lo, hi) for lo, hi in ranges) + (" pm32" if pm32 else "") +
-                     "".join(" skip %x" % sel for sel in skip))
+                     "".join((" skipr %x %x %x" % sk[1:] if sk[0] == "range" else " skipb %x %x" % sk)
+                             if isinstance(sk, tuple) else " skip %x" % sk for sk in skip))
 

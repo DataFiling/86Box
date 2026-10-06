@@ -1016,6 +1016,39 @@ def _current_program(regs, progs, mem=None, chain=None):
 _EXTENDER_FILES = {"DOS4GW.EXE", "DOS4G.EXE", "DOS32A.EXE", "PMODEW.EXE", "CWSTUB.EXE", "CW32.EXE"}
 
 
+def _v86_monitor_segments(c):
+    """Skips for an EMM386-style V86 monitor's code, from its IDT, if one is
+    running DOS: (selector, base) of its handlers' code segments and
+    ("range", lo, hi) around the handlers; [] otherwise."""
+    regs = _regs()
+    # Called before the program starts: protected mode on means a V86 monitor
+    # runs DOS (the CPU may be stopped inside the monitor rather than in V86).
+    if not regs["cr0"] & 1 or not regs.get("seg"):
+        return []
+    idt, gdt = regs["seg"]["idt"], regs["seg"]["gdt"]
+    try:
+        raw = c.read_memory(idt["base"], min(idt["limit"] + 1, 256 * 8))
+    except GdbError:
+        return []
+    gates = [(int.from_bytes(raw[i + 2:i + 4], "little") & ~3,
+              int.from_bytes(raw[i:i + 2], "little") | int.from_bytes(raw[i + 6:i + 8], "little") << 16)
+             for i in range(0, len(raw) - 7, 8) if raw[i + 5] & 0x80 and raw[i + 5] & 0x0F in (0xE, 0xF)]
+    out, bases, handlers = [], {}, []
+    for sel in sorted({g[0] for g in gates})[:8]:
+        if sel & 4 or not sel or sel + 8 > gdt["limit"] + 1:
+            continue
+        d = c.read_memory(gdt["base"] + sel, 8)
+        if len(d) == 8:
+            bases[sel] = d[2] | d[3] << 8 | d[4] << 16 | d[7] << 24
+            out.append((sel, bases[sel]))
+    handlers = [(bases[sel] + off) & 0xFFFFFFFF for sel, off in gates if sel in bases]
+    if handlers:
+        # Its code (also the VCPI server, which runs under the client's own
+        # selectors) lies around its interrupt handlers.
+        out.append(("range", min(handlers) & ~0xFFFF, (max(handlers) | 0xFFFF) + 1 + 0x10000, regs["cr3"]))
+    return out
+
+
 def _extender_code(c, regs):
     """Whether 32-bit code at CS:EIP looks like a DOS extender's own: CPL 3
     with paging on, as in CauseWay's kernel. (DOS/4GW, DOS/32A and PMODE/W
@@ -1402,6 +1435,9 @@ def wait_for_program_start(name: str = "", command: str = "", timeout_seconds: f
             return "\n".join(lines) + "\n\n" + _entry_report(stop)
 
         # Protected mode: find the extender opening the program, then DPMI blocks allocated after.
+        # With an EMM386-style V86 monitor loaded, every interrupt from V86 mode
+        # runs the monitor's 32-bit code: note its code segments now, from its IDT.
+        monitor = _v86_monitor_segments(c)
         if not {0x21, 0x31} <= set(traced):
             c.int_trace(sorted(set(traced) | {0x21, 0x31}))
         c.catch_int(0x21, 0x3D, None, "call")
@@ -1432,7 +1468,7 @@ def wait_for_program_start(name: str = "", command: str = "", timeout_seconds: f
         # allocated through DPMI after the open, whichever comes first.
         blocks, skipped = [], []
         try:
-            c.set_exec_ranges([], pm32=True)
+            c.set_exec_ranges([], pm32=True, skip=monitor)
             pm32 = True
         except GdbError:  # older 86Box build: DPMI blocks only
             pm32 = False
@@ -1444,7 +1480,7 @@ def wait_for_program_start(name: str = "", command: str = "", timeout_seconds: f
                         "DPMI blocks seen: %s%s" % (opened, timeout_seconds,
                                                     ", ".join("%08X+%X" % (a, b - a) for a, b in blocks) or "none",
                                                     "; 32-bit code passed over (the extender's own?): " +
-                                                    ", ".join("%04X:%08X" % x for x in skipped) if skipped else ""))
+                                                    ", ".join("%04X:%08X" % x[:2] for x in skipped) if skipped else ""))
             if stop.reason == "range":
                 regs = _regs()
                 in_block = any(lo <= regs["eip"] < hi for lo, hi in blocks)
@@ -1453,16 +1489,18 @@ def wait_for_program_start(name: str = "", command: str = "", timeout_seconds: f
                 # The first 32-bit code is the program's with DOS/4GW, DOS/32A and
                 # PMODE/W; CauseWay runs code of its own first. Watcom-built
                 # programs start with "jmp short; WATCOM", which settles it.
-                if watcom or ((in_block or not skipped) and not _extender_code(c, regs)):
+                # With a V86 monitor (EMM386) its code and its VCPI server run
+                # in 32-bit code too: there only the startup signature counts.
+                if watcom or (not monitor and (in_block or not skipped) and not _extender_code(c, regs)):
                     break
-                skipped.append((regs["cs"], dos.ip(regs) or 0))
-                if len(skipped) >= 16:
+                skipped.append((regs["cs"], dos.ip(regs) or 0, dos.seg_cache(regs, "cs")["base"]))
+                if len(skipped) + len([m for m in monitor if m[0] != "range"]) >= 16:
                     return ("%s: passed over 16 code selectors of 32-bit code without finding the program's entry "
                             "(no Watcom startup signature): %s.\n\n%s" % (
-                                opened, ", ".join("%04X:%08X" % x for x in skipped), _state_report(stop)))
+                                opened, ", ".join("%04X:%08X" % x[:2] for x in skipped), _state_report(stop)))
                 # From now on only the 32-bit catch: the extender runs code in
                 # blocks it allocated too.
-                c.set_exec_ranges([], pm32=True, skip=[sel for sel, _ in skipped])
+                c.set_exec_ranges([], pm32=True, skip=monitor + [(sel, base) for sel, _, base in skipped])
                 continue
             if stop.reason != "catch":
                 return other_stop(stop)
@@ -1474,7 +1512,7 @@ def wait_for_program_start(name: str = "", command: str = "", timeout_seconds: f
                 if size:
                     blocks = [blk for blk in blocks if blk[0] != lin] + [(lin, lin + size)]  # a resize replaces
                     c.set_exec_ranges([] if skipped else sorted(blocks, key=lambda b: b[0] - b[1])[:8], pm32=pm32,
-                                      skip=[sel for sel, _ in skipped])
+                                      skip=monitor + [(sel, base) for sel, _, base in skipped])
         regs = _regs()
         inside = [b for b in blocks if b[0] <= regs["eip"] < b[1]]
         memscan.save(_state_dir(), "last-start", {"kind": "protected", "path": opened, "entry": regs["eip"],
