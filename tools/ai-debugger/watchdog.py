@@ -41,7 +41,9 @@ def blocks_legitimately(c):
     if v == 0x2F:
         return c.r("ax") in (0x1680,)
     if v == 0x31:
-        return c.r("ax") in (0x0300, 0x0301, 0x0302)  # real-mode calls: their own nested calls are checked
+        # Real-mode calls: their own nested calls are checked. AX >= FF00h:
+        # extender vendor extensions (CauseWay runs the program in FF24h).
+        return c.r("ax") in (0x0300, 0x0301, 0x0302) or c.r("ax") >= 0xFF00
     return False
 
 

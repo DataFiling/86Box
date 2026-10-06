@@ -10,7 +10,9 @@ Three kinds of maps:
 """
 
 import bisect
+import collections
 import re
+import struct
 
 _SYM = re.compile(r"^([0-9a-fA-F]{4}):([0-9a-fA-F]{4}|[0-9a-fA-F]{8})([+s* ]*)\s+(\S.*?)\s*$")
 _SEG = re.compile(r"^(\S+)\s+(\S+)\s+(\S+)\s+([0-9a-fA-F]{4}):([0-9a-fA-F]{4,8})\s+([0-9a-fA-F]{8})\s*$")
@@ -249,3 +251,47 @@ def guess_object_bases(mapfile, entry_linear, blocks):
         bases[obj] = lo
         used.add(lo)
     return bases
+
+
+def absolute_operands(code):
+    """32-bit absolute addresses used by code: memory operands [disp32] (opcode
+    A0-A3, or a ModRM byte with mod=00 r/m=101) and push imm32 (68). These are
+    the addresses a DOS extender relocated, so they point into the program's
+    objects where they were loaded. -> Counter {address: uses}."""
+    found = collections.Counter()
+    for m in re.finditer(rb"[\xA0-\xA3\x68]", code):
+        i = m.start() + 1
+        if i + 4 <= len(code):
+            found[struct.unpack_from("<I", code, i)[0]] += 1
+    for m in re.finditer(rb"[\x01-\x3B\x80-\x8B\xC6\xC7\xD9\xDD\xF6\xF7\xFE\xFF][\x05\x0D\x15\x1D\x25\x2D\x35\x3D]", code):
+        i = m.start() + 2
+        if i + 4 <= len(code):
+            found[struct.unpack_from("<I", code, i)[0]] += 1
+    return found
+
+
+def infer_object_base(mapfile, obj, code, sample=60):
+    """Where object `obj` was loaded, from the absolute addresses in the code
+    (absolute_operands) that hit its symbols: the base at which most of the
+    most-used addresses land exactly on a symbol of that object.
+    -> (base, votes, sampled) or None."""
+    offsets = {off for sg, off, _, _ in mapfile.symbols if sg == obj}
+    if not offsets:
+        return None
+    size = mapfile.object_sizes().get(obj, 0)
+    uses = absolute_operands(code)
+    top = [v for v, _ in uses.most_common(sample * 4) if v >= 0x1000][:sample]
+    votes = collections.Counter()
+    for v in top:
+        for off in offsets:
+            if off <= v:
+                votes[v - off] += 1
+    if not votes:
+        return None
+    # Score the strongest candidates against every address used.
+    best = None
+    for base, _ in votes.most_common(8):
+        score = sum(n for v, n in uses.items() if base <= v < base + max(size, 1) and (v - base) in offsets)
+        if best is None or score > best[1]:
+            best = (base, score)
+    return best[0], best[1], sum(uses[v] for v in top)

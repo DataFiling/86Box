@@ -1012,6 +1012,33 @@ def _current_program(regs, progs, mem=None, chain=None):
     return p, "most recently loaded (CS:IP is outside DOS program memory)"
 
 
+# DOS extenders' own files, which they open before the program they run.
+_EXTENDER_FILES = {"DOS4GW.EXE", "DOS4G.EXE", "DOS32A.EXE", "PMODEW.EXE", "CWSTUB.EXE", "CW32.EXE"}
+
+
+def _extender_code(c, regs):
+    """Whether 32-bit code at CS:EIP looks like a DOS extender's own: CPL 3
+    with paging on, as in CauseWay's kernel. (DOS/4GW, DOS/32A and PMODE/W
+    run the program at CPL 0 without paging.)"""
+    return (regs.get("cr0", 0) >> 31) & 1 == 1 and (regs["cs"] & 3) == 3
+
+
+def _stub_tsc(c):
+    try:
+        return c.int_status().get("tsc", 0)
+    except GdbError:
+        return 0
+
+
+def _last_start(c):
+    """The last program start this bridge saw, or {} if the machine has been
+    reset or restarted since (its time counter went backwards)."""
+    start = memscan.load(_state_dir(), "last-start") or {}
+    if start.get("tsc") and _stub_tsc(c) < start["tsc"]:
+        return {}
+    return start
+
+
 def _name_matches(want, path):
     if not want:
         return True
@@ -1300,10 +1327,12 @@ def wait_for_program_start(name: str = "", command: str = "", timeout_seconds: f
     empty if something else starts the program.
 
     protected_mode=true waits instead for a DOS-extender program's 32-bit code
-    (DOS/4GW and other DPMI-based extenders): it watches the extender open the
-    program file and allocate DPMI memory, and stops when execution first enters
-    that memory, at the program's 32-bit entry point. Use it after (or instead
-    of) the real-mode start, which for such programs is just the extender stub."""
+    (tested with DOS/4GW, DOS/32A, PMODE/W and CauseWay): after the program
+    file is opened, it stops at the first 32-bit protected-mode instruction or
+    when execution enters DPMI memory allocated after the open, passing over an
+    extender's own 32-bit code (CauseWay's) until Open Watcom's startup code.
+    That is the program's 32-bit entry point. Use it after (or instead of) the
+    real-mode start, which for such programs is just the extender stub."""
     c = client()
     saved = c.int_status()
     deadline = time.time() + max(1.0, timeout_seconds)
@@ -1364,7 +1393,7 @@ def wait_for_program_start(name: str = "", command: str = "", timeout_seconds: f
             lines = ["Program %s started: stopped at its first instruction." % path]
             if p:
                 memscan.save(_state_dir(), "last-start", {"kind": "real", "path": path, "psp": p.psp,
-                                                          "load": p.load_segment})
+                                                          "load": p.load_segment, "tsc": _stub_tsc(c)})
                 lines.append("PSP %04X; load segment %04X (PSP+10h; add it to segment values from the "
                              "program's linker map or EXE header). DS=ES=PSP at entry." % (p.psp, p.load_segment))
                 lines.append("Memory: " + ", ".join("%04X-%04X %s" % (b.start, b.end, b.kind) for b in p.blocks))
@@ -1386,27 +1415,55 @@ def wait_for_program_start(name: str = "", command: str = "", timeout_seconds: f
             if stop.reason != "catch":
                 return other_stop(stop)
             regs = _regs()
-            if dos.segmented(regs):
-                continue
-            reg = "ds:edx" if dos.code_bits(regs) == 32 else "ds:dx"
+            # Extenders open the program file from protected mode (DOS/4GW,
+            # DOS/32A) or from real mode before switching (PMODE/W).
+            reg = "ds:edx" if dos.code_bits(regs) == 32 and not dos.segmented(regs) else "ds:dx"
             if (regs["eax"] >> 8) & 0xFF == 0x6C:
                 reg = reg.replace("dx", "si")
             path = dosinfo.asciiz(c.read_memory(_resolve(reg, regs).linear, 80), 80)
-            if _name_matches(name, path) and (name or path.upper().endswith(".EXE")):
+            base = path.replace("/", "\\").rsplit("\\", 1)[-1].upper()
+            if _name_matches(name, path) and (name or (base.endswith(".EXE") and base not in _EXTENDER_FILES)):
                 opened = path
         c.clear_int_catches()
         c.catch_int(0x31, 0x05, 0x01, "ret")
         c.catch_int(0x31, 0x05, 0x03, "ret")
-        blocks = []
+        # The program's entry is its first 32-bit protected-mode instruction
+        # (the extenders' own kernels are 16-bit), or execution entering memory
+        # allocated through DPMI after the open, whichever comes first.
+        blocks, skipped = [], []
+        try:
+            c.set_exec_ranges([], pm32=True)
+            pm32 = True
+        except GdbError:  # older 86Box build: DPMI blocks only
+            pm32 = False
         while True:
             c.resume()
             stop = wait()
             if stop is None:
                 return ("%s was opened by the extender, but its code didn't start within %.0fs (CPU still running). "
-                        "DPMI blocks seen: %s" % (opened, timeout_seconds,
-                                                  ", ".join("%08X+%X" % (a, b - a) for a, b in blocks) or "none"))
+                        "DPMI blocks seen: %s%s" % (opened, timeout_seconds,
+                                                    ", ".join("%08X+%X" % (a, b - a) for a, b in blocks) or "none",
+                                                    "; 32-bit code passed over (the extender's own?): " +
+                                                    ", ".join("%04X:%08X" % x for x in skipped) if skipped else ""))
             if stop.reason == "range":
-                break
+                regs = _regs()
+                in_block = any(lo <= regs["eip"] < hi for lo, hi in blocks)
+                head = c.read_memory(regs["eip"], 8)
+                watcom = len(head) == 8 and head[0] == 0xEB and head[2:8] == b"WATCOM"
+                # The first 32-bit code is the program's with DOS/4GW, DOS/32A and
+                # PMODE/W; CauseWay runs code of its own first. Watcom-built
+                # programs start with "jmp short; WATCOM", which settles it.
+                if watcom or ((in_block or not skipped) and not _extender_code(c, regs)):
+                    break
+                skipped.append((regs["cs"], dos.ip(regs) or 0))
+                if len(skipped) >= 16:
+                    return ("%s: passed over 16 code selectors of 32-bit code without finding the program's entry "
+                            "(no Watcom startup signature): %s.\n\n%s" % (
+                                opened, ", ".join("%04X:%08X" % x for x in skipped), _state_report(stop)))
+                # From now on only the 32-bit catch: the extender runs code in
+                # blocks it allocated too.
+                c.set_exec_ranges([], pm32=True, skip=[sel for sel, _ in skipped])
+                continue
             if stop.reason != "catch":
                 return other_stop(stop)
             recs = dosinfo.parse_log(c.int_log(stop.int_seq, 1)) if stop.int_seq else []
@@ -1415,17 +1472,19 @@ def wait_for_program_start(name: str = "", command: str = "", timeout_seconds: f
                 size = (r.r("bx") << 16) | r.r("cx")
                 lin = (r.r("bx", True) << 16) | r.r("cx", True)
                 if size:
-                    blocks.append((lin, lin + size))
-                    c.set_exec_ranges(sorted(blocks, key=lambda b: b[0] - b[1])[:8])
+                    blocks = [blk for blk in blocks if blk[0] != lin] + [(lin, lin + size)]  # a resize replaces
+                    c.set_exec_ranges([] if skipped else sorted(blocks, key=lambda b: b[0] - b[1])[:8], pm32=pm32,
+                                      skip=[sel for sel, _ in skipped])
         regs = _regs()
         inside = [b for b in blocks if b[0] <= regs["eip"] < b[1]]
         memscan.save(_state_dir(), "last-start", {"kind": "protected", "path": opened, "entry": regs["eip"],
-                                                  "blocks": blocks})
+                                                  "blocks": blocks, "tsc": _stub_tsc(c)})
         lines = ["32-bit code of %s started: stopped at its first instruction (linear %08X)." % (opened, regs["eip"]),
                  "DPMI memory allocated after the extender opened it: " +
-                 ", ".join("%08X-%08X%s" % (a, b, " (code entered here)" if (a, b) in inside else "") for a, b in blocks),
-                 "In the flat model of DOS/4GW, DOS/32A and similar extenders, linear = offset (segment bases 0); the program's objects "
-                 "(code, data) are in these blocks."]
+                 (", ".join("%08X-%08X%s" % (a, b, " (code entered here)" if (a, b) in inside else "") for a, b in blocks)
+                  or "none") + ("" if inside else " (the code runs outside them: the extender placed it itself)"),
+                 "With flat-model extenders (DOS/4GW, DOS/32A, PMODE/W, CauseWay) linear = offset (segment bases 0); "
+                 "load_symbols places the program's objects (code, data) from here."]
         return "\n".join(lines) + "\n\n" + _entry_report(stop)
     finally:
         try:
@@ -1818,11 +1877,12 @@ def load_symbols(map_path: str, bases: str = "auto") -> str:
         dos.namer = None
         return "Symbols unloaded."
     m = symbols.MapFile(map_path)
+    other_program = None
     if bases.strip().lower() not in ("", "auto"):
         b = _parse_bases(bases)
         how = "as given"
     else:
-        start = memscan.load(d, "last-start") or {}
+        start = _last_start(client())
         image = os.path.splitext(os.path.basename(m.image or map_path))[0].upper()
         started = os.path.splitext(start.get("path", "").replace("/", "\\").rsplit("\\", 1)[-1])[0].upper()
         if m.wide:
@@ -1831,8 +1891,24 @@ def load_symbols(map_path: str, bases: str = "auto") -> str:
                         "protected_mode=true) first, or give bases like \"1=174000,2=1FF000\".")
             b = symbols.guess_object_bases(m, start["entry"], start["blocks"])
             how = "from the entry point and DPMI blocks of %s" % start["path"]
+            # The other objects (data): where the code's absolute addresses
+            # say they are, which beats matching block sizes (some extenders
+            # put headers in front of an object, or place objects themselves).
+            eobj = m.entry[0]
+            esize = m.object_sizes().get(eobj, 0)
+            if esize:
+                code = _region_bytes(b[eobj], b[eobj] + min(esize, 0x400000))
+                for obj in sorted(m.object_sizes()):
+                    if obj in (eobj, 0):
+                        continue
+                    found = symbols.infer_object_base(m, obj, code)
+                    if found and found[1] >= max(10, found[2] * 0.3):
+                        if b.get(obj) != found[0]:
+                            how += "; object %d placed by the code's references to it (%d agree)" % (obj, found[1])
+                        b[obj] = found[0]
             if image and started and image != started:
                 how += " (NOTE: the map is for %s)" % image
+                other_program = (image, started)
             missing = sorted(set(m.object_sizes()) - set(b))
             if missing:
                 how += "; no block found for object(s) %s" % ", ".join(map(str, missing))
@@ -1859,6 +1935,10 @@ def load_symbols(map_path: str, bases: str = "auto") -> str:
                     table.describe_bases(), hits, total)) + (
                     "\nThe symbols loaded before (%s) are still in use; map_path=\"none\" unloads them."
                     % _symcache["table"].map.path if _symbols() is not None else "")
+    if other_program and total < 20:
+        return ("NOT loaded: the map is for %s but the last program started was %s, and there were too few "
+                "calls in memory to check that it fits. Start the right program with wait_for_program_start, "
+                "or give bases." % other_program)
     fit = ("; %d of %d call targets in memory are functions in the map" % (hits, total) if total >= 20
            else "; could not check it against the code in memory (too few calls found)")
     memscan.save(d, "symbols", {"path": os.path.abspath(map_path), "bases": b})
@@ -1937,7 +2017,7 @@ def what_is(address: str) -> str:
         else:
             if chain and lin < chain[0].mcb * 16:
                 out.append("DOS memory: below the first memory block (DOS kernel data, buffers, device drivers)")
-    start = memscan.load(_state_dir(), "last-start") or {}
+    start = _last_start(client())
     for i, (lo, hi) in enumerate(start.get("blocks", [])):
         if lo <= lin < hi:
             out.append("DPMI block #%d %08X-%08X allocated after %s was opened, offset %X" % (
@@ -1971,7 +2051,7 @@ def _linear_code_bits(regs, linear):
     blocks or loaded symbols) if it is in there; 32 above the real-mode 1 MiB
     (+HMA) while the CPU happens to be in real or V86 mode (the program was
     interrupted by DOS or the extender's real-mode code); else the current size."""
-    start = memscan.load(_state_dir(), "last-start") or {}
+    start = _last_start(client())
     if any(lo <= linear < hi for lo, hi in start.get("blocks", [])):
         return 32
     table = _symcache["table"] if dos.namer else None
@@ -1986,7 +2066,7 @@ def _code_region(regs, linear):
     """(lo, hi, bits) of the code to analyse around `linear`: the extender's
     memory block holding it (from wait_for_program_start), the DOS program
     block, or the 64 KiB code segment in real mode; else 1 MiB around it."""
-    start = memscan.load(_state_dir(), "last-start") or {}
+    start = _last_start(client())
     for lo, hi in start.get("blocks", []):
         if lo <= linear < hi:
             return lo, hi, 32

@@ -7,8 +7,8 @@ patch memory, disassemble, see the screen in any video mode, and type and use
 the mouse, in real, V86 and protected mode (including 16-bit protected mode).
 It knows about DOS: the programs in memory, a log of the DOS, DPMI, BIOS and
 mouse calls a program makes (with file names and results), stopping at a
-program's first instruction (also the 32-bit entry of DOS/4GW and DOS/32A
-games), and
+program's first instruction (also the 32-bit entry of DOS/4GW, DOS/32A,
+PMODE/W and CauseWay games), and
 cheat-finder style searches for variables such as lives or score.
 
 ```
@@ -108,9 +108,9 @@ can also be imported directly from Python.
 | Area | Tools |
 |---|---|
 | Execution | `status`, `pause`, `resume`, `run_for`, `wait_for_stop`, `step`, `step_over`, `step_out`, `run_until`, `hard_reset` |
-| DOS programs | `dos_memory_map` (MCB chain, programs, which one is running), `wait_for_program_start` (stop at a program's first instruction; `protected_mode` for a DOS/4GW or DOS/32A program's 32-bit entry; `command` types the command that starts it) |
+| DOS programs | `dos_memory_map` (MCB chain, programs, which one is running), `wait_for_program_start` (stop at a program's first instruction; `protected_mode` for a DOS-extender program's 32-bit entry (DOS/4GW, DOS/32A, PMODE/W, CauseWay); `command` types the command that starts it) |
 | Interrupt calls | `log_interrupts` + `read_interrupt_log` (INT 21h DOS, 31h DPMI, 10h video, 33h mouse... with decoded arguments, file names, buffers and results), `catch_interrupt` (stop on a call or its return), `clear_interrupt_catches` |
-| Symbols | `load_symbols` (an Open Watcom linker map, placed automatically for 16-bit programs and DOS/4GW or DOS/32A objects, checked against the code in memory; `map_path=none` unloads), `lookup_symbol` (`module!name` for duplicated statics); names then work as addresses (`set_breakpoint address=main_`) and appear in disassembly, the CPU state, stacks, the INT log and watch_program |
+| Symbols | `load_symbols` (an Open Watcom linker map, placed automatically for 16-bit programs and for 32-bit extender programs (code from the entry point, data from the code's references to it), checked against the code in memory; `map_path=none` unloads), `lookup_symbol` (`module!name` for duplicated statics); names then work as addresses (`set_breakpoint address=main_`) and appear in disassembly, the CPU state, stacks, the INT log and watch_program |
 | Addresses | `what_is` (symbol, PC memory area, DOS block and owner, DPMI block, the function it is in) |
 | Code | `find_references` (instructions that use an address or call/jump to it), `log_hits` (the emulator records each time an address executes, without stopping: registers, a memory dword, callers, emulated time), `patch_code` (jmp/call/nop/ret, padded to whole instructions; `undo`) |
 | Unattended runs | `watch_program` (start a program, watch it, and report whether it exited, crashed, hung or waits for input, with evidence) |
@@ -150,9 +150,10 @@ Example prompts:
   (virtual ones when paging is on), so one set on a selector whose base later
   changes stays at the old place. DOS-extender support is generic: DPMI calls
   are logged and decoded, and `wait_for_program_start(protected_mode=true)`
-  finds the 32-bit entry of extenders that allocate the program's memory
-  through DPMI (tested with DOS/4GW and DOS/32A). It doesn't read the
-  program's LE/LX object table.
+  finds a program's 32-bit entry (tested with DOS/4GW, DOS/32A, PMODE/W and
+  CauseWay). With CauseWay, which runs 32-bit code of its own first, it
+  relies on Open Watcom's startup signature. It doesn't read the program's
+  LE/LX object table.
 - **No machine save states.** 86Box can't save and restore a running
   machine's device state, so the bridge can't either; `restore_memory` puts
   back memory from a snapshot (a variable, a patched routine), which is not

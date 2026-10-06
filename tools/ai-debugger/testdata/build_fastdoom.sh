@@ -8,9 +8,10 @@
 # FASTDOOM_PATCH=0 builds the unpatched game, which hangs during startup.
 # FASTDOOM_DEBUG=1 (default) builds with -debug (frame-based locals, as in
 # the bug); FASTDOOM_DEBUG=0 builds the release version.
-# FASTDOOM_EXTENDER=dos4gw (default) or dos32a: the DOS extender bound to the
-# game (DOS/32A comes with the FastDoom repository; bind_dos32a.py does what
-# its SB/SS tools would).
+# FASTDOOM_EXTENDER=dos4gw (default), dos32a, pmodew or causeway: the DOS
+# extender bound to the game. DOS/32A comes with the FastDoom repository
+# (bind_dos32a.py does what its SB/SS tools would); PMODE/W and CauseWay come
+# with Open Watcom, and the game is relinked with their stub.
 #
 # Needs: git and curl access to GitHub, Open Watcom v2 (WATCOM), nasm, mtools.
 
@@ -44,7 +45,13 @@ case "$FASTDOOM_EXTENDER" in
 dos4gw) cp fastdoom/FDOOM.EXE . ;;
 dos32a) python3 "$HERE/bind_dos32a.py" fastdoom/FDOOM.EXE fastdoom/dos32a/BINW/DOS32A.EXE \
             fastdoom/DOS32A.D32 FDOOM.EXE ;;
-*) echo "FASTDOOM_EXTENDER is dos4gw or dos32a"; exit 1 ;;
+pmodew|causeway)
+    stub=$([ "$FASTDOOM_EXTENDER" = pmodew ] && echo pmodew.exe || echo cwstub.exe)
+    (cd fastdoom/FASTDOOM &&
+        sed -e "s/option stub=wstub/option stub=$stub/" -e "s/^name fdoom/name fdext/" fdoom.lnk > fdext.lnk &&
+        PATH="$WATCOM/binw:$PATH" wlink @fdext.lnk > fdext.log 2>&1) || { tail -5 fastdoom/FASTDOOM/fdext.log; exit 1; }
+    cp fastdoom/FASTDOOM/fdext.exe FDOOM.EXE ;;
+*) echo "FASTDOOM_EXTENDER is dos4gw, dos32a, pmodew or causeway"; exit 1 ;;
 esac
 
 if [ ! -f freedoom1.wad ]; then

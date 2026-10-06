@@ -114,7 +114,7 @@ Other options:
 | Variable | Default | |
 |---|---|---|
 | `FASTDOOM_DEBUG` | `1` | `0` builds the release version (registers instead of stack locals; the bug above stays hidden) |
-| `FASTDOOM_EXTENDER` | `dos4gw` | `dos32a` binds the DOS/32A extender (shipped in the FastDoom repository) instead of using DOS4GW.EXE |
+| `FASTDOOM_EXTENDER` | `dos4gw` | `dos32a` binds DOS/32A (shipped in the FastDoom repository); `pmodew` and `causeway` relink the game with those extenders' stubs (shipped with Open Watcom) |
 
 For DOS/32A, `bind_dos32a.py` does what DOS/32A's `SB /R` and `SS` tools do
 in DOS (the output is byte-identical). DOS/32A places the objects tightly
@@ -122,3 +122,12 @@ instead of on page boundaries: the release build's code object was at
 linear 100010h and its data object at 165230h. The unpatched `-debug` build
 runs under DOS/32A, because its interrupt stack has base 0 (see
 `GROUND_TRUTH.md`).
+
+Where each extender put the release build:
+
+| Extender | Code object | Data object | Notes |
+|---|---|---|---|
+| DOS/4GW 1.97 | 171000h | 1D7000h | page-aligned DPMI blocks |
+| DOS/32A 9.1.2 | 100010h | 165230h | packed DPMI blocks |
+| PMODE/W 1.33 | 101000h | 167000h | the test game's code went to conventional memory (31000h) |
+| CauseWay | 435000h | 49B000h | paging on, CPL 3; runs 32-bit code of its own before the program |

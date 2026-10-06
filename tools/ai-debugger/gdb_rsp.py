@@ -514,7 +514,10 @@ class GdbClient:
     def clear_int_catches(self):
         self.monitor("cx")
 
-    def set_exec_ranges(self, ranges):
-        """Stop when execution enters any [lo, hi) linear range (up to 8); [] clears."""
-        self.monitor("xr" + "".join(" %x %x" % (lo, hi) for lo, hi in ranges))
+    def set_exec_ranges(self, ranges, pm32=False, skip=()):
+        """Stop when execution enters any [lo, hi) linear range (up to 8), and with
+        pm32, at the first 32-bit protected-mode instruction outside the code
+        selectors in `skip` (up to 16); [] clears."""
+        self.monitor("xr" + "".join(" %x %x" % (lo, hi) for lo, hi in ranges) + (" pm32" if pm32 else "") +
+                     "".join(" skip %x" % sel for sel in skip))
 

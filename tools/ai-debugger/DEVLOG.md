@@ -617,6 +617,71 @@ round:
 - **Memory reads at junk addresses:** `read_memory` masks addresses to 32
   bits and turns an unexpected reply into a GdbError, not a ValueError.
 
+### 18. PMODE/W and CauseWay
+
+Open Watcom ships two more extenders that games used: PMODE/W and CauseWay.
+I linked the 32-bit test game and the release FastDoom with each, and with
+DOS/32A for comparison. `build_fastdoom.sh` takes
+`FASTDOOM_EXTENDER=pmodew|causeway`. Both games load and play, and FastDoom
+ran its demos under each.
+
+Program-start detection was built around DOS/4GW and broke twice:
+
+- **PMODE/W** opens the program file from real mode, before switching to
+  protected mode. It loaded the test game's code into conventional memory
+  (31000h), outside any DPMI block. The detection waited for a
+  protected-mode open, so it never fired.
+- **CauseWay** runs 32-bit code of its own (CPL 3, paging on) under at least
+  five code selectors before the program.
+
+The new detection:
+
+- The stub has a one-shot catch for the first 32-bit protected-mode
+  instruction (`xr pm32`), optionally skipping given code selectors.
+- `wait_for_program_start(protected_mode=true)` accepts the program file
+  being opened in any mode. It then stops at the first 32-bit instruction,
+  or when execution enters DPMI memory allocated after the open.
+- If that code isn't the program, the bridge skips its selector and goes on.
+  The test is Open Watcom's startup code: a short jump over "WATCOM". Code
+  running at CPL 3 with paging on (CauseWay's kernel) is skipped unless it
+  has that signature.
+- Old 86Box builds without `pm32` fall back to DPMI blocks only.
+
+Results:
+
+| Extender | Test game entry | FastDoom entry | Map check (calls on functions) |
+|---|---|---|---|
+| DOS/4GW | 12D5C8h | (unchanged) | 24/34 |
+| DOS/32A | 1005D8h | 151180h | 24/34, 617/625 |
+| PMODE/W | 315C8h | 152170h | 24/34, 617/625 |
+| CauseWay | 4355C8h | 486170h | 24/34, 617/625 |
+
+**Placing the data object.** Matching block sizes put PMODE/W's data at the
+start of its block (100008h). The data is really at 101000h: PMODE/W puts
+something in front of it. `load_symbols` now places each non-entry object
+from the code itself. It collects the absolute addresses in the code
+(`[disp32]` operands, `push imm32`), which the extender has relocated, and
+finds the base at which most of them land on that object's symbols. On
+PMODE/W this found 101000h, with 169 of 210 sampled references agreeing.
+The game's "Score:" string at 101004h (CONST at offset 4) confirms it. It
+needs no DPMI blocks at all, so CauseWay is covered too.
+
+**Other fixes:**
+- **Stale program start:** a remembered start now carries the machine's time
+  counter, and is ignored after a reset or a VM restart (the counter goes
+  back).
+- **Wrong map:** `load_symbols` refuses automatic placement when the map's
+  program name differs from the started program's and the code check is
+  inconclusive.
+- **False hang:** DPMI vendor extensions (INT 31h AX >= FF00h; CauseWay runs
+  the program inside FF24h) no longer count as calls that should return at
+  once.
+- A resized DPMI block is no longer listed twice.
+
+Logpoints, symbols and `find_references` work under CauseWay's paging. The
+smoke test passes on all four machines (from a DOS prompt; under CauseWay
+the BIOS timer handler it breakpoints doesn't run).
+
 ## Test results
 
 Test machines, built with `-DQT=OFF -DSDL2=ON -DGDBSTUB=ON` and run headless
@@ -662,8 +727,8 @@ this environment), and V86 mode under EMM386.
 1. **Report the FastDoom bug upstream**: `testdata/fastdoom-bug-report.md` is
    ready to paste (this environment can't post to that repository).
 2. More AI exercises on real software, e.g. a bug hunt without a map.
-3. **More real games and extenders:** other open-source DOS games build with
-   Open Watcom; EMM386/JEMM386 (V86 mode, VCPI) is untested.
+3. **EMM386/JEMM386** (V86 mode, VCPI) is untested; other open-source DOS
+   games build with Open Watcom.
 4. **Read LE/LX object tables** from the program file to place objects
    without a program-start stop.
 5. **Speed:** let the dynamic recompiler run while no breakpoints,
