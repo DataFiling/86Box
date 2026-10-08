@@ -21,6 +21,7 @@ import dos
 import dosinfo
 import memscan
 import codeanalysis
+import libsigs
 import pcinput
 import symbols
 import watchdog
@@ -56,7 +57,9 @@ file names and results (e.g. a failing file open); catch_interrupt stops on a
 chosen call (e.g. INT 21h AH=3Dh opens, INT 10h AH=00h mode sets).
 With the program's linker map, load_symbols lets you use names as addresses
 and shows name+offset everywhere (after wait_for_program_start for automatic
-placement).
+placement). Without a map, identify_functions names the C runtime and other
+library functions (printf_, inp_, strtoul_...) from the compiler's libraries,
+and every other called function sub_ADDRESS.
 watch_program runs a program unattended and says whether it exited, crashed,
 hung (and inside which call) or waits for input: a good first step for "it
 hangs" or "it crashes" reports.
@@ -138,6 +141,9 @@ def _symbols():
     except Exception:
         return None
     info = memscan.load(d, "symbols")
+    if info and info.get("identified") and \
+            (memscan.load(d, "last-start") or {}).get("tsc") != info.get("start_tsc"):
+        info = None  # identified names belong to the program started then; another has started
     if not info:
         _symcache.update(key=None, table=None)
         return None
@@ -162,7 +168,16 @@ def _with_symbols(fn, *args, **kwargs):
         except OSError:
             pass
     dos.namer = (lambda lin, dist: table.name_at(lin, dist)) if table else None
+    dos.peek = _peek_bytes
     return fn(*args, **kwargs)
+
+
+def _peek_bytes(linear, length):
+    """Bytes at linear (RAM/ROM, without side effects), or None if any are unreadable."""
+    runs = client().peek(linear, length)
+    if not runs or any(b is None for _, b in runs):
+        return None
+    return b"".join(b for _, b in runs)
 
 
 def _sym(linear, dist=0x10000):
@@ -300,7 +315,7 @@ def wait_for_stop(timeout_seconds: float = 30.0) -> str:
             stops = None
         if stops is not None and mark.get("stops") is not None and stops > mark["stops"]:
             memscan.save(_state_dir(), "resume-mark", {"stops": stops})  # report it once
-            return "Stopped after the last resume, before this call:\n\n" + _state_report(c.last_stop)
+            return "Already stopped (it stopped after the last resume, before this wait):\n\n" + _state_report(c.last_stop)
         return ("No new stop: the CPU was already stopped (resume it first).\n\n" + _state_report())
     stop = c.wait_stop(timeout=timeout_seconds)
     if stop is None:
@@ -1639,7 +1654,8 @@ def wait_for_program_start(name: str = "", command: str = "", timeout_seconds: f
             lines = ["Program %s started: stopped at its first instruction." % path]
             if p:
                 memscan.save(_state_dir(), "last-start", {"kind": "real", "path": path, "psp": p.psp,
-                                                          "load": p.load_segment, "tsc": _stub_tsc(c)})
+                                                          "load": p.load_segment, "cs": regs["cs"],
+                                                          "tsc": _stub_tsc(c)})
                 lines.append("PSP %04X; load segment %04X (PSP+10h; add it to segment values from the "
                              "program's linker map or EXE header). DS=ES=PSP at entry." % (p.psp, p.load_segment))
                 lines.append("Memory: " + ", ".join("%04X-%04X %s" % (b.start, b.end, b.kind) for b in p.blocks))
@@ -2200,13 +2216,222 @@ def load_symbols(map_path: str, bases: str = "auto") -> str:
                                                       how, fit)
 
 
+def _watcom_libraries(spec, bits):
+    """Library/object files from "path;path" (files or directories), or Open
+    Watcom's DOS libraries ($WATCOM, else found from wcl386 on the PATH)."""
+    paths = []
+    parts = [p.strip() for p in re.split(r"[;\n]", spec) if p.strip()]
+    if parts and any(p.lower() == "watcom" for p in parts):
+        parts = [p for p in parts if p.lower() != "watcom"]
+        paths = _watcom_libraries("", bits)
+    for part in parts:
+        if os.path.isdir(part):
+            paths += [os.path.join(part, n) for n in sorted(os.listdir(part)) if n.lower().endswith((".lib", ".obj"))]
+        elif os.path.isfile(part):
+            paths.append(part)
+        else:
+            raise ValueError("no such library file or directory: %s" % part)
+    if spec.strip():
+        return paths
+    if not os.environ.get("WATCOM"):
+        import shutil
+        exe = shutil.which("wcl386") or shutil.which("wcl")
+        if exe:  # $WATCOM/binl64/wcl386 -> $WATCOM
+            os.environ["WATCOM"] = os.path.dirname(os.path.dirname(os.path.realpath(exe)))
+    return libsigs.default_libraries(bits)
+
+
+def _program_code(c, regs):
+    """[(lo, hi, frame)], bits, description: the code of the program started
+    last (32-bit: its extender block holding the entry point; 16-bit: its DOS
+    memory, one 64 KiB frame per code segment)."""
+    start = _last_start(c)
+    if start.get("kind") == "protected":
+        entry = start["entry"]
+        block = next(((a, b) for a, b in start["blocks"] if a <= entry < b), None)
+        if block is None and entry < 0xA0000:  # placed in DOS memory (PMODE/W): that DOS block
+            mem, chain, top, progs = _dos_state(c)
+            block = next(((b.start * 16, b.end * 16) for p in progs.values() for b in p.blocks
+                          if b.start * 16 <= entry < b.end * 16), None)
+        if block is None:
+            lo, hi, _ = _code_region(regs, entry)
+            block = (lo, hi)
+        return [(block[0], block[1], 0)], 32, "%s, 32-bit code in %08X-%08X" % (start["path"], block[0], block[1])
+    if start.get("kind") == "real":
+        load, cs, name = start["load"], start.get("cs", start["load"]), start["path"]
+        psp = start["psp"]
+    else:
+        mem, chain, top, progs = _dos_state(c)
+        p, _ = _current_program(regs, progs, mem, chain)
+        if p is None:
+            raise ValueError("no program to look at: start one with wait_for_program_start")
+        load, cs, name, psp = p.load_segment, p.load_segment, p.name or "the running program", p.psp
+    mem, chain, top, progs = _dos_state(c)
+    p = progs.get(psp)
+    end = max((b.end for b in p.blocks if b.kind != "environment"), default=load + 0x1000) if p else load + 0x1000
+    lo, hi = load * 16, min(end * 16, 0xA0000)
+    # Code segments: the entry point's, and those far calls go to (medium/large models).
+    data = _region_bytes(lo, hi)
+    counts = collections.Counter()
+    for m in re.finditer(b"\x9A", data):  # far calls: 9A offset segment
+        if m.start() + 5 <= len(data):
+            counts[struct.unpack_from("<H", data, m.start() + 3)[0]] += 1
+    # Segments called more than once (a lone match is likely other bytes).
+    segs = sorted({cs} | {sg for sg, n in counts.items() if n >= 2 and lo <= sg * 16 < hi})
+    frames = [(sg * 16, min(sg * 16 + 0x10000, hi), sg * 16) for sg in segs]
+    return frames, 16, "%s, 16-bit code segment(s) %s" % (name, ", ".join("%04X" % sg for sg in segs))
+
+
+def _write_identified_map(path, image, bits, frames, found, data_syms, blocks):
+    """A map file in Open Watcom's format with the identified names, which
+    load_symbols' machinery then reads like any map."""
+    lines = ["Executable Image: %s" % image, "", "|   Segments   |", "",
+             "Segment                Class          Group          Address         Size"]
+    if bits == 32:
+        for lo, hi, _ in frames:
+            lines.append("_TEXT                  CODE           AUTO           0001:%08x       %08x" % (lo, hi - lo))
+        for lo, hi in blocks:
+            lines.append("DATA                   DATA           AUTO           0001:%08x       %08x" % (lo, hi - lo))
+    else:
+        for lo, hi, frame in frames:
+            lines.append("_TEXT                  CODE           AUTO           %04x:0000       %08x" % (frame >> 4, hi - lo))
+    lines += ["", "|   Memory Map   |", "", "Module: identified"]
+    # Aliases first: of the names at one address, the last one is shown.
+    names = {a: [n] for a, n in data_syms.items()}
+    names.update((a, f.get("alts", [])[::-1] + [f["name"]]) for a, f in found.items())
+    for a in sorted(names):
+        for n in names[a]:
+            if bits == 32:
+                lines.append("0001:%08x  %s" % (a, n))
+            else:
+                frame = next((fr for lo, hi, fr in frames if lo <= a < hi), None)
+                if frame is not None:
+                    lines.append("%04x:%04x  %s" % (frame >> 4, a - frame, n))
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+@tool
+def identify_functions(libraries: str = "", max_listed: int = 80) -> str:
+    """Name library functions (the C runtime's printf_, inp_, outp_, strtoul_,
+    malloc_, and any other library's) in the program started last, without
+    its linker map: their code is matched against signatures read from OMF
+    libraries (bytes the linker fills in are ignored). Functions found also
+    name the functions they call, and in 32-bit programs the runtime's
+    variables they use (__psp, ___iob...). Every other called function is
+    named sub_ADDRESS. The names then work like a map's: as addresses, and in
+    disassembly, stacks and logs (load_symbols map_path=none removes them).
+
+    libraries: library or object files, or directories of them, separated by
+    ";"; the word watcom adds Open Watcom's DOS libraries, e.g.
+    "watcom;/sdk/awe32/pawe32.lib" for a game also linked with a sound SDK.
+    Default: Open Watcom's DOS libraries ($WATCOM, or found from wcl386 on
+    the PATH). Use the libraries of the compiler version that built the
+    program: another version's code differs, and fewer functions are found.
+    Run it after wait_for_program_start (protected_mode=true for 32-bit
+    programs)."""
+    c = client()
+    regs = _regs()
+    if _symbols() is not None and not memscan.load(_state_dir(), "symbols").get("identified"):
+        return ("A linker map is loaded (%s); its names are better than identified ones. "
+                "load_symbols map_path=none unloads it." % _symcache["table"].map.path)
+    try:
+        frames, bits, what = _program_code(c, regs)
+        paths = _watcom_libraries(libraries, bits)
+    except ValueError as e:
+        return str(e)
+    if not paths:
+        return ("No libraries to read: set WATCOM to Open Watcom's directory (or put wcl386 on the PATH), "
+                "or give libraries=\"path/to/clib3r.lib;...\".")
+    sigs = libsigs.load(paths, _state_dir())
+    if not sigs.by_bits[bits]:
+        return "No %d-bit functions in %s." % (bits, ", ".join(paths[:5]))
+    found, data_syms = {}, {}
+    called = set()
+    for lo, hi, frame in frames:
+        base = lo if bits == 32 else frame
+        data = _region_bytes(base, hi)
+        targets = codeanalysis.call_targets(data, base, bits, lo, hi)
+        f, d = libsigs.identify(data, base, bits, sigs, targets, frame)
+        # Memory holding more than the program's code (PMODE/W keeps the
+        # program file it loaded in the same DOS block): keep the code that
+        # the entry point's calls reach.
+        entry = _last_start(c).get("entry")
+        span = libsigs.reachable_span(data, base, bits, set(f) | set(targets), entry) \
+            if bits == 32 and entry is not None and lo <= entry < hi else None
+        inside = {x["name"] for a, x in f.items() if span and span[0] <= a < span[1]}
+        if span and any(x["name"] in inside for a, x in f.items() if not span[0] <= a < span[1]):
+            f = {a: x for a, x in f.items() if span[0] <= a < span[1]}
+            targets = {a: n for a, n in targets.items() if span[0] <= a < span[1]}
+            frames = [(span[0], span[1], frame) if (fl, fh) == (lo, hi) else (fl, fh, ff) for fl, fh, ff in frames]
+            what = "%s, 32-bit code in %08X-%08X (the code reached from the entry point in %08X-%08X)" % (
+                what.split(",")[0], span[0], span[1], lo, hi)
+        called |= set(targets)
+        found.update(f)
+        data_syms.update(d)
+    if not found:
+        return ("No library function found in %s with %d signatures from %d file(s). Is it built with "
+                "these libraries (another compiler or version)?" % (what, len(sigs), len(sigs.sources)))
+    # Names for the rest: called functions, and code right after an identified
+    # function (functions are laid out back to back).
+    sub = {}
+    for t in called:
+        if t not in found:
+            sub[t] = "sub_%08X" % t if bits == 32 else "sub_%05X" % t
+    starts = set(found) | set(sub)
+    for a, f in list(found.items()):
+        end = a + f["length"]
+        if f["sig"].get("code") and end not in starts and any(lo <= end < hi for lo, hi, _ in frames):
+            sub[end] = "sub_%08X" % end if bits == 32 else "sub_%05X" % end
+    names = {a: {"name": n} for a, n in sub.items()}
+    names.update(found)
+    blocks = []
+    if bits == 32:
+        blocks = [b for b in _last_start(c).get("blocks", []) if any(b[0] <= a < b[1] for a in data_syms)
+                  and not any(b[0] == lo for lo, _, _ in frames)]
+        data_syms = {a: n for a, n in data_syms.items() if any(lo <= a < hi for lo, hi in blocks)}
+    d = _state_dir()
+    path = os.path.join(d, "identified.map")
+    _write_identified_map(path, what.split(",")[0], bits, frames, names, data_syms, blocks)
+    memscan.save(d, "symbols", {"path": path, "bases": {1: 0} if bits == 32 else {"load": 0}, "identified": True,
+                                "start_tsc": (memscan.load(d, "last-start") or {}).get("tsc")})
+    _symcache["key"] = None
+    table = _symbols()
+    dos.namer = lambda lin, dist: table.name_at(lin, dist)
+    by_sig = sum(1 for f in found.values() if f["how"] == "signature" or f["how"].startswith("next to"))
+    lines = ["%s: %d library function(s) identified (%d by signature, %d through calls and addresses in them), "
+             "%d other function(s) named sub_ADDRESS%s. Signatures: %d from %d file(s)." % (
+                 what, len(found), by_sig, len(found) - by_sig, len(sub),
+                 ", %d runtime variable(s)" % len(data_syms) if data_syms else "", len(sigs), len(sigs.sources))]
+    lib_called = sorted(a for a in found if a in called)
+    lines.append("Called library functions (address, name, source module):")
+    for a in lib_called[:max_listed]:
+        f = found[a]
+        mod = f["sig"].get("module", "")
+        lines.append("  %08X  %s%s%s%s" % (a, f["name"], "  [%s]" % mod if mod else "",
+                                            "  (or %s)" % ", ".join(f["alts"][:3]) if f["alts"] else "",
+                                            "" if f["how"] == "signature" or f["how"].startswith("next to")
+                                            else "  (%s)" % f["how"]))
+    if len(lib_called) > max_listed:
+        lines.append("  ... %d more (lookup_symbol \"*\" lists all names)" % (len(lib_called) - max_listed))
+    others = len(found) - len(lib_called)
+    if others:
+        lines.append("%d more identified function(s) are only called indirectly or by the library itself." % others)
+    lines.append("The names last until another program starts (wait_for_program_start), hard_reset or "
+                 "load_symbols map_path=none; after this program exits its memory may hold other code.")
+    if data_syms:
+        lines.append("Runtime variables: " + ", ".join("%s=%08X" % (n, a) for a, n in sorted(data_syms.items())[:12]) +
+                     (" ..." if len(data_syms) > 12 else ""))
+    return "\n".join(lines)
+
+
 @tool
 def lookup_symbol(query: str, limit: int = 30) -> str:
     """Find symbols: a name ("HeadTask", "_HeadTask+8"), a pattern with * ("TS_*",
     "*score*"), or an address (shows the symbol it falls in)."""
     table = _symbols()
     if table is None:
-        return "No symbols loaded; use load_symbols."
+        return "No symbols loaded; use load_symbols (a linker map) or identify_functions (library functions, no map needed)."
     q = query.strip()
     if "*" in q or "?" in q:
         rx = re.compile("^" + re.escape(q).replace(r"\*", ".*").replace(r"\?", ".") + "$", re.I)

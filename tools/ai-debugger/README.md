@@ -58,7 +58,9 @@ Claude Desktop (`~/.config/Claude/claude_desktop_config.json` on Linux):
 ```
 
 `BOX86_GDB_HOST` / `BOX86_GDB_PORT` select the emulator. The bridge connects
-on first use and reconnects if 86Box is restarted.
+on first use and reconnects if 86Box is restarted. `WATCOM` (Open Watcom's
+directory) lets `identify_functions` find the compiler's libraries; it is
+also found from `wcl386` on the `PATH` (`claude mcp add -e WATCOM=/opt/watcom ...`).
 
 ## 3. Check it works
 
@@ -110,7 +112,7 @@ can also be imported directly from Python.
 | Execution | `status`, `pause`, `resume`, `run_for`, `wait_for_stop`, `step`, `step_over`, `step_out`, `run_until`, `hard_reset` |
 | DOS programs | `dos_memory_map` (MCB chain, programs, which one is running), `wait_for_program_start` (stop at a program's first instruction; `protected_mode` for a DOS-extender program's 32-bit entry (DOS/4GW, DOS/32A, PMODE/W, CauseWay); `command` types the command that starts it) |
 | Interrupt calls | `log_interrupts` + `read_interrupt_log` (INT 21h DOS, 31h DPMI, 10h video, 33h mouse... with decoded arguments, file names, buffers and results), `catch_interrupt` (stop on a call or its return), `clear_interrupt_catches` |
-| Symbols | `load_symbols` (an Open Watcom linker map, placed automatically for 16-bit programs and for 32-bit extender programs (code from the entry point, data from the code's references to it), checked against the code in memory; `map_path=none` unloads), `lookup_symbol` (`module!name` for duplicated statics); names then work as addresses (`set_breakpoint address=main_`) and appear in disassembly, the CPU state, stacks, the INT log and watch_program |
+| Symbols | `load_symbols` (an Open Watcom linker map, placed automatically for 16-bit programs and for 32-bit extender programs (code from the entry point, data from the code's references to it), checked against the code in memory; `map_path=none` unloads), `lookup_symbol` (`module!name` for duplicated statics), `identify_functions` (no map: names the C runtime and other library functions from the compiler's OMF libraries, the runtime's variables, and every other called function `sub_ADDRESS`); names then work as addresses (`set_breakpoint address=main_`) and appear in disassembly, the CPU state, stacks, the INT log and watch_program |
 | Addresses | `what_is` (symbol, PC memory area, DOS block and owner, DPMI block, the function it is in) |
 | Code | `find_references` (instructions that use an address or call/jump to it; in 16-bit code also `[ofs]` operands and `mov ax,ofs`-style pointers), `log_hits` (the emulator records each time an address executes, without stopping: registers, a memory dword, callers, emulated time, a summary of the values; for an interrupt handler, the program addresses each interrupt came in at; stops when the program exits), `patch_code` (jmp/call/nop/ret, padded to whole instructions; `undo`) |
 | Unattended runs | `watch_program` (start a program, watch it, and report whether it exited, crashed, hung or waits for input, with evidence) |
@@ -155,6 +157,13 @@ Example prompts:
   JemmEx). With CauseWay or a V86 monitor, which run 32-bit code of their
   own, it relies on Open Watcom's startup signature. It doesn't read the
   program's LE/LX object table.
+- **`identify_functions` needs the right libraries.** It matches code byte
+  for byte (apart from linker fixups), so it names functions from the
+  library version that built the program; another compiler or version gives
+  few or no names. It reads OMF libraries (Open Watcom, and the Phar Lap
+  Easy OMF-386 format of some sound SDKs). Functions only called through
+  pointers, and very short ones, are named only when a found function's
+  call, or their position next to one of the same module, places them.
 - **No machine save states.** 86Box can't save and restore a running
   machine's device state, so the bridge can't either; `restore_memory` puts
   back memory from a snapshot (a variable, a patched routine), which is not

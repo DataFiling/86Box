@@ -802,7 +802,7 @@ Not done:
 - Naming C runtime routines (inp/outp/strtoul) without a map.
 
 All four agents asked for one or more of these; they are the next
-candidates. The first two are done in section 21.
+candidates. The first two are done in section 21, the third in section 22.
 
 ### 21. Conditional breakpoints and what an interrupt interrupted
 
@@ -876,6 +876,132 @@ Bugs found while testing:
 - `monitor help` was missing `bc`, `lp`/`ll` and the `xr` options; it now
   lists them.
 
+### 22. Naming library functions without a map
+
+Round 3's agents asked for C runtime names (`inp_`, `outp_`, `strtoul_`)
+in programs without a map. `identify_functions` names them from the
+compiler's own libraries, much as IDA's FLIRT does.
+
+**Signatures** (`libsigs.py`). It reads OMF libraries and object files:
+LNAMES, SEGDEF, EXTDEF/LEXTDEF/CEXTDEF/COMDEF, PUBDEF and LPUBDEF (statics
+too), LEDATA and FIXUPP. Each public or static symbol in a code segment
+becomes a function: its bytes up to the next symbol, with the bytes the
+linker fills in masked. Its fixups record what it calls and which variables
+it uses, by name. Open Watcom's `lib286`/`lib386` DOS libraries give about
+8,500 32-bit and 16,500 16-bit signatures in 3 s. They are cached in the
+state directory, so later runs take a fraction of a second.
+
+**Matching** (`libsigs.identify`):
+
+1. Signatures whose first 6 bytes are known are looked up at every byte of
+   the code. Signatures with 6 or more known bytes are tried at call
+   targets only.
+2. Where matches overlap, the one with the most known bytes wins. That
+   drops short signatures matching inside longer functions, and tables
+   (all zeros, repeated bytes) are never matched.
+3. Weak matches (fewer than 16 known bytes) must come from a library that
+   confident matches came from: this dropped the C++ library's string
+   operators matching game code in FastDoom. Where they call something
+   that has a signature, the code at the call target must match it: this
+   dropped `_lfntosfn_` at a GUS driver routine.
+4. Functions with the same bytes but different calls (`printf_`,
+   `printf_s_`, `wprintf_s_`) are told apart by whether their calls and
+   variable addresses land on what was found under those names. A remaining
+   tie goes to the library the unambiguous matches came from (the
+   register- rather than the stack-convention C library).
+5. A found function's fixups name what it calls, even when the code there
+   isn't the library's. `__CMain` names `main_`. In 32-bit code they also
+   name the runtime's variables (`__psp`, `___iob`, `_errno`).
+6. A module's functions stay in order, so short functions right before or
+   after a found one from the same module are matched there.
+7. Thin wrappers (`jmp __close_`) are named where every call they make
+   goes to the function of that name.
+
+Aliases (`malloc_`/`_nmalloc_`) are all written to the generated map, with
+the plainest name shown. Every other called function is `sub_ADDRESS`.
+
+**Bridge.** The names are written as a map in Open Watcom's format
+(`identified.map` in the state directory) and loaded by `load_symbols`'
+machinery, so breakpoints, disassembly, stacks and logs use them as they
+would a map's. The code region is:
+
+- 32-bit: the DPMI block holding the entry point, or the DOS block when the
+  extender placed the code in conventional memory (PMODE/W).
+- 16-bit: the program's DOS memory, one 64 KiB frame for the entry's code
+  segment and one for each segment that far calls go to.
+
+`libraries=` takes files and directories; the word `watcom` adds the
+default libraries. Easy OMF-386 libraries (Phar Lap's format, used by the
+AWE32 SDK) are read too: 16-bit record types with 32-bit fields, and
+32-bit "offset" fixups.
+
+**Accuracy against the linker maps.** An address counts as right when a
+name there is the map's:
+
+| Program | Code | Right | Wrong | Map symbols left as sub_ |
+|---|---|---|---|---|
+| COINS (DOS/4GW) | 16 KB | 121 | 0 | 3 |
+| TOUR (DOS/32A) | 12 KB | 118 | 0 | 3 |
+| SBTEST (PMODE/W, in DOS memory) | 67 KB block | 138 | 1 (`_edata`, a linker label at `___env_mask`'s address) | 3: `___GETDSEnd_` (a label), `__get_errno_ptr_`, `__full_io_exit_` |
+| CAVES (16-bit, small model) | 9 KB | 67 | 0 | 6 |
+| FastDoom (DOS/4GW), Open Watcom libraries | 408 KB | 343 | 1 (`_edata` again) | clib3r: 271 of its 288 symbols named |
+| FastDoom with its AWE32 and GUS SDK libraries | 408 KB | 601 | 1 | clib3r 271/288, gf1_osf 136/136, pawe32 36/45 (the rest are code-range labels) |
+
+"Right" counts addresses. In COINS, CAVES and SBTEST (checked against
+the call targets in the code) every directly called function in the map
+got its real name; the misses are reached otherwise (exit and errno paths). The game's own functions get `sub_`
+names, and `main_` is named by `__CMain`'s call.
+Identification takes under 2 s on FastDoom. The misses are mostly linker
+labels (`___GETDSEnd_`, `___begtext`) and functions only called through
+pointers (`__clock_init_` from the init table).
+
+Before these steps, the first runs got the following wrong. Each fix is
+above:
+
+- `_GroupTable` matched every byte (a table).
+- C++ operators matched FastDoom code.
+- `printf_` showed `wprintf_s_` as an alternative.
+- `cstart` from the stack-convention library was used, which lost the
+  variable names.
+- `main_` wasn't named: a library's own `main_` didn't match the program's.
+- The AWE32 library was skipped: Easy OMF-386 wasn't read.
+- AWE32 functions mismatched: their 32-bit offsets were taken as 16-bit.
+
+**Blind exercise.** SBTEST under JemmEx again, without a map, now with
+`identify_functions`. The agent:
+
+- reproduced the bug with `watch_program`;
+- named `main_`, `getenv_`, `strtoul_`, `inp_`, `outp_` and `printf_`;
+- found `mov ebx,0xA` / `call strtoul_` in the `A` case of the BLASTER
+  parser;
+- confirmed EAX=0DCh after the call, and `outp_` to port 0E2h with
+  `log_hits`;
+- suggested base 16, or patching the byte at 26072 to 10h.
+
+It was correct, in about 10 minutes with 12 tool calls (round 3 without
+names: about 10 minutes, 17 calls). The agent's words: "the bug was obvious
+on first read of `main_` and its callees: the strtoul base register stands
+out once the call is named". It also noticed the default IRQ 7 doesn't match
+the card's IRQ 5, which is true and not the planted bug.
+
+What it found wrong, now fixed:
+
+- **Duplicate names.** PMODE/W keeps the program file it read in the same
+  DOS block as the relocated code, so heap functions were named twice: in
+  the file copy and in the code. When names repeat, only the code reached
+  from the entry point by direct calls and jumps is kept
+  (`libsigs.reachable_span`); here 26010-2990C of the block's
+  125B0-29930. This gave 136 right and 1 alias wrong.
+- **Stale names.** Names stayed after the program exited and DOS reused its
+  memory. Identified names now lapse when another program starts. The
+  output says how long they last.
+- **Strings.** Data references showed as `DATA+FFC`. Disassembly now shows
+  the string an address points to (`mov eax, 0x112004 ; DATA+FFC
+  "BLASTER"`), read without side effects.
+- **Wording.** `wait_for_stop`'s "Stopped after the last resume, before this
+  call" now reads "Already stopped (it stopped after the last resume,
+  before this wait)".
+
 ## Test results
 
 Test machines, built with `-DQT=OFF -DSDL2=ON -DGDBSTUB=ON` and run headless
@@ -916,14 +1042,12 @@ this environment), and V86 mode under EMM386.
 
 ## Next steps
 
-1. **Name C runtime routines without a map** (inp/outp/strtoul...), e.g.
-   from signatures of the Open Watcom libraries.
-2. **Report the FastDoom bug upstream**: `testdata/fastdoom-bug-report.md` is
+1. **Report the FastDoom bug upstream**: `testdata/fastdoom-bug-report.md` is
    ready to paste (this environment can't post to that repository).
-3. More AI exercises on real software, e.g. a bug hunt without a map.
-4. **More real games:** other open-source DOS games build with Open Watcom.
-5. **Read LE/LX object tables** from the program file to place objects
+2. More AI exercises on real software, e.g. a bug hunt without a map.
+3. **More real games:** other open-source DOS games build with Open Watcom.
+4. **Read LE/LX object tables** from the program file to place objects
    without a program-start stop.
-6. **Speed:** let the dynamic recompiler run while no breakpoints,
+5. **Speed:** let the dynamic recompiler run while no breakpoints,
    watchpoints or stepping are active.
-7. Offer the emulator changes upstream (86Box/86Box).
+6. Offer the emulator changes upstream (86Box/86Box).

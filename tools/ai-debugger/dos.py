@@ -353,6 +353,28 @@ def hexdump(data, linear, loc=None):
 # Optional symbol lookup set by the bridge when a linker map is loaded:
 # namer(linear, max_distance) -> "name" / "name+off" / None.
 namer = None
+# Set by the bridge: peek(linear, length) -> bytes or None, without side effects.
+peek = None
+
+
+def _string_at(linear):
+    """' "text"' when memory at linear holds a C string (4+ printable
+    characters, then a NUL or more text), else ''."""
+    if peek is None:
+        return ""
+    try:
+        data = peek(linear, 48)
+    except Exception:
+        return ""
+    if not data:
+        return ""
+    n = 0
+    while n < len(data) and (32 <= data[n] < 127 or data[n] in (9, 10, 13)):
+        n += 1
+    if n < 4 or (n < len(data) and data[n] != 0):
+        return ""
+    text = data[:n].decode("latin-1").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+    return ' "%s%s"' % (text[:40], "..." if n > 40 else "")
 _HEX = re.compile(r"0x[0-9a-f]+")
 _BRANCH = ("call", "lcall", "jmp", "ljmp", "loop") + tuple("j" + c for c in
                                                          ("a", "ae", "b", "be", "e", "ne", "g", "ge", "l", "le",
@@ -365,7 +387,7 @@ def _symbol_comment(mnemonic, op_str, seg_base, bits, data_base):
     segment: DS unless overridden; indirect call/jmp [x] included) and, in
     32-bit code, immediates that may be addresses. Stack-relative operands
     (BP/ESP/EBP based: locals and arguments) and far branches are skipped."""
-    if namer is None:
+    if namer is None and peek is None:
         return ""
     word = mnemonic.split()[-1]
     if word in ("lcall", "ljmp") or ("ptr [" not in op_str and "[" not in op_str and ":" in op_str and word in _BRANCH):
@@ -387,17 +409,18 @@ def _symbol_comment(mnemonic, op_str, seg_base, bits, data_base):
                 continue  # another segment: base unknown here
             if v < 0x10 and re.search(r"\b[a-z]{2,3}\b", inside):
                 continue  # small offset from a register: a struct field, not a global
-            n = namer((data_base + v) & 0xFFFFFFFF, 0x40)
+            n = namer((data_base + v) & 0xFFFFFFFF, 0x40) if namer else None
         elif branch:
             if v < 0x10:
                 continue
-            n = namer((seg_base + v) & 0xFFFFFFFF, 0x10000)
+            n = namer((seg_base + v) & 0xFFFFFFFF, 0x10000) if namer else None
         else:
             if bits == 16 or data_base is None or v < 0x1000:
                 continue  # 16-bit immediates are mostly numbers, not addresses
-            n = namer((data_base + v) & 0xFFFFFFFF, 0x40)
+            n = namer((data_base + v) & 0xFFFFFFFF, 0x40) if namer else None
+            n = (n or "") + _string_at((data_base + v) & 0xFFFFFFFF)  # a string's address
         if n:
-            names.append(n)
+            names.append(n.strip())
     return ("  ; " + ", ".join(names)) if names else ""
 
 

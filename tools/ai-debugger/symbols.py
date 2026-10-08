@@ -113,8 +113,10 @@ class SymbolTable:
                 self.code_addrs.append((lin, name))
         if not self.by_addr:
             raise ValueError("no symbol could be placed with bases %s" % self.bases)
-        self.by_addr.sort()
-        self.code_addrs.sort()
+        # By address only, keeping the map's order at one address: the last
+        # name there is the one shown.
+        self.by_addr.sort(key=lambda e: e[0])
+        self.code_addrs.sort(key=lambda e: e[0])
         self.addrs = [a for a, _ in self.by_addr]
         self.code_keys = [a for a, _ in self.code_addrs]
         # Exact names first, then case-insensitive ones that don't shadow any exact name.
