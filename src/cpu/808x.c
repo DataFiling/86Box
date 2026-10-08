@@ -1265,6 +1265,7 @@ check_interrupts(int nec_hlt)
             wait_cycs(1, 0);
             /* ACK to PIC */
             temp = pic_irq_ack();
+            gdbstub_irq(temp);
             wait_cycs(4, 1);
             wait_cycs(1, 0);
             in_lock    = 0;

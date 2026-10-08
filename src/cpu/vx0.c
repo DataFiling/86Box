@@ -1499,6 +1499,7 @@ check_interrupts(void)
             do_cycle();
             /* ACK to PIC */
             temp = bus_pic_ack();
+            gdbstub_irq(temp);
             in_lock    = 0;
             clear_lock = 0;
             /* Here is where temp should be filled, but we cheat. */

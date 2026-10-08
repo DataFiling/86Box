@@ -91,11 +91,28 @@ def client():
                     "-DGDBSTUB=ON; the port is set by gdbstub_port in 86box.cfg." % (host, port, e))
             _client = c
             _points.clear()
-            # Points can outlive a connection when the stub holds them (run_tool.py).
+            # Points can outlive a connection when the stub holds them (run_tool.py);
+            # what they were set as is kept in the state directory.
+            try:
+                with open(os.path.join(memscan.state_dir(host, port), "points.json")) as f:
+                    saved = json.load(f)
+            except (OSError, ValueError, RuntimeError):
+                saved = {}
             for kind, addr, length in c.list_points() or []:
+                info = saved.get("%d:%X" % (kind, addr), {})
                 _points[(kind, addr)] = {"kind": kind, "address": addr, "length": length,
-                                         "expr": "set by an earlier command"}
+                                         "expr": info.get("expr", "set by an earlier command"),
+                                         "condition": info.get("condition", "")}
         return _client
+
+
+def _save_points():
+    try:
+        with open(os.path.join(_state_dir(), "points.json"), "w") as f:
+            json.dump({"%d:%X" % key: {"expr": p["expr"], "condition": p.get("condition", "")}
+                       for key, p in _points.items()}, f)
+    except (OSError, RuntimeError):
+        pass
 
 
 def tool(fn):
@@ -642,28 +659,167 @@ def read_stack(entries: int = 16) -> str:
 
 # ---- breakpoints / watchpoints ----------------------------------------------
 
+_COND_REGS = ("eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp")  # the stub's order
+_COND_OPS = {"==": 0, "=": 0, "!=": 1, "<>": 1, "<": 2, ">": 3, "<=": 4, ">=": 5, "&": 6, "changed": 7}
+
+
+def _cond_value(text, regs):
+    """A condition's constant: hex like every number here, "#" for decimal,
+    "-" for negative, or a symbol/address."""
+    t = text.strip()
+    neg = t.startswith("-")
+    t = t[1:].strip() if neg else t
+    if t.startswith("#"):
+        v = int(t[1:])
+    else:
+        try:
+            v = dos.parse_number(t)
+        except ValueError:
+            v = _resolve(t, regs).linear
+    return (-v if neg else v) & 0xFFFFFFFF
+
+
+def _parse_condition(text, regs, watch=None):
+    """"[byte|word|dword] LHS OP VALUE" or "LHS changed" -> ((src, reg, arg, size,
+    op, value) for the stub's "bc", notes). LHS is a register, "[reg+disp]" with
+    an optional ds:/ss: prefix (EBP/ESP default to SS), or "[address]". For a
+    watchpoint (watch = (linear, length)) LHS may be left out: its own memory."""
+    t = " ".join(text.strip().lower().split())
+    size, notes = None, []
+    m = re.match(r"(byte|word|dword)\s+", t)
+    if m:
+        size = {"byte": 1, "word": 2, "dword": 4}[m.group(1)]
+        t = t[m.end():]
+    m = re.match(r"(.*?)\s*(==|!=|<>|<=|>=|=|<|>|&|\bchanged$)\s*(.*)$", t)
+    if not m:
+        raise ValueError("a condition is LHS OP VALUE (OP: == != < > <= >= &) or LHS changed, not %r" % text)
+    lhs, op, rhs = m.group(1).strip(), _COND_OPS[m.group(2)], m.group(3).strip()
+    if (op == 7) != (rhs == ""):
+        raise ValueError("%r needs a value after its operator" % text if rhs == "" else
+                         "\"changed\" takes no value (%r)" % text)
+    if lhs == "":
+        if watch is None:
+            raise ValueError("say what the condition tests, e.g. \"eax == 5\" or \"[esi+4] > 0\"")
+        src, reg, arg = 1, 0, watch[0]
+        size = size or (1 if watch[1] == 1 else 2 if watch[1] < 4 else 4)
+        if watch[1] > 4:
+            notes.append("the condition tests the first %d bytes of the watched memory" % size)
+    elif not lhs.startswith("["):
+        if lhs in _COND_REGS:
+            reg, rsize = _COND_REGS.index(lhs), 4
+        elif lhs in dos.REG16:
+            reg, rsize = _COND_REGS.index(dos.REG16[lhs]), 2
+        elif lhs in dos.REG8:
+            # the stub numbers AH BH CH DH 8-11
+            reg, rsize = _COND_REGS.index(dos.REG8[lhs][0]) + (8 if dos.REG8[lhs][1] else 0), 1
+        else:
+            raise ValueError("%r is not a register this can test (EAX-ESP and their 16/8-bit parts); "
+                             "memory goes in brackets: [address]" % lhs)
+        src, arg, size = 0, 0, size or rsize
+    else:
+        if not lhs.endswith("]"):
+            raise ValueError("unbalanced [ in %r" % lhs)
+        inner = lhs[1:-1].strip()
+        seg = None
+        if re.match(r"(ds|ss)\s*:", inner) and \
+                re.match(r"(ds|ss)\s*:\s*e?(ax|bx|cx|dx|si|di|bp|sp)\b", inner):
+            seg, inner = inner[:2], inner.split(":", 1)[1].strip()
+        if re.match(r"(cs|es|fs|gs)\s*:\s*e?(ax|bx|cx|dx|si|di|bp|sp)\b", inner):
+            raise ValueError("register operands can be DS- or SS-relative only, not %s" % inner[:2].upper())
+        rm = re.match(r"(e?(?:ax|bx|cx|dx|si|di|bp|sp))\b\s*(.*)$", inner)
+        if rm:
+            name = rm.group(1)
+            full = name if name in _COND_REGS else dos.REG16[name]
+            reg = _COND_REGS.index(full)
+            arg = dos.parse_term("0" + rm.group(2), None) & 0xFFFFFFFF if rm.group(2) else 0
+            seg = seg or ("ss" if full in ("ebp", "esp") else "ds")
+            src = 2 if seg == "ds" else 3
+            if name not in _COND_REGS and regs[full] >> 16:
+                notes.append("the base is all of %s (%08X now), not just %s" % (full.upper(), regs[full], name.upper()))
+        else:
+            src, reg, arg = 1, 0, _resolve(inner, regs).linear
+        size = size or (4 if dos.code_bits(regs) == 32 else 2)
+    value = 0 if op == 7 else _cond_value(rhs, regs)
+    return (src, reg, arg, size, op, value), notes
+
+
+def _apply_condition(c, kind, linear, condition, regs, watch=None):
+    """Set (or with "" remove) a point's condition; returns a note for the reply."""
+    if not condition.strip():
+        try:
+            c.set_condition(kind, linear, None)
+        except GdbError:
+            pass  # an older build without conditions
+        return ""
+    try:
+        cond, notes = _parse_condition(condition, regs, watch)
+    except ValueError:
+        c.clear_point(kind, linear, watch[1] if watch else 1)
+        raise
+    try:
+        c.set_condition(kind, linear, cond)
+    except GdbError as e:
+        c.clear_point(kind, linear, watch[1] if watch else 1)
+        raise GdbError("could not set the condition (%s); the point was removed" % e)
+    return " Stops only when %s.%s" % (condition.strip(), "".join(" Note: %s." % n for n in notes))
+
+
+def _set_point(c, kind, linear, length):
+    """Set a point; one of the same kind already at `linear` is replaced (to
+    change its length or condition)."""
+    old = _points.pop((kind, linear), None)
+    if old is not None:
+        try:
+            c.clear_point(kind, linear, old["length"])
+        except GdbError:
+            pass  # gone from the stub already
+    c.set_point(kind, linear, length)
+
+
 @tool
-def set_breakpoint(address: str) -> str:
+def set_breakpoint(address: str, condition: str = "") -> str:
     """Set an execution breakpoint (hardware-style; works in ROM and does not modify memory).
 
-    SEG:OFF is resolved to a linear address now, in the current CPU mode."""
+    SEG:OFF is resolved to a linear address now, in the current CPU mode.
+
+    condition: stop only when it holds when the instruction is reached, e.g.
+    "eax == 5", "cx > 100", "byte [esi+3] & 80", "[ss:ebp-8] != 0",
+    "word [player_hp] < #10", "[esi] changed" (differs from the last time
+    the breakpoint was reached, or from when it was set). Operators: == != < >
+    <= >= & (any bit set; comparisons are unsigned), changed. Numbers are hex;
+    #10 is decimal, -1 is FFFFFFFF. Registers: EAX-ESP, AX-SP, AL-DH. Memory in
+    brackets: [reg+disp] (DS-relative; EBP/ESP are SS-relative; ds:/ss: to
+    choose), [linear], [SEG:OFF] or [symbol] (fixed addresses, resolved now);
+    byte/word/dword before it sets the size (default: dword in 32-bit code,
+    word in 16-bit). Passes where it is false are counted (list_breakpoints).
+    Setting a breakpoint where there is one replaces it (and its condition)."""
     c = client()
     regs = _regs()
     loc = _resolve(address, regs)
     linear = loc.linear
-    c.set_point(BP_HARDWARE, linear)
-    _points[(BP_HARDWARE, linear)] = {"kind": BP_HARDWARE, "address": linear, "length": 1, "expr": address}
-    return "Breakpoint set at %s = %s." % (address, dos.describe(loc, regs))
+    _set_point(c, BP_HARDWARE, linear, 1)
+    note = _apply_condition(c, BP_HARDWARE, linear, condition, regs)
+    _points[(BP_HARDWARE, linear)] = {"kind": BP_HARDWARE, "address": linear, "length": 1, "expr": address,
+                                      "condition": condition.strip()}
+    _save_points()
+    return "Breakpoint set at %s = %s.%s" % (address, dos.describe(loc, regs), note)
 
 
 @tool
-def set_watchpoint(address: str, length: int = 1, kind: str = "write", cpu_mode: str = "") -> str:
+def set_watchpoint(address: str, length: int = 1, kind: str = "write", cpu_mode: str = "",
+                   condition: str = "") -> str:
     """Stop when memory in [address, address+length) is accessed. kind: write, read or access.
 
     cpu_mode: "protected" or "real" makes ALL watchpoints catch only accesses
     made in that CPU mode ("any" undoes it; empty leaves it as is). E.g. watch
     DOS memory with cpu_mode="protected" to find a DOS-extender program writing
-    into it, while DOS's own (real-mode) writes don't stop the CPU."""
+    into it, while DOS's own (real-mode) writes don't stop the CPU.
+
+    condition: stop only when it holds after the access, as in set_breakpoint.
+    A condition starting with its operator tests the watched memory itself
+    (its first byte/word/dword, by length): "== 0", "> #100", "& 8000",
+    "changed" (a write that changes the value), "byte changed". Others can
+    test anything, e.g. "eax == 3" or "[esi] < 0"."""
     c = client()
     k = {"write": WP_WRITE, "read": WP_READ, "access": WP_ACCESS}[kind]
     note = ""
@@ -677,8 +833,11 @@ def set_watchpoint(address: str, length: int = 1, kind: str = "write", cpu_mode:
     regs = _regs()
     loc = _resolve(address, regs)
     linear = loc.linear
-    c.set_point(k, linear, max(1, length))
-    _points[(k, linear)] = {"kind": k, "address": linear, "length": max(1, length), "expr": address}
+    _set_point(c, k, linear, max(1, length))
+    note = _apply_condition(c, k, linear, condition, regs, (linear, max(1, length))) + note
+    _points[(k, linear)] = {"kind": k, "address": linear, "length": max(1, length), "expr": address,
+                            "condition": condition.strip()}
+    _save_points()
     return "%s watchpoint on %s, %d byte(s) = %s.%s" % (kind.capitalize(), address, max(1, length),
                                                          dos.describe(loc, regs), note)
 
@@ -699,6 +858,7 @@ def clear_breakpoint(address: str) -> str:
         p = _points.pop(key)
         c.clear_point(p["kind"], p["address"], p["length"])
         removed.append("%s at %08X (%s)" % (KIND_NAMES[p["kind"]], p["address"], p["expr"]))
+    _save_points()
     if not removed:
         return "Nothing to remove at %s." % address
     return "Removed %d point(s):\n%s" % (len(removed), "\n".join(removed))
@@ -707,16 +867,24 @@ def clear_breakpoint(address: str) -> str:
 @tool
 def list_breakpoints() -> str:
     """List breakpoints, watchpoints and interrupt catches."""
-    hits = {}
+    hits, misses = {}, {}
     try:
         client().list_points()
         hits = getattr(client(), "point_hit_counts", {})
+        misses = getattr(client(), "point_cond_misses", {})
     except GdbError:
         pass
-    lines = ["%-12s %08X len=%d  (%s)%s" % (KIND_NAMES[p["kind"]], p["address"], p["length"], p["expr"],
-                                          "  hits=%d" % hits[(p["kind"], p["address"])]
-                                          if (p["kind"], p["address"]) in hits else "")
-             for p in _points.values()]
+    lines = []
+    for p in _points.values():
+        key = (p["kind"], p["address"])
+        line = "%-12s %08X len=%d  (%s)" % (KIND_NAMES[p["kind"]], p["address"], p["length"], p["expr"])
+        if p.get("condition"):
+            line += "  if %s" % p["condition"]
+        if key in hits:
+            line += "  hits=%d" % hits[key]
+        if key in misses:
+            line += "  false=%d" % misses[key]
+        lines.append(line)
     try:
         for v, ah, al, w in client().int_status()["catches"]:
             lines.append("%-12s INT %02Xh%s%s on %s" % ("int-catch", v, "" if ah is None else " AH=%02Xh" % ah,
@@ -2218,6 +2386,7 @@ def find_references(target: str, code: str = "", max_results: int = 50) -> str:
 
 
 _HIT_FMT = struct.Struct("<4I8II6H4III")  # one logpoint record of the stub's "ll" output
+_HIT_IRQ_FMT = struct.Struct("<4I")  # ...followed in newer builds by the last IRQ: info, linear, CS, age
 _HIT_REGS = ("eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp")
 
 
@@ -2230,8 +2399,28 @@ def _parse_hits(raw, size):
         r.update(zip(dos.SEGS, f[13:19]))
         out.append({"seq": f[0], "addr": f[1], "tsc": f[2] | (f[3] << 32), "regs": r,
                     "stack": f[19:23] if f[24] & 1 else None, "mem": f[23] if f[24] & 2 else None,
-                    "mode": (f[24] >> 8) & 3})
+                    "mode": (f[24] >> 8) & 3, "irq": None})
+        if size >= _HIT_FMT.size + _HIT_IRQ_FMT.size:  # newer builds: the last hardware interrupt
+            info, lin, sel, age = _HIT_IRQ_FMT.unpack_from(raw, k + _HIT_FMT.size)
+            if info & 0x10000:
+                out[-1]["irq"] = {"vector": info & 0xFF, "mode": (info >> 8) & 3, "linear": lin, "cs": sel,
+                                  "age": age}
     return out
+
+
+def _interrupted(hits, hz):
+    """When the hits look like an interrupt handler's (nearly all come just after
+    a hardware interrupt with the same vector), (vector, [interrupted linear
+    address or None per hit]); else None."""
+    near = max(1, hz // 2000)  # within 0.5 ms of emulated time
+    recent = [h["irq"] if h["irq"] and h["irq"]["age"] < near else None for h in hits]
+    vectors = collections.Counter(i["vector"] for i in recent if i)
+    if not vectors or len(hits) < 2:
+        return None
+    vector, n = vectors.most_common(1)[0]
+    if n * 5 < len(hits) * 4:
+        return None
+    return vector, [i["linear"] if i and i["vector"] == vector else None for i in recent]
 
 
 def _logpoint_memory(spec, regs):
@@ -2309,7 +2498,9 @@ def log_hits(address: str, seconds: float = 10.0, max_hits: int = 200, registers
     the program runs at full speed, for `seconds` of real time or until
     `max_hits`, or until the program exits (it then stays stopped at its exit
     call). Shows the first and last hits and the values seen. Times are
-    emulated seconds since the first hit."""
+    emulated seconds since the first hit. For an interrupt handler it also
+    shows where each interrupt came in: the program code it interrupted.
+    log_hits on a function entry also shows its callers."""
     c = client()
     regs = _regs()
     loc = _resolve(address, regs)
@@ -2387,9 +2578,18 @@ def log_hits(address: str, seconds: float = 10.0, max_hits: int = 200, registers
         lines.append("Callers (return addresses on the stack):")
         for a, n in sorted(callers.items(), key=lambda kv: -kv[1])[:10]:
             lines.append("  %08X%s  x%d" % (a, _sym(a), n))
+    # In an interrupt handler: what each interrupt interrupted (where the
+    # program was), e.g. to find the code a race with the handler hits.
+    irq = _interrupted(hits, hz)
+    if irq:
+        where = collections.Counter(a for a in irq[1] if a is not None)
+        lines.append("This is an interrupt handler: each hit follows an INT %02Xh hardware interrupt. "
+                     "It interrupted (top %d of %d addresses):" % (irq[0], min(12, len(where)), len(where)))
+        for a, n in where.most_common(12):
+            lines.append("  %08X%s  x%d" % (a, _sym(a), n))
     t0 = hits[0]["tsc"] if hits else 0
     out = []
-    for h, a in zip(hits, rets):
+    for i, (h, a) in enumerate(zip(hits, rets)):
         vals = []
         for n in names:
             try:
@@ -2399,8 +2599,10 @@ def log_hits(address: str, seconds: float = 10.0, max_hits: int = 200, registers
                 vals.append("%s=?" % n)
         if mem:
             vals.append("[%s]=%s" % (memory, "%08X" % h["mem"] if h["mem"] is not None else "?"))
-        out.append("%.4fs  %s%s" % ((h["tsc"] - t0) / hz, " ".join(vals),
-                                    ("  ret %08X%s" % (a, _sym(a))) if entry and a is not None else ""))
+        out.append("%.4fs  %s%s%s" % ((h["tsc"] - t0) / hz, " ".join(vals),
+                                      ("  ret %08X%s" % (a, _sym(a))) if entry and a is not None else "",
+                                      ("  interrupted %08X%s" % (irq[1][i], _sym(irq[1][i])))
+                                      if irq and irq[1][i] is not None else ""))
     # The values seen, per register / memory dword: few distinct ones are
     # listed with counts (a counter, a flag, a handful of callers...).
     fields = [n.upper() for n in names] + (["[%s]" % memory] if mem else [])

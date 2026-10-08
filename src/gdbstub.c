@@ -165,8 +165,25 @@ typedef struct _gdbstub_breakpoint_ {
     };
     uint32_t hits; /* times it stopped the CPU */
 
+    /* An optional condition ("bc"): stop only if it holds. For a watchpoint
+       it is tested after the accessing instruction, so it sees the new value. */
+    struct {
+        uint8_t  active;
+        uint8_t  src;    /* 0 register, 1 linear memory, 2 DS:reg+arg, 3 SS:reg+arg */
+        uint8_t  reg;    /* EAX EBX ECX EDX ESI EDI EBP ESP, and for a register AH BH CH DH (8-11) */
+        uint8_t  size;   /* 1, 2 or 4 bytes */
+        uint8_t  op;     /* 0 ==, 1 !=, 2 <, 3 >, 4 <=, 5 >=, 6 & (any bit set), 7 changed */
+        uint8_t  primed; /* for "changed": value holds the last value seen */
+        uint32_t arg, value;
+        uint32_t misses; /* times it fired but the condition was false */
+    } cond;
+
     struct _gdbstub_breakpoint_ *next;
 } gdbstub_breakpoint_t;
+
+static gdbstub_breakpoint_t *cond_watch;      /* a conditional watchpoint that fired... */
+static int                   cond_watch_step; /* ...its stop reason */
+static uint32_t              cond_watch_addr; /* ...and the address accessed */
 
 #ifdef ENABLE_GDBSTUB_LOG
 int gdbstub_do_log = ENABLE_GDBSTUB_LOG;
@@ -462,7 +479,19 @@ typedef struct {
     uint32_t stack[4]; /* 16 bytes at SS:(E)SP */
     uint32_t mem;      /* the dword at the logpoint's memory operand */
     uint32_t flags;    /* bit 0 stack read, bit 1 memory read, bits 8-9 mode (0 real, 1 V86, 2 PM16, 3 PM32) */
+    uint32_t irq_info; /* the last hardware interrupt before the hit: vector | mode << 8 | 1 << 16 if any */
+    uint32_t irq_lin;  /* ...the linear address it interrupted */
+    uint32_t irq_cs;   /* ...and the code selector there */
+    uint32_t irq_age;  /* ...how long before the hit, in TSC ticks (saturated) */
 } gdbstub_hitlog_t;
+
+/* The last hardware interrupt the CPU took, for logpoints: under a DOS
+   extender a game's IRQ handler is called from the extender's own code, so
+   the stack doesn't show what the interrupt interrupted; this does. */
+static struct {
+    uint32_t info, lin, sel;
+    uint64_t when; /* TSC */
+} last_irq;
 
 typedef struct {
     uint32_t addr;
@@ -495,7 +524,7 @@ static int watch_mode_filter;
 
 static void gdbstub_int_clear(void);
 static int  gdbstub_peek(uint32_t addr, uint8_t *buf, int len);
-
+static int  gdbstub_cond_value(gdbstub_breakpoint_t *bp, uint32_t *v);
 
 static void (*cpu_exec_shadow)(int32_t cycs);
 
@@ -509,6 +538,14 @@ gdbstub_pc(void)
     if (cpu_exec_shadow == execvx0)
         return cs + ((cpu_state.pc - biu_queue_preload) & 0xffff);
     return cs + cpu_state.pc;
+}
+
+/* TSC ticks per emulated second: CPU clocks, except that the 8086-class
+   cores count crystal ticks (xt_cpu_multi per CPU clock). */
+static int
+gdbstub_tsc_hz(void)
+{
+    return is286 ? cpu_s->rspeed : (int) (cpu_s->rspeed * (xt_cpu_multi >> 32));
 }
 
 /* Only the 286+ interpreters compute arithmetic flags lazily; on the 8086
@@ -1480,8 +1517,9 @@ e00:
                     client->packet_pos = 0;
                     for (l = 0; l < 5; l++) {
                         for (breakpoint = *lists[l]; breakpoint && (client->packet_pos < 4000); breakpoint = breakpoint->next)
-                            client->packet_pos += sprintf(&client->packet[client->packet_pos], "%d %08X %X %X\n", l, breakpoint->addr,
-                                                          (l < 2) ? 1 : (breakpoint->end - breakpoint->addr), breakpoint->hits);
+                            client->packet_pos += sprintf(&client->packet[client->packet_pos], "%d %08X %X %X %X %d\n", l, breakpoint->addr,
+                                                          (l < 2) ? 1 : (breakpoint->end - breakpoint->addr), breakpoint->hits,
+                                                          breakpoint->cond.misses, breakpoint->cond.active);
                     }
                     client->response_pos = 0;
                     if (client->packet_pos)
@@ -1520,7 +1558,7 @@ e00:
                                                       catches[i].ah & 0x1ff, catches[i].al & 0x1ff, catches[i].when);
                     for (i = 0; i < xrange_count; i++)
                         client->packet_pos += sprintf(&client->packet[client->packet_pos], "xrange %08X %08X\n", xrange_lo[i], xrange_hi[i]);
-                    client->packet_pos += sprintf(&client->packet[client->packet_pos], "tsc %" PRIX64 " hz %d\n", tsc, cpu_s->rspeed);
+                    client->packet_pos += sprintf(&client->packet[client->packet_pos], "tsc %" PRIX64 " hz %d\n", tsc, gdbstub_tsc_hz());
                     client->response_pos = 0;
                     gdbstub_client_respond_hex(client, (uint8_t *) client->packet, client->packet_pos);
                     break;
@@ -1544,6 +1582,41 @@ e00:
                         if (client->gone)
                             break;
                     }
+                } else if (!strcmp(p, "bc")) {
+                    /* Condition on a point: "bc TYPE ADDR SRC REG ARG SIZE OP VALUE" (hex; TYPE is
+                       the Z packet number 1-4; see gdbstub_breakpoint_t.cond), or "bc TYPE ADDR off". */
+                    static gdbstub_breakpoint_t **lists[] = { &first_swbreak, &first_hwbreak, &first_wwatch, &first_rwatch, &first_awatch };
+                    uint32_t                      type, addr, v[5];
+                    gdbstub_breakpoint_t         *bp;
+                    if (!(p = strtok_r(NULL, " ", &strtok_save)) || !gdbstub_parse_hex(p, &type) || (type < 1) || (type > 4) || !(p = strtok_r(NULL, " ", &strtok_save)) || !gdbstub_parse_hex(p, &addr))
+                        goto e22;
+                    for (bp = *lists[type]; bp && (bp->addr != addr); bp = bp->next)
+                        ;
+                    if (!bp || !(p = strtok_r(NULL, " ", &strtok_save)))
+                        goto e22;
+                    if (!strcmp(p, "off"))
+                        memset(&bp->cond, 0, sizeof(bp->cond));
+                    else {
+                        for (i = 0; i < 5; i++) {
+                            if (((i > 0) && !(p = strtok_r(NULL, " ", &strtok_save))) || !gdbstub_parse_hex(p, &v[i]))
+                                goto e22;
+                        }
+                        if (!(p = strtok_r(NULL, " ", &strtok_save)) || !gdbstub_parse_hex(p, &addr))
+                            goto e22;
+                        if ((v[0] > 3) || (v[1] > ((v[0] == 0) ? 11 : 7)) || ((v[3] != 1) && (v[3] != 2) && (v[3] != 4)) || (v[4] > 7))
+                            goto e22;
+                        bp->cond.src    = v[0];
+                        bp->cond.reg    = v[1];
+                        bp->cond.arg    = v[2];
+                        bp->cond.size   = v[3];
+                        bp->cond.op     = v[4];
+                        bp->cond.value  = addr; /* the value, parsed last */
+                        bp->cond.misses = 0;
+                        bp->cond.active = 1;
+                        bp->cond.primed = (bp->cond.op == 7) && gdbstub_cond_value(bp, &bp->cond.value);
+                    }
+                    FAST_RESPONSE("OK");
+                    break;
                 } else if (!strcmp(p, "lp")) {
                     /* Logpoints: "lp ADDR [REG DISP]" adds one (REG 0-7 EAX EBX ECX EDX ESI EDI
                        EBP ESP for a dword at DS:REG+DISP, 10h-17h for SS:REG+DISP, 8 for the
@@ -1590,7 +1663,7 @@ e00:
                     for (i = 0; i < logpoint_count; i++)
                         client->packet_pos += sprintf(&client->packet[client->packet_pos], "lp %08X %d %X %X\n", logpoints[i].addr,
                                                       logpoints[i].mem_reg, logpoints[i].mem_disp, logpoints[i].hits);
-                    client->packet_pos += sprintf(&client->packet[client->packet_pos], "tsc %" PRIX64 " hz %d\n", tsc, cpu_s->rspeed);
+                    client->packet_pos += sprintf(&client->packet[client->packet_pos], "tsc %" PRIX64 " hz %d\n", tsc, gdbstub_tsc_hz());
                     client->response_pos = 0;
                     gdbstub_client_respond_hex(client, (uint8_t *) client->packet, client->packet_pos);
                     break;
@@ -1895,14 +1968,20 @@ e00:
                         "- hold [0|1] - Keep the CPU's run state and breakpoints when the last client disconnects,\n"
                         "  and don't pause it when the next one connects\n"
                         "- state - Show whether the CPU is running\n"
-                        "- bl - List breakpoints and watchpoints: {Z type} {address} {length}\n"
+                        "- bl - List breakpoints and watchpoints: {Z type} {address} {length} {hits} {false} {has condition}\n"
+                        "- bc type address src reg arg size op value - Stop at a point only while a condition holds\n"
+                        "  (src 0 register, 1 linear, 2 DS:reg+arg, 3 SS:reg+arg; reg EAX EBX ECX EDX ESI EDI EBP ESP AH BH CH DH;\n"
+                        "  size 1/2/4; op 0 == 1 != 2 < 3 > 4 <= 5 >= 6 & 7 changed); bc type address off removes it\n"
+                        "- lp [address [reg disp] | - address | off] - Log each execution of an address without stopping\n"
+                        "- ll from [count] - Read logpoint records from sequence number {from} as raw bytes\n"
                         "- tv [vector...|off] - Log INT calls to these hex vectors; shows the log state (also ts)\n"
                         "- tl [from [count]] - Read log records from sequence number {from} as raw bytes\n"
                         "- tc - Clear the INT log\n"
                         "- mr address length - Read RAM/ROM without side effects: {readable} {address} {length} [bytes] records\n"
                         "- ca vector [ah|*] [al|*] [call|ret|both] - Stop before matching INT calls and/or at their returns\n"
                         "- cx - Remove all INT catchpoints\n"
-                        "- xr [start end]... - Stop when execution enters a linear range (end exclusive); none clears\n"
+                        "- xr [start end]... [pm32] [skip sel|skipb sel base|skipr lo hi cr3]... - Stop when execution enters\n"
+                        "  a linear range (end exclusive), or with pm32 runs 32-bit protected-mode code outside the skips; none clears\n"
                         "- wf [any|pm|rm] - Watchpoints catch accesses in any mode, protected mode only or real/V86 mode only\n");
                     break;
                 } else {
@@ -2001,6 +2080,8 @@ unknown:
                     prev_breakpoint->next = breakpoint->next;
 
                 /* De-allocate breakpoint. */
+                if (cond_watch == breakpoint)
+                    cond_watch = NULL;
                 free(breakpoint);
             }
 
@@ -2069,6 +2150,8 @@ gdbstub_clear_points(void)
     for (int l = 0; l < 5; l++) {
         while ((breakpoint = *lists[l])) {
             *lists[l] = breakpoint->next;
+            if (cond_watch == breakpoint)
+                cond_watch = NULL;
             free(breakpoint);
         }
     }
@@ -2709,7 +2792,94 @@ gdbstub_logpoint_hit(gdbstub_logpoint_t *lp)
             rec->flags |= 2;
     }
     in_gdbstub = old_in_gdbstub;
+    if (last_irq.info) {
+        uint64_t age  = tsc - last_irq.when;
+        rec->irq_info = last_irq.info;
+        rec->irq_lin  = last_irq.lin;
+        rec->irq_cs   = last_irq.sel;
+        rec->irq_age  = (age > 0xffffffff) ? 0xffffffff : (uint32_t) age;
+    }
     lp->hits++;
+}
+
+/* Called by the CPU cores when they take a hardware interrupt, before
+   delivering it: CS:(E)IP is where it interrupted. */
+void
+gdbstub_irq(uint8_t vector)
+{
+    int mode = !(msw & 1) ? 0 : ((cpu_state.eflags & VM_FLAG) ? 1 : (use32 ? 3 : 2));
+
+    last_irq.info = vector | (mode << 8) | (1 << 16);
+    last_irq.lin  = gdbstub_pc();
+    last_irq.sel  = CS;
+    last_irq.when = tsc;
+}
+
+/* The value a point's condition tests; 0 if it is unreadable memory. */
+static int
+gdbstub_cond_value(gdbstub_breakpoint_t *bp, uint32_t *v)
+{
+    const uint32_t regs[12] = { EAX, EBX, ECX, EDX, ESI, EDI, EBP, ESP, EAX >> 8, EBX >> 8, ECX >> 8, EDX >> 8 };
+    uint32_t       mask     = (bp->cond.size >= 4) ? 0xffffffff : ((1u << (bp->cond.size * 8)) - 1);
+
+    if (bp->cond.src == 0)
+        *v = regs[(bp->cond.reg < 12) ? bp->cond.reg : 0];
+    else {
+        uint32_t lin            = bp->cond.arg;
+        uint8_t  buf[4]         = { 0 };
+        int      old_in_gdbstub = in_gdbstub;
+        int      ok;
+        if (bp->cond.src == 2)
+            lin = ds + regs[bp->cond.reg & 7] + bp->cond.arg;
+        else if (bp->cond.src == 3)
+            lin = ss + regs[bp->cond.reg & 7] + bp->cond.arg;
+        in_gdbstub = 1;
+        ok         = gdbstub_peek(lin, buf, bp->cond.size) == bp->cond.size;
+        in_gdbstub = old_in_gdbstub;
+        if (!ok)
+            return 0;
+        *v = buf[0] | (buf[1] << 8) | (buf[2] << 16) | ((uint32_t) buf[3] << 24);
+    }
+    *v &= mask;
+    return 1;
+}
+
+/* Whether a point's condition holds now (true without a condition). An
+   unreadable memory operand counts as false. */
+static int
+gdbstub_cond_holds(gdbstub_breakpoint_t *bp)
+{
+    uint32_t mask = (bp->cond.size >= 4) ? 0xffffffff : ((1u << (bp->cond.size * 8)) - 1);
+    uint32_t v;
+    int      ok;
+
+    if (!bp->cond.active)
+        return 1;
+    if (!gdbstub_cond_value(bp, &v))
+        return 0;
+    switch (bp->cond.op) {
+        case 0:
+            return v == (bp->cond.value & mask);
+        case 1:
+            return v != (bp->cond.value & mask);
+        case 2:
+            return v < (bp->cond.value & mask);
+        case 3:
+            return v > (bp->cond.value & mask);
+        case 4:
+            return v <= (bp->cond.value & mask);
+        case 5:
+            return v >= (bp->cond.value & mask);
+        case 6:
+            return (v & bp->cond.value) != 0;
+        case 7: /* changed since the last test, or since it was set (if readable then) */
+            ok              = bp->cond.primed && (bp->cond.value != v);
+            bp->cond.value  = v;
+            bp->cond.primed = 1;
+            return ok;
+        default:
+            return 1;
+    }
 }
 
 static int
@@ -2729,6 +2899,19 @@ gdbstub_pm32_skipped(uint16_t sel, uint32_t addr)
 int
 gdbstub_instruction(void)
 {
+    /* A conditional watchpoint that fired during the instruction just done:
+       stop if its condition holds now. */
+    if (cond_watch) {
+        gdbstub_breakpoint_t *bp = cond_watch;
+        cond_watch               = NULL;
+        if (gdbstub_cond_holds(bp)) {
+            bp->hits++;
+            watch_addr   = cond_watch_addr;
+            gdbstub_step = cond_watch_step;
+        } else
+            bp->cond.misses++;
+    }
+
     /* A stop raised during the instruction (watchpoint, INT 3) wins over the checks below. */
     int stopped = (gdbstub_step >= GDBSTUB_BREAK_SW);
 
@@ -2782,7 +2965,9 @@ gdbstub_instruction(void)
         /* Go through the list of software breakpoints. */
         do {
             /* Check if the breakpoint coincides with this address. */
-            if (breakpoint->addr == wanted_addr) {
+            if ((breakpoint->addr == wanted_addr) && !gdbstub_cond_holds(breakpoint))
+                breakpoint->cond.misses++;
+            else if (breakpoint->addr == wanted_addr) {
                 gdbstub_log("GDB Stub: Hardware breakpoint at %08X\n", wanted_addr);
                 breakpoint->hits++;
 
@@ -2868,6 +3053,16 @@ gdbstub_mem_access(uint32_t *addrs, int access)
             }
             if (i < width) {
                 gdbstub_log("GDB Stub: %s watchpoint at %08X\n", (access & GDBSTUB_MEM_AWATCH) ? "Access" : ((access & GDBSTUB_MEM_WRITE) ? "Write" : "Read"), watch_addr);
+
+                if (watchpoint->cond.active) {
+                    /* Test it once the instruction is done (gdbstub_instruction). */
+                    if (!cond_watch) {
+                        cond_watch      = watchpoint;
+                        cond_watch_addr = watch_addr;
+                        cond_watch_step = (access & GDBSTUB_MEM_AWATCH) ? GDBSTUB_BREAK_AWATCH : ((access & GDBSTUB_MEM_WRITE) ? GDBSTUB_BREAK_WWATCH : GDBSTUB_BREAK_RWATCH);
+                    }
+                    return;
+                }
 
                 watchpoint->hits++;
 

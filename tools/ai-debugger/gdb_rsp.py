@@ -383,13 +383,22 @@ class GdbClient:
             raise
         points = []
         self.point_hit_counts = {}
+        self.point_cond_misses = {}
         for line in text.splitlines():
             parts = line.split()
             if len(parts) >= 3:
-                points.append((int(parts[0]), int(parts[1], 16), int(parts[2], 16)))
+                key = (int(parts[0]), int(parts[1], 16))
+                points.append(key + (int(parts[2], 16),))
                 if len(parts) >= 4:  # newer builds: times it stopped the CPU
-                    self.point_hit_counts[(int(parts[0]), int(parts[1], 16))] = int(parts[3], 16)
+                    self.point_hit_counts[key] = int(parts[3], 16)
+                if len(parts) >= 6 and parts[5] == "1":  # with a condition: times it was false
+                    self.point_cond_misses[key] = int(parts[4], 16)
         return points
+
+    def set_condition(self, kind, addr, cond=None):
+        """Make a point stop only while a condition holds: cond is (src, reg, arg,
+        size, op, value) as the stub's "bc" takes it, or None to remove it."""
+        self.monitor("bc %x %x " % (kind, addr) + ("off" if cond is None else " ".join("%x" % v for v in cond)))
 
     def clear_point(self, kind, addr, length=1):
         reply = self.request("z%d,%x,%x" % (kind, addr, length))

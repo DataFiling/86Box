@@ -388,6 +388,7 @@ exec386_2386(int32_t cycs)
             } else if ((cpu_state.flags & I_FLAG) && pic.int_pending && !cpu_end_block_after_ins) {
                 vector = picinterrupt();
                 if (vector != -1) {
+                    gdbstub_irq(vector);
                     flags_rebuild();
                     if (msw & 1)
                         pmodeint_2386(vector, 0);

@@ -802,7 +802,79 @@ Not done:
 - Naming C runtime routines (inp/outp/strtoul) without a map.
 
 All four agents asked for one or more of these; they are the next
-candidates.
+candidates. The first two are done in section 21.
+
+### 21. Conditional breakpoints and what an interrupt interrupted
+
+**Conditions in the stub.** Each breakpoint and watchpoint can carry one
+condition, set with the monitor command
+`bc TYPE ADDR SRC REG ARG SIZE OP VALUE` (or `bc TYPE ADDR off`):
+
+- The tested value is a register (including AH/BH/CH/DH), a linear dword,
+  word or byte, or memory at DS:reg+disp or SS:reg+disp.
+- The operators are `==`, `!=`, `<`, `>`, `<=`, `>=`, `&` (any bit set) and
+  `changed`. `changed` compares against the value when the condition was
+  set, then against the previous test.
+
+The test runs inside the emulator, so a false condition costs no round trip
+and the program keeps its speed. Execution breakpoints test it before the
+instruction. Watchpoints test it after the accessing instruction (the stop
+is deferred one instruction), so they see the new value. `bl` now also
+reports how often the condition was false.
+
+**Recording interrupts.** Every CPU core calls `gdbstub_irq(vector)` when it
+takes a hardware interrupt: `386.c`, both places in `386_dynarec.c`,
+`808x.c` and `vx0.c` (NEC V20/V30). The stub keeps the last one: its vector, CPU mode, CS and the
+linear address it interrupted, and its time. Logpoint records grew from 88
+to 104 bytes to carry it. The bridge reads either size.
+
+**Bridge:**
+
+- **`condition=` on `set_breakpoint`/`set_watchpoint`.**
+  - Examples: `eax == 5`, `ah == 4C`, `byte [esi+3] & 80`,
+    `[ss:ebp-8] != 0`, `word [symbol] < #10`, `[esi] changed`.
+  - Numbers are hex. A leading `#` makes a number decimal, and `-1` is
+    FFFFFFFF.
+  - For a watchpoint, a condition that starts with its operator tests the
+    watched memory itself: `== 0`, `changed`.
+  - `[es:di]` and similar are refused rather than silently turned into a
+    fixed address.
+- **Conditions are kept** in the state directory, so `list_breakpoints`
+  shows them, with `hits=` and `false=`, across run_tool commands.
+- **Setting a point where one exists replaces it.** Before this the stub
+  refused it with E22.
+- **`log_hits` on an interrupt handler.** It recognises a handler (at least
+  80% of hits come within 0.5 ms of a hardware interrupt with the same
+  vector). It then lists the addresses the interrupts came in at, and adds
+  "interrupted ADDR" to each hit.
+
+**Checks on the Pentium VM, with COINS:**
+
+| Check | Result |
+|---|---|
+| Write watch on `pending` (14C464), `== 0` | Stopped first in the C runtime's BSS clear (`rep stosd`), then only at `main_+86` (`pending = 0`) |
+| Same watch, `> 0` | Stopped only in the timer handler (12D07E), with 119 zero writes counted as false |
+| Same watch, `changed` | Alternated: main loop (5→0), handler (0→5), main loop |
+| Breakpoint at `main_+63`, `ax == 5` | Stopped with EAX=5 after 61 false passes |
+| `log_hits` on the handler (12D010), 500 hits | "This is an interrupt handler: each hit follows an INT 08h". Most of the 22 interrupted addresses were in `draw_number`. `main_+70` and `main_+7D` are inside the race window `main_+5E`..`main_+86` between reading and clearing `pending`: the bug, seen directly |
+| `log_hits` on `main_+5E` | No handler report |
+
+On the 386, a breakpoint on DOS's INT 21h entry (00D9:12E8) with
+`ah == 19` stopped at FreeCOM's get-drive call after 12 false passes
+(EAX=000019CD). `smoke_test.py` passes on all five VMs.
+
+On the IBM PC (8088), `log_hits` on the BIOS timer handler (F000:FEA5)
+showed every tick interrupting the keyboard wait loop at FE847, 0.0549 s
+apart (18.2 Hz).
+
+Bugs found while testing:
+
+- `bc` read one field too many and always failed.
+- On 8086-class CPUs the stub reported the CPU clock as the TSC rate. Those
+  cores count crystal ticks (`xt_cpu_multi`, 3 per clock on the 5150), so
+  emulated times in the INT log and `log_hits` were 3 times too long.
+- `monitor help` was missing `bc`, `lp`/`ll` and the `xr` options; it now
+  lists them.
 
 ## Test results
 
@@ -844,12 +916,14 @@ this environment), and V86 mode under EMM386.
 
 ## Next steps
 
-1. **Report the FastDoom bug upstream**: `testdata/fastdoom-bug-report.md` is
+1. **Name C runtime routines without a map** (inp/outp/strtoul...), e.g.
+   from signatures of the Open Watcom libraries.
+2. **Report the FastDoom bug upstream**: `testdata/fastdoom-bug-report.md` is
    ready to paste (this environment can't post to that repository).
-2. More AI exercises on real software, e.g. a bug hunt without a map.
-3. **More real games:** other open-source DOS games build with Open Watcom.
-4. **Read LE/LX object tables** from the program file to place objects
+3. More AI exercises on real software, e.g. a bug hunt without a map.
+4. **More real games:** other open-source DOS games build with Open Watcom.
+5. **Read LE/LX object tables** from the program file to place objects
    without a program-start stop.
-5. **Speed:** let the dynamic recompiler run while no breakpoints,
+6. **Speed:** let the dynamic recompiler run while no breakpoints,
    watchpoints or stepping are active.
-6. Offer the emulator changes upstream (86Box/86Box).
+7. Offer the emulator changes upstream (86Box/86Box).
