@@ -132,3 +132,101 @@ with a protected-mode-only write watchpoint over the buffers
 **Fix:** don't address locals through EBP after changing SS: make `ptr` and
 `next` static (fastdoom-ns_task-stack.diff), or compute EBP for the new
 stack too.
+
+## Round 3: five planted bugs of different kinds
+
+Built with the commands in each source's header (`games/`). CAVES and SHIPS
+go on the test floppy; COINS (with DOS4GW.EXE), TOUR and SBTEST on the
+hard disk in `C:\GAMES`.
+
+### CAVES.EXE (16-bit real mode): dangling pointer to the stack
+
+**Symptom:** the high score table's titles are garbage.
+
+**Cause:** `make_title()` formats "Name the Rank" into a local
+`char title[24]` and returns its address. `add_score()` stores that pointer
+in `table[i].title`. The table entries for the three players all point to
+the same stack location (a near pointer, SS = DS = DGROUP), which later
+calls (`printf` and friends) overwrite. The "Computer" entries point to a
+constant and print fine. Open Watcom warns about it (W116 "Attempt to
+return address of auto variable").
+
+**Evidence an AI should find:** `table` (DGROUP:073A) holds {score dword,
+title word} entries. Three titles share one value, an offset in the stack
+area near SP. The code that stores it is in `add_score`, right after the
+call to `make_title`, whose last instructions are `lea ax,[bp-18h]` /
+`mov sp,bp` / ... / `ret`: it returns the address of its own frame.
+
+**Fix:** a static or caller-supplied buffer per entry, e.g. `char
+title[24]` inside `struct entry` and `strcpy` into it.
+
+### SHIPS.EXE (16-bit real mode): uninitialized heap memory
+
+**Symptom:** works on the first run after boot; on a second run the ship
+starts with shield 10 (what the last game ended with) and is destroyed on
+turn 5.
+
+**Cause:** `new_ship()` mallocs a `struct ship` and sets x, y, fuel and name
+but never sets `shield`. It only does `if (s->shield == 0) s->shield =
+100`, as if malloc returned zeroed memory. After a boot that memory is 0.
+On the next run DOS loads the program at the same place, malloc returns the
+same block, and it still holds the previous game's final shield (10).
+
+**Evidence:** the ship struct on the near heap ({x, y, fuel, shield,
+name[10]}, shield at +6). The first write to it in the second run is the
+missing one: the `cmp word [bx+6],0 / jne` skips the default. A memory read
+before the program starts, or a diff between runs, shows the leftover value.
+
+**Fix:** set `s->shield = 100` unconditionally (or `calloc`).
+
+### COINS.EXE (DOS/4GW): race with the timer interrupt
+
+**Symptom:** 3333 coins but score 16590 instead of 16665 (15 coins' points
+lost; the exact loss depends on timing).
+
+**Cause:** the timer handler (IRQ 0, reprogrammed to 1000 Hz) does `coins++;
+pending += 5` every third tick. The main loop does `score += pending;`,
+then a bonus-life check (`score / 1000`, which may redraw the lives
+counter), then `pending = 0`. An interrupt between reading `pending` and
+clearing it adds 5 points that are then thrown away.
+
+**Evidence:** in `main_`, `mov reg,[pending]` / `add [score],reg` ... (div
+by 1000) ... `mov [pending],0`. The handler's `add dword [pending],5`. A
+write watchpoint on `pending` shows both writers; log_hits on the handler
+counts coins against the bank.
+
+**Fix:** take the points atomically: `_disable(); p = pending; pending = 0;
+_enable(); score += p;` (or `xchg`).
+
+### TOUR.EXE (DOS/32A): memory leak
+
+**Symptom:** "Not enough memory for level 78" (on the 16 MB Pentium).
+
+**Cause:** each level does `malloc(128 KB)` for the map (freed in
+`unload_level`) and `load_sprites()` does `malloc(192 KB)` for a sprite
+cache, storing it in `sprite_cache` without freeing the previous one: 192 KB
+leaks per level.
+
+**Evidence:** DPMI allocations (INT 31h 0501h) growing every level in
+`watch_program`/the INT log; `log_hits` on `malloc_` and `free_` shows two
+mallocs and one free per level; the leaked size is 30000h (192 KB). `load_sprites` and `load_level`
+are static, so the map doesn't name them; `malloc_` and `free_` are in it,
+and `find_references` on `malloc_` gives the two call sites.
+
+**Fix:** `free(sprite_cache)` before replacing it (or reuse the cache).
+
+### SBTEST.EXE (PMODE/W, run under JemmEx): BLASTER port parsed as decimal
+
+**Symptom:** card found with BLASTER unset; "Sound Blaster not found" with
+`BLASTER=A220 I5 D1 H5 T6`.
+
+**Cause:** `parse_blaster()` reads the A field with `strtoul(p + 1, NULL,
+10)`, so "220" becomes 220 = 0DCh instead of 220h. The DSP reset then goes
+to port 0E2h (0DCh + 6) and the status port 0EAh, where nothing answers.
+Without BLASTER the default 0x220 is used.
+
+**Evidence:** the call to `strtoul_` with base 10 (push 0Ah / mov ebx,0Ah)
+after the 'A' case; the port value 0DCh in the config struct; the `out dx,al`
+with DX = 0E2h in the reset routine.
+
+**Fix:** parse the port with base 16 (`strtoul(p + 1, NULL, 16)`).

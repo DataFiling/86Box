@@ -31,6 +31,14 @@ wcl    -zq -ms -bt=dos -0 -os -fe=mousetst.exe "$G/mousetst.c"
 wcl    -zq -ms -bt=dos -0 -os -fm=datagame.map -fe=datagame.exe "$G/datagame.c"
 wcl386 -zq -bt=dos -l=dos4g -3r -os -fm=pmgame.map -fe=pmgame.exe "$G/pmgame.c"
 wcl386 -zq -bt=dos -l=dos4g -3r -fp3 -ox -fe=bench.exe "$G/bench.c"
+# Round 3 exercises (GROUND_TRUTH.md): CAVES and SHIPS go on the floppy;
+# COINS (with DOS4GW.EXE), TOUR and SBTEST are copied to a hard disk's
+# C:\GAMES by hand (see README.md).
+wcl    -zq -ms -bt=dos -0 -os -fm=caves.map -fe=caves.exe "$G/caves.c"
+wcl    -zq -ms -bt=dos -0 -os -fm=ships.map -fe=ships.exe "$G/ships.c"
+wcl386 -zq -bt=dos -l=dos4g -3r -ox -fm=coins.map -fe=coins.exe "$G/coins.c"
+PATH="$WATCOM/binw:$PATH" wcl386 -zq -bt=dos -l=dos32a -3r -ox -fm=tour.map -fe=tour.exe "$G/tour.c"
+PATH="$WATCOM/binw:$PATH" wcl386 -zq -bt=dos -l=pmodew -3r -os -fm=sbtest.map -fe=sbtest.exe "$G/sbtest.c"
 cp "$WATCOM/binw/dos4gw.exe" DOS4GW.EXE
 
 # DATAGAME's level table: "LVL1", a count, then {char name[12]; u16 enemies, time}.
@@ -67,4 +75,4 @@ printf '@ECHO OFF\r\nPROMPT $P$G\r\nCTMOUSE /O\r\nECHO READY\r\n' > AUTOEXEC.BAT
 
 "$HERE/build_floppy.sh" "$OUT/boot.img" "$FDOS_KERNEL_DIR/bin/kernel.sys" "$FREECOM/command.com" \
     FDCONFIG.SYS AUTOEXEC.BAT CTMOUSE.COM txtgame.exe vgagame.exe pmgame.exe mousetst.exe bench.exe DOS4GW.EXE \
-    datagame.exe LEVELS.DAT
+    datagame.exe LEVELS.DAT caves.exe ships.exe
