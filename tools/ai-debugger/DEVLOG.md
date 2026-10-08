@@ -734,6 +734,76 @@ Also checked under JemmEx:
 Without EMM386 every entry is unchanged. The smoke test passes on all five
 machines.
 
+### 20. Round 3: five blind exercises with different kinds of bugs
+
+Five new test games, one planted bug each (sources in `testdata/games/`,
+answers in `GROUND_TRUTH.md`). One fresh agent per game got only the
+user's symptom, no source and no notes; four ran in parallel on separate
+VMs. Only TOUR's agent had a linker map.
+
+| Game | Bug | Machine | Result | Time | Tool calls |
+|---|---|---|---|---|---|
+| CAVES | function returns a pointer to its own stack buffer | 486, real mode | correct | ~10 min | 22 |
+| SHIPS | uninitialized heap field (malloc assumed to zero) | 386, real mode | correct, fix proven by patching memory | ~12 min | 25 |
+| COINS | race: main loop reads then clears a counter the timer IRQ adds to | Pentium, DOS/4GW | correct, fix proven by patching in `xchg` (score then exactly coins x 5) | ~18 min | 25 |
+| TOUR | sprite cache leaked every level | Pentium + JemmEx, DOS/32A over VCPI, with map | correct | ~10 min | 17 |
+| SBTEST | BLASTER port parsed as decimal | Pentium + JemmEx, PMODE/W | correct, fix proven by setting the register | ~10 min | 17 |
+
+Five out of five, each with the code addresses, the evidence and a working
+fix. The common path was:
+- `watch_program` to reproduce the bug;
+- `search_memory` for a string the program prints;
+- `find_references` or a watchpoint to reach the code;
+- disassembly, then a live patch to prove the fix.
+
+**Tool feedback, and what changed:**
+- **`find_references` missed 16-bit references.** It found nothing for
+  real-mode data: Watcom 16-bit code passes near pointers as `mov ax,ofs` /
+  `push ofs` and addresses globals as `[ofs]`. It now also matches
+  `[disp16]` operands and `imm16` values equal to the target's offset in
+  its segment (the given segment, else DS), labelling immediates "offset
+  value". On CAVES it found the format-string load and the six uses of
+  the score table.
+- **`disassemble` stopped silently** at bytes capstone can't decode (a
+  start in the middle of an instruction). It now shows them as `db`, goes
+  on, and says the start may be mid-instruction.
+- **No backtrace.** `read_stack` now marks return addresses: values right
+  after a near call (or indirect call) in the current code segment, and in
+  real mode far CS:IP pairs after a far call. The callers of a library
+  routine are then visible at a glance.
+- **`log_hits`:**
+  - It now stops when the program exits (it catches INT 21h AH=4Ch while
+    logging) and leaves the CPU at the exit call, with memory still
+    readable. TOUR's run ended after 6 s instead of waiting the full 60.
+  - It shows the first 20 and last 40 hits; the end of a run is what
+    matters for "fails after N".
+  - It summarises each logged value (counts when there are few distinct
+    values, the range otherwise).
+  - Its memory operand follows the CPU's segment rules: `[ebp+x]`/`[esp+x]`
+    are SS-relative, and `ss:`/`ds:` prefixes are accepted. In COINS the
+    timer handler runs on DOS/4GW's stack (SS base 143DF0h), so a
+    DS-relative read logged garbage. The stub's logpoints take SS-relative
+    operands for this.
+- **`read_text_screen`** now returns plain text with a header line (mode,
+  size, cursor); JSON with `format=json`.
+- **`search_memory`:**
+  - It takes `text=`.
+  - It marks hits above 1 MB that are the first MB seen again: it checks
+    that A20 is off by comparing 0 and 100000h.
+- **Parameter names:** `run_tool help` lists every tool's parameters, and
+  more aliases are accepted (`address`/`target`, `register`, `text`, `hex`,
+  `map`, `file`, `seconds`).
+- **Wording:** a breakpoint from another run_tool command is "set by an
+  earlier command".
+
+Not done:
+- Conditional breakpoints.
+- Recording what an interrupt handler interrupted.
+- Naming C runtime routines (inp/outp/strtoul) without a map.
+
+All four agents asked for one or more of these; they are the next
+candidates.
+
 ## Test results
 
 Test machines, built with `-DQT=OFF -DSDL2=ON -DGDBSTUB=ON` and run headless

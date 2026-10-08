@@ -409,8 +409,31 @@ def disassemble(data, linear, bits=16, loc=None, count=None, data_base=None):
     # Capstone gets the offset within the segment, not the linear address,
     # so that relative jump targets come out as offsets too.
     seg_base = loc.base if (loc is not None and loc.sel is not None) else 0
-    lines = []
-    for insn in md.disasm(data, (linear - seg_base) & 0xFFFFFFFF):
+    lines, pos, bad = [], 0, 0
+    start = (linear - seg_base) & 0xFFFFFFFF
+
+    def instructions():
+        # Capstone stops at bytes it can't decode: show them as data and go on.
+        nonlocal pos, bad
+        while pos < len(data):
+            got = False
+            for insn in md.disasm(data[pos:], (start + pos) & 0xFFFFFFFF):
+                got = True
+                pos += insn.size
+                yield insn
+            if pos < len(data):
+                bad += 1
+                yield None
+                pos += 1
+
+    for insn in instructions():
+        if insn is None:
+            a = seg_base + ((start + pos) & 0xFFFFFFFF)
+            lines.append("%s  %-20s db %02Xh  ; not a valid instruction" % (_label(loc, a), "%02X" % data[pos],
+                                                                           data[pos]))
+            if count and len([x for x in lines if not x.endswith(":")]) >= count:
+                break
+            continue
         addr = _label(loc, seg_base + insn.address)
         mnemonic = insn.mnemonic
         if bits == 16 and insn.bytes[-1:] in (b"\x98", b"\x99") and len(insn.bytes) == 1:
@@ -425,6 +448,9 @@ def disassemble(data, linear, bits=16, loc=None, count=None, data_base=None):
                                              _symbol_comment(mnemonic, insn.op_str, seg_base, bits, data_base)))
         if count and len([x for x in lines if not x.endswith(":")]) >= count:
             break
+    if bad and any("not a valid instruction" in x for x in lines[:4]):
+        lines.append("(invalid bytes right after the start: the address may be in the middle of an "
+                     "instruction; try starting a few bytes earlier)")
     return "\n".join(lines) if lines else "(could not decode)"
 
 

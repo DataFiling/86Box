@@ -63,12 +63,41 @@ def _operand_at(insn, start, pos, value):
     return False
 
 
-def references(data, base, bits, target, max_results=50):
+def references(data, base, bits, target, max_results=50, offset16=None):
     """Instructions in data (at linear base) that refer to the linear target:
     32-bit absolute operands, and near call/jmp/jcc whose destination is the
-    target. Returns [(linear, kind, insn text)]."""
+    target. In 16-bit code, offset16 (the target's offset in its segment,
+    usually DS) also finds [disp16] memory operands and imm16 values equal to
+    it, the way 16-bit code passes near pointers (mov ax,ofs / push ofs).
+    Returns [(linear, kind, insn text)]."""
     found = []
     seen = set()
+    if bits == 16 and offset16 is not None:
+        pat = struct.pack("<H", offset16 & 0xFFFF)
+        for m in re.finditer(re.escape(pat), data):
+            p = m.start()
+            for back in range(5, 0, -1):
+                s = p - back
+                if s < 0:
+                    continue
+                insn = _decode_at(data, base, bits, s, detail=True)
+                if insn is None or s + insn.size <= p:
+                    continue
+                try:
+                    disp = insn.disp_offset and s + insn.disp_offset == p and (insn.disp & 0xFFFF) == offset16
+                    imm = (insn.imm_offset and s + insn.imm_offset == p and
+                           any(op.type == dos.capstone.x86.X86_OP_IMM and (op.imm & 0xFFFF) == offset16
+                               for op in insn.operands))
+                except (AttributeError, dos.capstone.CsError):
+                    continue
+                if disp or imm:
+                    if base + s not in seen:
+                        seen.add(base + s)
+                        found.append((base + s, "uses offset" if disp else "offset value",
+                                      "%s %s" % (insn.mnemonic, insn.op_str)))
+                    break
+            if len(found) >= max_results:
+                return found
     if bits == 32:
         # Absolute operands: the 4 bytes of the address, inside an instruction
         # that starts up to 7 bytes earlier and really decodes with it.

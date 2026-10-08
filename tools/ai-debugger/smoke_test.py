@@ -118,7 +118,7 @@ async def main():
             await call("read_memory", address="0040:006C", length=4, format="words")
             await call("search_memory", pattern="55 AA", start="C0000", end="F0000", max_results=4)
             out = await call("read_text_screen")
-            expect('"mode"' in out, "text screen")
+            expect(out.startswith("mode ") or '"mode"' in out, "text screen")
             await call("io_read", port="40", count=4)
 
             out = await call("screenshot")

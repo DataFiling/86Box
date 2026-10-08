@@ -5,7 +5,9 @@ Run:  python3 server.py           (stdio transport)
 Env:  BOX86_GDB_HOST (default 127.0.0.1), BOX86_GDB_PORT (default 12345)
 """
 
+import collections
 import functools
+import json
 import os
 import re
 import struct
@@ -92,7 +94,7 @@ def client():
             # Points can outlive a connection when the stub holds them (run_tool.py).
             for kind, addr, length in c.list_points() or []:
                 _points[(kind, addr)] = {"kind": kind, "address": addr, "length": length,
-                                         "expr": "set by an earlier connection"}
+                                         "expr": "set by an earlier command"}
         return _client
 
 
@@ -494,11 +496,16 @@ def write_memory(address: str, hex_bytes: str) -> str:
 
 
 @tool
-def search_memory(pattern: str, start: str = "", end: str = "", as_text: bool = False,
-                  max_results: int = 64) -> str:
-    """Search guest memory for a byte pattern (hex, "??" wildcard) or text.
+def search_memory(pattern: str = "", start: str = "", end: str = "", as_text: bool = False,
+                  max_results: int = 64, text: str = "") -> str:
+    """Search guest memory for a byte pattern (hex, "??" wildcard) or text
+    (text=..., or a quoted pattern, or as_text=true).
 
     Default range: all RAM. Device memory (VGA etc.) is skipped, and searching has no side effects."""
+    if text:
+        pattern, as_text = text, True
+    if not pattern:
+        return "Give pattern= (hex bytes) or text=."
     c = client()
     regs = _regs()
     start_loc = _resolve(start, regs) if start else None
@@ -553,7 +560,25 @@ def search_memory(pattern: str, start: str = "", end: str = "", as_text: bool = 
             return " (FFFF:%04X)" % (a - 0xFFFF0)
         return ""
     more = " (stopped at max_results)" if len(hits) >= max_results else ""
-    return "%d match(es)%s, %s:\n" % (len(hits), more, where) + "\n".join("%08X%s" % (h, seg_note(h)) for h in hits)
+    found = set(hits)
+    a20_off = None
+
+    def mirror(a):
+        # With the A20 gate off, bit 20 of an address is ignored: what is
+        # above 1 MB with it set is the first MB again.
+        nonlocal a20_off
+        if not (a & 0x100000 and (a ^ 0x100000) in found):
+            return ""
+        if a20_off is None:
+            try:
+                a20_off = c.read_memory(0x100000, 64) == c.read_memory(0, 64)
+            except GdbError:
+                a20_off = False
+        if a20_off:
+            return "  (same place as %08X: A20 is off, so this is the first MB seen again)" % (a ^ 0x100000)
+        return "  (same bytes as at %08X: a copy)" % (a ^ 0x100000)
+    return "%d match(es)%s, %s:\n" % (len(hits), more, where) + "\n".join(
+        "%08X%s%s" % (h, seg_note(h), mirror(h)) for h in hits)
 
 
 @tool
@@ -600,6 +625,17 @@ def read_stack(entries: int = 16) -> str:
             n = table.code_name_at(lin) if table else None
             if n:
                 line += " (%s)" % n
+            # Return addresses: the value follows a call instruction (near,
+            # in the current code segment; a far return in real mode is
+            # IP then CS, checked with the next word).
+            if _looks_like_return(c, lin, None, 32 if w == 4 else 16):
+                line += "  <- return address (after a call at %08X)" % _call_before(c, lin, w)
+            elif w == 2 and dos.segmented(regs) and i + 1 < entries:
+                nxt = c.read_memory((ss["base"] + ((sp + (i + 1) * w) & mask)) & 0xFFFFFFFF, 2)
+                if len(nxt) == 2:
+                    far = int.from_bytes(nxt, "little") * 16 + val
+                    if dos.segmented(regs) and 0x500 <= far < 0x100000 and _looks_like_far_return(c, far):
+                        line += "  <- far return address %04X:%04X" % (int.from_bytes(nxt, "little"), val)
         lines.append(line)
     return "\n".join(lines)
 
@@ -700,15 +736,24 @@ def list_breakpoints() -> str:
 # ---- PC / DOS views ---------------------------------------------------------
 
 @tool
-def read_text_screen(include_attributes: bool = False, plain: bool = False):
+def read_text_screen(include_attributes: bool = False, plain: bool = False, format: str = "text"):
     """Read the current text-mode screen (from the BIOS video mode and video RAM).
 
-    Returns JSON (mode, size, cursor, text); plain=true returns just the text,
-    one screen row per line."""
+    Returns a header line (video mode, size, cursor) and the screen text, one
+    row per line. plain=true: the text only. format="json" (or
+    include_attributes=true, which adds colours): the details as JSON."""
     result = dos.read_text_screen(client(), include_attributes)
+    if include_attributes or format.lower() == "json":
+        return result
+    if result.get("text") is None:
+        return result.get("note") or json.dumps(result)
     if plain:
-        return result["text"] if result.get("text") is not None else result["note"]
-    return result
+        return result["text"]
+    cur = result.get("cursor") or {}
+    head = "mode %02Xh, %sx%s, cursor row %s col %s" % (
+        result.get("mode", 0), result.get("columns", "?"), result.get("rows", "?"), cur.get("row", "?"),
+        cur.get("col", "?"))
+    return head + "\n" + result["text"]
 
 
 @tool
@@ -2133,7 +2178,9 @@ def _region_bytes(lo, hi):
 @tool
 def find_references(target: str, code: str = "", max_results: int = 50) -> str:
     """Find the instructions that refer to an address: 32-bit absolute operands
-    (e.g. mov eax,[target], push offset target) and near call/jmp/jcc to it.
+    (e.g. mov eax,[target], push offset target), in 16-bit code [ofs] operands
+    and immediates equal to its offset (mov ax,ofs / push ofs: near pointers),
+    and near call/jmp/jcc to it.
     Use it to find every place that uses a variable, or every caller of a
     function. code: the address of some code in the program to search (default:
     the code around target if it is code, else the code at CS:EIP); the search
@@ -2144,8 +2191,19 @@ def find_references(target: str, code: str = "", max_results: int = 50) -> str:
     where = _resolve(code, regs).linear if code else regs["eip"]
     lo, hi, bits = _code_region(regs, where)
     data = _region_bytes(lo, hi)
-    refs = codeanalysis.references(data, lo, bits, tloc.linear, max_results)
-    head = "References to %s (linear %08X) in %08X-%08X (%d-bit code):" % (target, tloc.linear, lo, hi, bits)
+    off16 = None
+    if bits == 16:
+        # 16-bit code refers to data by its offset in the segment: the one
+        # given (SEG:OFF), else DS's.
+        seg_base = tloc.base if tloc.base is not None else dos.seg_cache(regs, "ds")["base"]
+        if 0 <= tloc.linear - seg_base <= 0xFFFF:
+            off16 = tloc.linear - seg_base
+    refs = codeanalysis.references(data, lo, bits, tloc.linear, max_results, off16)
+    head = "References to %s (linear %08X%s) in %08X-%08X (%d-bit code):" % (
+        target, tloc.linear, ", offset %04X" % off16 if off16 is not None else "", lo, hi, bits)
+    if off16 is not None and refs:
+        head += ("\n(\"offset value\" = an immediate equal to the offset: usually a near pointer being "
+                 "passed, e.g. mov ax,ofs / push ofs, but it can be a constant that happens to match)")
     if not refs:
         return head + "\nNone found (data reached through registers or tables isn't visible to this search)."
     targets = codeanalysis.call_targets(data, lo, bits)
@@ -2177,23 +2235,29 @@ def _parse_hits(raw, size):
 
 
 def _logpoint_memory(spec, regs):
-    """(reg, disp) for the stub: "esi+2C", "ds:si", "bx-4" (DS-relative), or a
-    linear address / symbol (reg 8)."""
+    """(reg, disp) for the stub: "esi+2C", "ds:si", "bx-4" (DS-relative),
+    "ebp-8", "ss:esi+4" (SS-relative: reg | 10h), or a linear address / symbol
+    (reg 8)."""
     t = spec.strip().lower().replace(" ", "")
-    if t.startswith("ds:"):
-        t = t[3:]
+    seg = None
+    if t[:3] in ("ds:", "ss:"):
+        seg, t = t[:2], t[3:]
     m = re.fullmatch(r"\[?(e?[abcd]x|e?[sd]i|e?[bs]p)(?:([+-])(?:0x)?([0-9a-f]+)h?)?\]?", t)
     if m:
         reg = m.group(1) if m.group(1).startswith("e") else dos.REG16[m.group(1)]
         disp = int(m.group(3), 16) if m.group(3) else 0
-        return _HIT_REGS.index(reg), (-disp if m.group(2) == "-" else disp) & 0xFFFFFFFF
+        # As the CPU does: [ebp+x] and [esp+x] are in SS, the rest in DS.
+        if seg is None:
+            seg = "ss" if reg in ("ebp", "esp") else "ds"
+        return _HIT_REGS.index(reg) | (0x10 if seg == "ss" else 0), (-disp if m.group(2) == "-" else disp) & 0xFFFFFFFF
     if re.match(r"[a-z]s:", t):
-        raise ValueError("memory= can be relative to DS only (e.g. \"esi+2C\"), or an address")
+        raise ValueError("memory= can be relative to DS or SS (e.g. \"esi+2C\", \"ss:ebp-8\"), or an address")
     return 8, _resolve(spec, regs).linear
 
 
 def _looks_like_return(c, ret_lin, target, bits):
-    """Whether ret_lin follows a call (direct to target, or indirect)."""
+    """Whether ret_lin follows a call (direct to target, any direct call if
+    target is None, or indirect)."""
     if not 7 <= ret_lin < 0xFFFFFFF0:
         return False
     try:
@@ -2205,11 +2269,34 @@ def _looks_like_return(c, ret_lin, target, bits):
     n = 5 if bits == 32 else 3
     if b[7 - n] == 0xE8:
         rel = int.from_bytes(b[8 - n:], "little", signed=True)
+        if target is None:
+            return True
         if bits == 32:
             return (ret_lin + rel) & 0xFFFFFFFF == target
         return (ret_lin + rel - target) & 0xFFFF == 0  # same code segment: offsets agree mod 64K
     # Indirect: FF /2 (call r/m) with a 0-, 1-, 4- or 2-byte operand after the ModRM byte.
     return any(b[7 - k] == 0xFF and (b[8 - k] >> 3) & 7 == 2 for k in (2, 3, 6, 4))
+
+
+def _call_before(c, ret_lin, w):
+    """Linear address of the call instruction that ret_lin returns after."""
+    b = c.read_memory(ret_lin - 7, 7)
+    n = 5 if w == 4 else 3
+    if len(b) == 7 and b[7 - n] == 0xE8:
+        return ret_lin - n
+    for k in (2, 3, 4, 6):
+        if len(b) == 7 and b[7 - k] == 0xFF and (b[8 - k] >> 3) & 7 == 2:
+            return ret_lin - k
+    return ret_lin
+
+
+def _looks_like_far_return(c, ret_lin):
+    """Whether ret_lin follows a far call (9A ptr16:16, or FF /3)."""
+    try:
+        b = c.read_memory(ret_lin - 5, 5)
+    except GdbError:
+        return False
+    return len(b) == 5 and (b[0] == 0x9A or any(b[5 - k] == 0xFF and (b[6 - k] >> 3) & 7 == 3 for k in (2, 3, 4)))
 
 
 @tool
@@ -2220,7 +2307,9 @@ def log_hits(address: str, seconds: float = 10.0, max_hits: int = 200, registers
     when `address` is a function entry, and optionally the dword at `memory`:
     an address or symbol, or relative to DS like "esi+2C" or "ds:si") while
     the program runs at full speed, for `seconds` of real time or until
-    `max_hits`. Times are emulated seconds since the first hit."""
+    `max_hits`, or until the program exits (it then stays stopped at its exit
+    call). Shows the first and last hits and the values seen. Times are
+    emulated seconds since the first hit."""
     c = client()
     regs = _regs()
     loc = _resolve(address, regs)
@@ -2235,6 +2324,12 @@ def log_hits(address: str, seconds: float = 10.0, max_hits: int = 200, registers
     start = st["next"]
     t_end = time.time() + max(0.1, seconds)
     was_running = c.running
+    # Stop with the program: catch its exit (INT 21h AH=4Ch) while logging.
+    saved = c.int_status()
+    exit_catch = not any(v == 0x21 and ah in (None, 0x4C) for v, ah, _, _ in saved["catches"])
+    if exit_catch:
+        c.catch_int(0x21, 0x4C, None, "call")
+    exited = False
     try:
         if not c.running:
             c.resume()
@@ -2243,13 +2338,18 @@ def log_hits(address: str, seconds: float = 10.0, max_hits: int = 200, registers
             st = c.logpoints()
             if st["next"] - start >= max_hits:
                 break
-            if not c.running:  # stopped for something else (breakpoint, watchpoint)
+            if not c.running:  # stopped: the program's exit, or a breakpoint or watchpoint
                 break
         stopped = None if c.running else c.last_stop
+        if stopped is not None and stopped.reason == "catch" and getattr(stopped, "int_vector", None) == 0x21 \
+                and exit_catch:
+            exited, stopped = True, None
         if c.running and not was_running:
             c.pause()
     finally:
         st = c.logpoints("- %x" % loc.linear)
+        if exit_catch:
+            _restore_catches(c, saved)
     total = next((h for a, _, _, h in st["points"] if a == loc.linear), None)
     hits = [h for h in _parse_hits(c.hit_log(start), st["record"]) if h["addr"] == loc.linear][:max_hits]
     lost = max(0, st["first"] - start)
@@ -2301,11 +2401,38 @@ def log_hits(address: str, seconds: float = 10.0, max_hits: int = 200, registers
             vals.append("[%s]=%s" % (memory, "%08X" % h["mem"] if h["mem"] is not None else "?"))
         out.append("%.4fs  %s%s" % ((h["tsc"] - t0) / hz, " ".join(vals),
                                     ("  ret %08X%s" % (a, _sym(a))) if entry and a is not None else ""))
-    lines += out[:60]
+    # The values seen, per register / memory dword: few distinct ones are
+    # listed with counts (a counter, a flag, a handful of callers...).
+    fields = [n.upper() for n in names] + (["[%s]" % memory] if mem else [])
+    for f in fields:
+        vals = collections.Counter()
+        for h in hits:
+            if f.startswith("["):
+                vals[h["mem"]] += 1
+            else:
+                try:
+                    vals[dos.reg_value(f.lower(), h["regs"])] += 1
+                except (KeyError, ValueError):
+                    pass
+        if not vals or len(hits) < 2:
+            continue
+        if len(vals) <= 8:
+            lines.append("%s: %s" % (f, ", ".join("%s x%d" % ("?" if v is None else "%X" % v, n)
+                                                  for v, n in vals.most_common())))
+        else:
+            known = [v for v in vals if v is not None]
+            lines.append("%s: %d different values, %X..%X" % (f, len(vals), min(known), max(known)) if known
+                         else "%s: unreadable" % f)
+    # The first and the last hits: how it starts and how it ends.
     if len(out) > 60:
-        lines.append("... %d more hits (%d shown)" % (len(out) - 60, 60))
+        lines += out[:20] + ["... %d hits not shown ..." % (len(out) - 60)] + out[-40:]
+    else:
+        lines += out
     if total is not None and total > len(hits) + lost:
         lines.append("(%d hits in all while the logpoint was set)" % total)
+    if exited:
+        lines += ["", "The program exited (INT 21h AH=4Ch); stopped at its exit call, so its memory can "
+                  "still be read. resume lets DOS finish."]
     if stopped is not None:
         lines += ["", "Stopped for another reason:", _state_report(stopped)]
     return "\n".join(lines)

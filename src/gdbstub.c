@@ -466,7 +466,7 @@ typedef struct {
 
 typedef struct {
     uint32_t addr;
-    int      mem_reg; /* -1 none, 0-7 EAX EBX ECX EDX ESI EDI EBP ESP (DS-relative), 8 linear */
+    int      mem_reg; /* -1 none, 0-7 EAX EBX ECX EDX ESI EDI EBP ESP (DS-relative), 8 linear, 10h-17h the same SS-relative */
     uint32_t mem_disp;
     uint32_t hits;
 } gdbstub_logpoint_t;
@@ -1546,7 +1546,8 @@ e00:
                     }
                 } else if (!strcmp(p, "lp")) {
                     /* Logpoints: "lp ADDR [REG DISP]" adds one (REG 0-7 EAX EBX ECX EDX ESI EDI
-                       EBP ESP for a dword at DS:REG+DISP, 8 for the linear DISP), "lp - ADDR"
+                       EBP ESP for a dword at DS:REG+DISP, 10h-17h for SS:REG+DISP, 8 for the
+                       linear DISP), "lp - ADDR"
                        removes one, "lp off" removes all; always shows the state. */
                     if ((p = strtok_r(NULL, " ", &strtok_save))) {
                         uint32_t addr, reg = (uint32_t) -1, disp = 0;
@@ -1566,7 +1567,7 @@ e00:
                             if (!gdbstub_parse_hex(p, &addr))
                                 goto e22;
                             if ((p = strtok_r(NULL, " ", &strtok_save))) {
-                                if (!gdbstub_parse_hex(p, &reg) || (reg > 8) || !(p = strtok_r(NULL, " ", &strtok_save)) || !gdbstub_parse_hex(p, &disp))
+                                if (!gdbstub_parse_hex(p, &reg) || ((reg > 8) && ((reg < 0x10) || (reg > 0x17))) || !(p = strtok_r(NULL, " ", &strtok_save)) || !gdbstub_parse_hex(p, &disp))
                                     goto e22;
                             }
                             for (i = 0; (i < logpoint_count) && (logpoints[i].addr != addr); i++)
@@ -2703,7 +2704,7 @@ gdbstub_logpoint_hit(gdbstub_logpoint_t *lp)
     if (gdbstub_peek(ss + sp, (uint8_t *) rec->stack, sizeof(rec->stack)) == sizeof(rec->stack))
         rec->flags |= 1;
     if (lp->mem_reg >= 0) {
-        uint32_t lin = (lp->mem_reg == 8) ? lp->mem_disp : (ds + regs[lp->mem_reg] + lp->mem_disp);
+        uint32_t lin = (lp->mem_reg == 8) ? lp->mem_disp : (((lp->mem_reg >= 16) ? ss : ds) + regs[lp->mem_reg & 7] + lp->mem_disp);
         if (gdbstub_peek(lin, (uint8_t *) &rec->mem, 4) == 4)
             rec->flags |= 2;
     }

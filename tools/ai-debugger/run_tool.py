@@ -56,7 +56,10 @@ def coerce(fn, kwargs):
     out = {}
     aliases = {"count": ("entries", "length", "limit"), "length": ("count", "entries"), "entries": ("count",),
                "name": ("query", "address", "map_path"), "path": ("save_path", "map_path"),
-               "data": ("hex_bytes",), "bytes": ("hex_bytes",), "addr": ("address",), "timeout": ("timeout_seconds",)}
+               "data": ("hex_bytes",), "bytes": ("hex_bytes",), "hex": ("hex_bytes", "pattern"),
+               "addr": ("address",), "timeout": ("timeout_seconds",), "address": ("target", "map_path"),
+               "target": ("address",), "register": ("name",), "reg": ("name",), "text": ("pattern",),
+               "map": ("map_path",), "file": ("map_path", "path"), "seconds": ("timeout_seconds",)}
     for k, v in list(kwargs.items()):
         if k not in sig.parameters:
             alt = next((a for a in aliases.get(k, ()) if a in sig.parameters and a not in kwargs), None)
@@ -105,7 +108,8 @@ async def call(tool_name, kwargs, image_dir):
         else:
             print(server.INSTRUCTIONS)
             for name in names:
-                print("%-24s %s" % (name, (tools[name].description or "").strip().split("\n")[0]))
+                params = ", ".join(inspect.signature(getattr(server, name)).parameters)
+                print("%s(%s)\n    %s" % (name, params, (tools[name].description or "").strip().split("\n")[0]))
             print("\nrun_tool.py help TOOL shows a tool's parameters and full description.")
         return
     if tool_name not in names:
