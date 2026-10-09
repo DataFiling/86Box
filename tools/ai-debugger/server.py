@@ -1291,11 +1291,101 @@ def _stub_tsc(c):
         return 0
 
 
+def _attach_watcom(c, regs):
+    """For a 32-bit Open Watcom program already running (no
+    wait_for_program_start): find its entry point by Open Watcom's startup
+    signature (EB xx "WATCOM") in memory and its code by following calls
+    from there, keeping the copy the CPU is running (CS:EIP, or return
+    addresses on its stack, inside it). If the CPU is elsewhere (in DOS or
+    the extender), it runs to the next 32-bit protected-mode instruction
+    first; it is left stopped there if it was paused. Saves and returns a
+    start record like wait_for_program_start's, or {} if none is found."""
+    snap = memscan.take(c, [(0, 0x10000000)])
+    cands = []
+    for run_lo, run in snap.runs:
+        for m in re.finditer(b"WATCOM", run):
+            i = m.start() - 2
+            if i < 0 or run[i] != 0xEB or not 6 <= run[i + 1] < 0x80:
+                continue
+            entry = run_lo + i
+            lo = max(run_lo, entry - 0x100000)
+            data = run[lo - run_lo:min(len(run), entry - run_lo + 0x400000)]
+            span = libsigs.reachable_span(data, lo, 32, set(codeanalysis.call_targets(data, lo, 32)), entry)
+            if span is not None:
+                cands.append((entry, span))
+    if not cands:
+        return {}
+
+    def running_copy(regs):
+        """(entry, span) of the copy CS:EIP or the stack is in, else None."""
+        if dos.segmented(regs) or dos.code_bits(regs) != 32:
+            return None
+        stack = []
+        try:
+            ss = dos.seg_cache(regs, "ss")["base"]
+            raw = c.read_memory((ss + regs["esp"]) & 0xFFFFFFFF, 0x400)
+            stack = [struct.unpack_from("<I", raw, i)[0] for i in range(0, len(raw) - 3, 4)]
+        except (GdbError, ValueError):
+            pass
+        scored = [((lo <= regs["eip"] < hi, sum(1 for v in stack if lo <= v < hi)), e, (lo, hi))
+                  for e, (lo, hi) in cands]
+        best = max(scored, key=lambda x: x[0])
+        return None if best[0] == (False, 0) else best[1:]
+
+    found = running_copy(regs)
+    if found is None:
+        was_running = c.running
+        skips = _v86_monitor_segments(c)
+        try:
+            for _ in range(6):  # pass over 32-bit code of the extender (CauseWay) or a V86 monitor
+                c.set_exec_ranges([], pm32=True, skip=skips)
+                if not c.running:
+                    c.resume()
+                stop = c.wait_stop(timeout=5)
+                if stop is None:
+                    c.pause()
+                    break
+                regs = _regs()
+                found = running_copy(regs)
+                if found is not None:
+                    break
+                skips.append((regs["cs"], dos.seg_cache(regs, "cs")["base"]))
+        finally:
+            c.set_exec_ranges([])
+        if was_running and not c.running:
+            c.resume()
+    if found is None:
+        return {}
+    entry, span = found
+    start = {"kind": "protected", "path": "(running program, found in memory)", "entry": entry,
+             "blocks": [(span[0] & ~0xFFF, span[1])], "tsc": _stub_tsc(c), "attached": True}
+    _save_start(c, start)
+    return start
+
+
+def _start_mark(c, start):
+    """Bytes that stay put while the started program is in memory: its entry
+    code (protected mode) or the start of its PSP (real mode)."""
+    at = start.get("entry") if start.get("kind") == "protected" else start.get("psp", 0) * 16
+    try:
+        return _peek_bytes(at, 16) if at else None
+    except (GdbError, OSError):
+        return None
+
+
+def _save_start(c, start):
+    start["mark"] = _start_mark(c, start)
+    memscan.save(_state_dir(), "last-start", start)
+
+
 def _last_start(c):
     """The last program start this bridge saw, or {} if the machine has been
-    reset or restarted since (its time counter went backwards)."""
+    reset or restarted since (its time counter went backwards, or the
+    program's memory no longer holds what it did)."""
     start = memscan.load(_state_dir(), "last-start") or {}
     if start.get("tsc") and _stub_tsc(c) < start["tsc"]:
+        return {}
+    if start.get("mark") is not None and _start_mark(c, start) != start["mark"]:
         return {}
     return start
 
@@ -1653,9 +1743,8 @@ def wait_for_program_start(name: str = "", command: str = "", timeout_seconds: f
             p = dosinfo.program_at(progs, regs["eip"])
             lines = ["Program %s started: stopped at its first instruction." % path]
             if p:
-                memscan.save(_state_dir(), "last-start", {"kind": "real", "path": path, "psp": p.psp,
-                                                          "load": p.load_segment, "cs": regs["cs"],
-                                                          "tsc": _stub_tsc(c)})
+                _save_start(c, {"kind": "real", "path": path, "psp": p.psp, "load": p.load_segment,
+                                "cs": regs["cs"], "tsc": _stub_tsc(c)})
                 lines.append("PSP %04X; load segment %04X (PSP+10h; add it to segment values from the "
                              "program's linker map or EXE header). DS=ES=PSP at entry." % (p.psp, p.load_segment))
                 lines.append("Memory: " + ", ".join("%04X-%04X %s" % (b.start, b.end, b.kind) for b in p.blocks))
@@ -1744,8 +1833,8 @@ def wait_for_program_start(name: str = "", command: str = "", timeout_seconds: f
                                       skip=monitor + [(sel, base) for sel, _, base in skipped])
         regs = _regs()
         inside = [b for b in blocks if b[0] <= regs["eip"] < b[1]]
-        memscan.save(_state_dir(), "last-start", {"kind": "protected", "path": opened, "entry": regs["eip"],
-                                                  "blocks": blocks, "tsc": _stub_tsc(c)})
+        _save_start(c, {"kind": "protected", "path": opened, "entry": regs["eip"],
+                        "blocks": blocks, "tsc": _stub_tsc(c)})
         lines = ["32-bit code of %s started: stopped at its first instruction (linear %08X)." % (opened, regs["eip"]),
                  "DPMI memory allocated after the extender opened it: " +
                  (", ".join("%08X-%08X%s" % (a, b, " (code entered here)" if (a, b) in inside else "") for a, b in blocks)
@@ -2132,7 +2221,9 @@ def load_symbols(map_path: str, bases: str = "auto") -> str:
     bases: where the program is loaded. "auto" works it out: for a 16-bit
     program from the last wait_for_program_start or DOS's running program
     (load segment = PSP+10h); for a 32-bit DOS/4GW-style program from the last
-    wait_for_program_start(protected_mode=true) (entry point and DPMI blocks).
+    wait_for_program_start(protected_mode=true) (entry point and DPMI blocks),
+    or for an Open Watcom program already running, from its entry point found
+    in memory (pause it while its own code runs).
     Or give them: "load=240E" (16-bit) or "1=174000,2=1FF000" (object bases)."""
     d = _state_dir()
     if map_path.strip().lower() in ("", "none", "off"):
@@ -2154,10 +2245,15 @@ def load_symbols(map_path: str, bases: str = "auto") -> str:
         started = os.path.splitext(start.get("path", "").replace("/", "\\").rsplit("\\", 1)[-1])[0].upper()
         if m.wide:
             if start.get("kind") != "protected":
-                return ("Can't place a 32-bit map automatically: run wait_for_program_start(name, "
-                        "protected_mode=true) first, or give bases like \"1=174000,2=1FF000\".")
+                start = _attach_watcom(client(), _regs())
+            if start.get("kind") != "protected":
+                return ("Can't place a 32-bit map automatically: no program start was seen and no running "
+                        "Open Watcom program was found in memory (pause it while its own code runs). Run "
+                        "wait_for_program_start(name, protected_mode=true) first, or give bases like "
+                        "\"1=174000,2=1FF000\".")
             b = symbols.guess_object_bases(m, start["entry"], start["blocks"])
-            how = "from the entry point and DPMI blocks of %s" % start["path"]
+            how = ("from the entry point of the running program (Open Watcom's signature in memory)"
+                   if start.get("attached") else "from the entry point and DPMI blocks of %s" % start["path"])
             # The other objects (data): where the code's absolute addresses
             # say they are, which beats matching block sizes (some extenders
             # put headers in front of an object, or place objects themselves).
@@ -2173,7 +2269,7 @@ def load_symbols(map_path: str, bases: str = "auto") -> str:
                         if b.get(obj) != found[0]:
                             how += "; object %d placed by the code's references to it (%d agree)" % (obj, found[1])
                         b[obj] = found[0]
-            if image and started and image != started:
+            if image and started and image != started and not start.get("attached"):
                 how += " (NOTE: the map is for %s)" % image
                 other_program = (image, started)
             missing = sorted(set(m.object_sizes()) - set(b))
@@ -2246,6 +2342,8 @@ def _program_code(c, regs):
     last (32-bit: its extender block holding the entry point; 16-bit: its DOS
     memory, one 64 KiB frame per code segment)."""
     start = _last_start(c)
+    if not start:
+        start = _attach_watcom(c, regs)
     if start.get("kind") == "protected":
         entry = start["entry"]
         block = next(((a, b) for a, b in start["blocks"] if a <= entry < b), None)
@@ -2329,7 +2427,8 @@ def identify_functions(libraries: str = "", max_listed: int = 80) -> str:
     the PATH). Use the libraries of the compiler version that built the
     program: another version's code differs, and fewer functions are found.
     Run it after wait_for_program_start (protected_mode=true for 32-bit
-    programs)."""
+    programs), or with an Open Watcom program already running, paused while
+    its own code runs (its entry point is then found in memory)."""
     c = client()
     regs = _regs()
     if _symbols() is not None and not memscan.load(_state_dir(), "symbols").get("identified"):
@@ -2389,6 +2488,13 @@ def identify_functions(libraries: str = "", max_listed: int = 80) -> str:
     if bits == 32:
         blocks = [b for b in _last_start(c).get("blocks", []) if any(b[0] <= a < b[1] for a in data_syms)
                   and not any(b[0] == lo for lo, _, _ in frames)]
+        if not blocks and data_syms:
+            # No extender block known (a program found running): the data the
+            # library uses, just above the code.
+            code_hi = max(hi for _, hi, _ in frames)
+            near = [a for a in data_syms if code_hi <= a < code_hi + 0x400000]
+            if near:
+                blocks = [(min(near) & ~0xFFF, (max(near) + 0x1000) & ~0xFFF)]
         data_syms = {a: n for a, n in data_syms.items() if any(lo <= a < hi for lo, hi in blocks)}
     d = _state_dir()
     path = os.path.join(d, "identified.map")

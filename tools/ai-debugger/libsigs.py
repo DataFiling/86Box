@@ -543,9 +543,25 @@ def reachable_span(data, base, bits, starts, entry, frame=0):
     between the function `starts` (each runs to the next start): the
     program's code, as opposed to other copies of it in the same memory
     (an extender's load buffer). None if too little is reached to tell."""
-    starts = sorted(a for a in set(starts) | {entry} if base <= a < base + len(data))
-    index = {a: i for i, a in enumerate(starts)}
     size = 4 if bits == 32 else 2
+    starts = sorted(a for a in set(starts) | {entry} if base <= a < base + len(data))
+    # The startup code jumps rather than calls (to __CMain): what the entry
+    # function branches to counts as a function start too.
+    nxt = next((a for a in starts if a > entry), base + len(data))
+    chunk = data[entry - base:min(nxt, entry + 0x1000) - base]
+    for i, b in enumerate(chunk):
+        if b in (0xE8, 0xE9) and i + 1 + size <= len(chunk):
+            t = _call_target(data, entry - base + i + 1, base, bits, frame)
+            if base <= t < base + len(data):
+                starts.append(t)
+    starts = sorted(set(starts))
+    index = {a: i for i, a in enumerate(starts)}
+    md = None
+    try:
+        import capstone
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32 if bits == 32 else capstone.CS_MODE_16)
+    except ImportError:
+        pass
     seen, todo = set(), [entry]
     while todo:
         a = todo.pop()
@@ -554,16 +570,34 @@ def reachable_span(data, base, bits, starts, entry, frame=0):
         seen.add(a)
         end = starts[index[a] + 1] if index[a] + 1 < len(starts) else base + len(data)
         chunk = data[a - base:min(end, a + 0x10000) - base]
-        for i, b in enumerate(chunk):
-            if b in (0xE8, 0xE9) and i + 1 + size <= len(chunk):
-                t = _call_target(data, a - base + i + 1, base, bits, frame)
+        if md is not None:
+            # Calls and jumps the instructions really make (a byte scan also
+            # finds E8/E9 inside other instructions, and in data).
+            sites = [insn.address - a + 1 for insn in md.disasm(chunk, a) if insn.bytes[0] in (0xE8, 0xE9)]
+        else:
+            sites = [i + 1 for i, b in enumerate(chunk) if b in (0xE8, 0xE9)]
+        for i in sites:
+            if i + size <= len(chunk):
+                t = _call_target(data, a - base + i, base, bits, frame)
                 if t in index and t not in seen:
                     todo.append(t)
     if len(seen) < 5:
         return None
-    last = max(seen)
+    reached = sorted(seen)
+    lo_i, hi_i = 0, len(reached) - 1
+    if md is None:
+        # Without decoding, stray E8/E9 bytes in data can reach far away: keep
+        # the run of reached functions around the entry point with no gap
+        # over 64 KiB.
+        i = reached.index(entry)
+        lo_i, hi_i = i, i
+        while lo_i > 0 and reached[lo_i] - reached[lo_i - 1] <= 0x10000:
+            lo_i -= 1
+        while hi_i + 1 < len(reached) and reached[hi_i + 1] - reached[hi_i] <= 0x10000:
+            hi_i += 1
+    last = reached[hi_i]
     end = starts[index[last] + 1] if index[last] + 1 < len(starts) else base + len(data)
-    return min(seen), end
+    return reached[lo_i], min(end, last + 0x10000)
 
 
 def default_libraries(bits=None):

@@ -1002,6 +1002,54 @@ What it found wrong, now fixed:
   call" now reads "Already stopped (it stopped after the last resume,
   before this wait)".
 
+### 23. Attaching to a program that is already running
+
+`load_symbols` and `identify_functions` needed a `wait_for_program_start`
+stop for 32-bit programs, but a bug often shows mid-game. For an Open
+Watcom program they now find the program themselves (`_attach_watcom`):
+
+1. Search all RAM for the startup signature (`EB xx "WATCOM"`).
+2. For each hit, follow the calls and jumps the code really makes from
+   there, decoded with capstone, to get the code's extent.
+3. Keep the copy the CPU is running: CS:EIP or return addresses on the
+   stack inside it. When the CPU is elsewhere (in DOS, or the extender), let
+   it run to the next 32-bit protected-mode instruction, passing over V86
+   monitor and extender code, as `wait_for_program_start` does. A CPU that
+   was paused stays stopped there, in the program's code.
+
+The result is saved like a program start (`"attached": True`).
+
+Fixes on the way:
+
+- **Decoding the calls.** Following raw `E8`/`E9` bytes from FastDoom's
+  entry wandered through the game data (the WAD loaded above the code)
+  and gave a "code" range of 144000-57F7FF. Requiring a target to be
+  called twice stopped after 5 functions. Following only decoded call and
+  jump instructions reached exactly the code object, 1710D4-1D4AC0 (the
+  map has 171000-1D7000). Without capstone, a 64 KiB-gap rule limits the
+  byte scan.
+- **Jumped-to functions.** The startup code jumps to `__CMain` rather than
+  calling it, so targets of the entry function's jumps count as function
+  starts.
+- **Stale starts.** A program start saved before the emulator was
+  restarted was still used: the reset check compares the CPU's time
+  counter, which had already passed the old value. Starts now also keep
+  the first bytes at the entry point (or the PSP) and are dropped when
+  memory no longer holds them.
+- **Runtime variables.** With no extender block known, they are kept
+  when they lie just above the code.
+
+Results, with the program running and no program start seen:
+
+| Program | Paused in | Result |
+|---|---|---|
+| FastDoom (DOS/4GW), `load_symbols` | DOS (real mode) | ran to `read_+E4`; map placed at 171000/1D7000, 617 of 625 calls fit |
+| FastDoom, `identify_functions` | the game | 342 right, 1 alias wrong (as with a program start: 343) |
+| PMGAME built with CauseWay (paging, CPL 3) | the game | 106 library functions named, `main_` found, the game loop's `kbhit_`/`getch_`/`rand_` named |
+
+COINS, CAVES and SBTEST (also under JemmEx) give the same results as
+before. `smoke_test.py` passes on all five VMs.
+
 ## Test results
 
 Test machines, built with `-DQT=OFF -DSDL2=ON -DGDBSTUB=ON` and run headless
