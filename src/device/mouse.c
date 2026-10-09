@@ -48,6 +48,7 @@ int mouse_type = 0;
 int tablet_type = 0;
 int mouse_input_mode;
 int mouse_timed = 1;
+int mouse_injected = 0;
 int mouse_tablet_in_proximity = 0;
 int tablet_tool_type          = 1; /* 0 = Puck/Cursor, 1 = Pen */
 
@@ -545,6 +546,14 @@ void
 mouse_set_z(int z)
 {
     ATOMIC_ADD(mouse_z, z);
+}
+
+/* Turn the wheel by whole clicks, positive away from the user, in the
+   units the host frontends use. */
+void
+mouse_wheel_clicks(int clicks)
+{
+    mouse_set_z(clicks * WHEEL_DELTA);
 }
 
 void

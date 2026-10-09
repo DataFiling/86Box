@@ -39,6 +39,10 @@ opINT(uint32_t fetchdat)
     UN_USED(cycles_old);
     uint8_t temp = getbytef();
 
+#ifdef USE_GDBSTUB
+    gdbstub_int(temp);
+#endif
+
     if ((cr0 & 1) && (cpu_state.eflags & VM_FLAG) && (IOPL != 3)) {
         if (cr4 & CR4_VME) {
             uint16_t t;

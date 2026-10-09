@@ -1499,6 +1499,7 @@ check_interrupts(void)
             do_cycle();
             /* ACK to PIC */
             temp = bus_pic_ack();
+            gdbstub_irq(temp);
             in_lock    = 0;
             clear_lock = 0;
             /* Here is where temp should be filled, but we cheat. */
@@ -3623,6 +3624,9 @@ execute_instruction(void)
             /* read_operand8() */
             temp = biu_pfq_fetchb();
             do_cycle_i();
+#ifdef USE_GDBSTUB
+            gdbstub_int(temp);
+#endif
             sw_int(temp);
             jump = 1;
             break;

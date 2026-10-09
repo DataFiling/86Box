@@ -369,7 +369,7 @@ readmembf(uint32_t a)
     uint8_t ret;
 
     a   = cs + (a & 0xffff);
-    ret = read_mem_b(a);
+    ret = read_mem_fetch_b(a);
 
     return ret;
 }
@@ -401,7 +401,7 @@ readmemwf(uint16_t a)
 {
     uint16_t ret;
 
-    ret = read_mem_w(cs + (a & 0xffff));
+    ret = read_mem_fetch_w(cs + (a & 0xffff));
 
     return ret;
 }
@@ -1265,6 +1265,7 @@ check_interrupts(int nec_hlt)
             wait_cycs(1, 0);
             /* ACK to PIC */
             temp = pic_irq_ack();
+            gdbstub_irq(temp);
             wait_cycs(4, 1);
             wait_cycs(1, 0);
             in_lock    = 0;
@@ -2856,7 +2857,11 @@ execx86_instruction(void)
                 break;
             case 0xcd:             /* INT */
                 wait_cycs(1, 0);
-                interrupt(pfq_fetchb());
+                temp = pfq_fetchb();
+#ifdef USE_GDBSTUB
+                gdbstub_int(temp);
+#endif
+                interrupt(temp);
                 break;
             case 0xce:             /* INTO */
                 wait_cycs(3, 0);

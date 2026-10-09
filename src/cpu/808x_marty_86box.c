@@ -651,9 +651,9 @@ biu_do_bus_transfer(m808x_cpu_t *icpu)
         case BUS_CODE:
             if (b->transfer_size == XFER_WORD) {
                 const uint32_t even = addr & ~1u;
-                b->data_bus = read_mem_w(even);
+                b->data_bus = read_mem_fetch_w(even);
             } else
-                b->data_bus = read_mem_b(addr);
+                b->data_bus = read_mem_fetch_b(addr);
             break;
 
         case BUS_MEMR:
@@ -4983,7 +4983,7 @@ static void m808x_rebuild_saved_prefetch_queue(void)
     queue_flush(&m808x_cpu.biu.queue);
     for (unsigned i = 0; i < len; ++i) {
         const uint32_t addr = linear_address(m808x_cpu.segs[SEG_CS], (uint16_t)(arch_ip + i));
-        (void)queue_push(&m808x_cpu.biu.queue, read_mem_b(addr));
+        (void)queue_push(&m808x_cpu.biu.queue, read_mem_fetch_b(addr));
     }
     m808x_cpu.pc = m808x_restore_pfq_ip;
 }
