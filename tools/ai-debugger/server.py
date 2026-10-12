@@ -5,6 +5,7 @@ Run:  python3 server.py           (stdio transport)
 Env:  BOX86_GDB_HOST (default 127.0.0.1), BOX86_GDB_PORT (default 12345)
 """
 
+import bisect
 import collections
 import functools
 import json
@@ -500,13 +501,19 @@ def set_register(name: str, value: str) -> str:
 
 @tool
 def read_memory(address: str, length: int = 128, format: str = "hex") -> str:
-    """Read guest memory. format: hex (dump), words, dwords, text (CP437)."""
+    """Read guest memory. format: hex (dump), words, dwords, text (CP437, up
+    to the first NUL), or raw_text (all `length` bytes as CP437)."""
     c = client()
     loc = _resolve(address, _regs())
     linear = loc.linear
     length = max(1, min(length, 65536))
     data = c.read_memory(linear, length)
     if format == "text":
+        text = data.split(b"\0", 1)[0]
+        return text.decode("cp437", errors="replace") + (
+            "\n(ends with a NUL at %08X; format=raw_text shows what follows)" % (linear + len(text))
+            if len(text) < len(data) else "")
+    if format == "raw_text":
         return data.decode("cp437", errors="replace")
     if format in ("words", "dwords"):
         w = 2 if format == "words" else 4
@@ -799,6 +806,40 @@ def _apply_condition(c, kind, linear, condition, regs, watch=None):
     return " Stops only when %s.%s" % (condition.strip(), "".join(" Note: %s." % n for n in notes))
 
 
+def _mid_instruction_note(regs, linear):
+    """A warning when linear looks like the middle of an instruction, decoding
+    from the function it is in (a symbol, or the nearest call target before
+    it); '' when it is on an instruction boundary or that can't be told."""
+    try:
+        lo, hi, bits = _code_region(regs, linear)
+        table = _symcache["table"] if dos.namer else None
+        start = None
+        if table is not None:
+            i = bisect.bisect_right(table.code_keys, linear) - 1
+            if i >= 0 and linear - table.code_keys[i] < 0x4000:
+                start = table.code_keys[i]
+        if start is None:
+            base = max(lo, linear - 0x4000)
+            data = _region_bytes(base, min(hi, linear + 16))
+            start = codeanalysis.function_start(codeanalysis.call_targets(data, base, bits, base, linear + 1), linear)
+        if start is None or start == linear:
+            return ""
+        data = _region_bytes(start, linear + 16)
+        pos = 0
+        for insn in codeanalysis.instructions(data, start, bits):
+            if start + pos >= linear:
+                break
+            pos += insn.size
+        else:
+            return ""
+        if start + pos == linear:
+            return ""
+        return (" WARNING: this looks like the middle of an instruction (decoding from %08X, one ends at %08X), "
+                "so the breakpoint may never be hit; check with disassemble." % (start, start + pos))
+    except (GdbError, ValueError, KeyError):
+        return ""
+
+
 def _set_point(c, kind, linear, length):
     """Set a point; one of the same kind already at `linear` is replaced (to
     change its length or condition)."""
@@ -833,7 +874,7 @@ def set_breakpoint(address: str, condition: str = "") -> str:
     loc = _resolve(address, regs)
     linear = loc.linear
     _set_point(c, BP_HARDWARE, linear, 1)
-    note = _apply_condition(c, BP_HARDWARE, linear, condition, regs)
+    note = _apply_condition(c, BP_HARDWARE, linear, condition, regs) + _mid_instruction_note(regs, linear)
     _points[(BP_HARDWARE, linear)] = {"kind": BP_HARDWARE, "address": linear, "length": 1, "expr": address,
                                       "condition": condition.strip()}
     _save_points()
@@ -1502,6 +1543,9 @@ def read_interrupt_log(filter: str = "", since: int = 0, limit: int = 60, collap
       after this read".
     collapse: list identical calls (same caller, arguments and result) once with
       a count, which keeps game loops readable; false shows every call in order.
+    "via hook" marks a call made by a program that hooked the vector, passing it
+    on to the previous handler (pushf; call far [old]) rather than with INT;
+    its address is where that call returns, inside the program's handler.
     show_polling: include keyboard-status polls with no key, idle calls, etc.
     show_reflections: include the copies DOS extenders make when they pass a
       protected-mode call down to real-mode DOS (shown nested under the original)."""

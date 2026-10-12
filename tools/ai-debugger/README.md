@@ -237,6 +237,12 @@ All of these only take effect in builds with `-DGDBSTUB=ON`.
   when they take a hardware interrupt (`386.c`, `386_dynarec.c`, `808x.c`, `vx0.c`),
   and each logged hit carries the last interrupt and the address it
   interrupted.
+- **Calls chained through a hooked vector are logged.** A program that hooks
+  INT 21h (or another logged vector) and passes calls on with `pushf; call
+  far [old]` reaches the old handler without an `INT`. The stub remembers
+  the logged vectors' real-mode handlers and logs such an entry as a call
+  ("via hook"). It checks that the stack holds a FLAGS word and a return
+  address right after a far call.
 - **EFLAGS reads and writes respect lazy flags.** The interpreter computes
   arithmetic flags lazily; the stub read stale ZF/CF/... after e.g. a `cmp`,
   and a written EFLAGS could be overridden by the pending lazy state.

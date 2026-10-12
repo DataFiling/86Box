@@ -23,7 +23,10 @@ class IntCall:
         self.vector = u[1] & 0xFF
         self.mode = (u[1] >> 8) & 0xFF
         self.depth = (u[1] >> 16) & 0xFF
-        self.status = u[1] >> 24
+        self.status = (u[1] >> 24) & 0x7F
+        # Made by a program that hooked the vector, calling the old handler
+        # directly (pushf; call far): cs:eip is where that call returns.
+        self.chained = bool(u[1] >> 31)
         self.tsc = u[2] | (u[3] << 32)
         self.cs, self.eip, self.ss, self.esp, self.ds, self.es = u[4:10]
         self.inp = dict(zip(REGS_IN, u[10:16]))
@@ -73,9 +76,10 @@ class IntCall:
         return v if self.wide else v & 0xFFFF
 
     def caller(self):
+        via = " via hook" if self.chained else ""
         if self.mode in (0, 1):
-            return "%04X:%04X" % (self.cs, self.eip)
-        return "%04X:%08X" % (self.cs, self.eip) if self.wide else "%04X:%04X" % (self.cs, self.eip)
+            return "%04X:%04X%s" % (self.cs, self.eip, via)
+        return ("%04X:%08X" % (self.cs, self.eip) if self.wide else "%04X:%04X" % (self.cs, self.eip)) + via
 
     def caller_linear(self):
         return (self.cs_base + self.eip) & 0xFFFFFFFF
@@ -653,8 +657,8 @@ def is_reflection(parent, cur):
     the protected-mode call parent down to real mode: the same call again in
     the other mode (DOS/4GW), or the extender's own DPMI "simulate real-mode
     interrupt" for it (DOS/32A). A split transfer makes several."""
-    if parent is None:
-        return False
+    if parent is None or getattr(cur, "chained", False):
+        return False  # a program's hook calling the old handler is a call of its own
     if cur.vector == parent.vector:
         return cur.mode != parent.mode and function_number(cur) == function_number(parent)
     if cur.vector == 0x31 and cur.r("ax") == 0x0300 and cur.r("bl") == parent.vector and parent.mode >= 2:

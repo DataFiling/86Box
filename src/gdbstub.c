@@ -424,6 +424,7 @@ enum {
     INTLOG_RETURNED,
     INTLOG_NO_RETURN /* an outer call returned first (exit, longjmp...) */
 };
+#define INTLOG_CHAINED 0x80 /* status flag: entered through a far call to the handler, not INT */
 
 typedef struct {
     uint32_t seq;
@@ -454,6 +455,16 @@ static uint32_t             intlog_next = 1;
 static uint32_t             intlog_first = 1;
 static uint8_t              intlog_vectors[256];
 static int                  intlog_on;
+
+/* Real-mode handlers of the logged vectors (from the IVT when logging starts
+   and at each logged INT). Entering one other than through its INT is a call
+   chained to it by a program that hooked the vector (pushf; call far [old]):
+   logged too, flagged INTLOG_CHAINED. */
+#define CHAIN_MAX 32
+static uint32_t             chain_addr[CHAIN_MAX];
+static uint8_t              chain_vector[CHAIN_MAX];
+static int                  chain_count;
+static uint32_t             int_entry_pc; /* where the last INT or hardware interrupt enters (real/V86 mode), until reached */
 static gdbstub_intpending_t int_pending[INTLOG_PENDING];
 static int                  int_pending_count;
 static uint8_t              int_ret_hash[INTLOG_HASH];
@@ -525,6 +536,8 @@ static int watch_mode_filter;
 static void gdbstub_int_clear(void);
 static int  gdbstub_peek(uint32_t addr, uint8_t *buf, int len);
 static int  gdbstub_cond_value(gdbstub_breakpoint_t *bp, uint32_t *v);
+static uint32_t gdbstub_ivt_handler(uint8_t vector);
+static void     gdbstub_chain_add(uint8_t vector, uint32_t addr);
 
 static void (*cpu_exec_shadow)(int32_t cycs);
 
@@ -1543,8 +1556,13 @@ e00:
                                 goto e22;
                         }
                         memcpy(intlog_vectors, vectors, sizeof(intlog_vectors));
-                        for (intlog_on = 0, i = 0; i < 256; i++)
+                        chain_count  = 0;
+                        int_entry_pc = 0;
+                        for (intlog_on = 0, i = 0; i < 256; i++) {
                             intlog_on |= intlog_vectors[i];
+                            if (intlog_vectors[i])
+                                gdbstub_chain_add(i, gdbstub_ivt_handler(i));
+                        }
                     }
                     client->packet_pos = sprintf(client->packet, "vectors");
                     for (i = 0; i < 256; i++) {
@@ -2560,7 +2578,7 @@ gdbstub_int_pop(int index, int status)
     if (intlog && (status == INTLOG_NO_RETURN)) {
         gdbstub_intlog_t *rec = &intlog[pending->seq & (INTLOG_SIZE - 1)];
         if (rec->seq == pending->seq)
-            rec->info = (rec->info & 0x00ffffff) | (INTLOG_NO_RETURN << 24);
+            rec->info = (rec->info & 0x80ffffff) | (INTLOG_NO_RETURN << 24);
     }
     memmove(pending, pending + 1, (int_pending_count - index - 1) * sizeof(gdbstub_intpending_t));
     int_pending_count--;
@@ -2598,22 +2616,43 @@ gdbstub_int_clear(void)
     memset(int_ret_hash, 0, sizeof(int_ret_hash));
 }
 
-/* Called by INT n instructions with EIP already past the instruction: logs
-   the call and remembers where it returns to. */
-void
-gdbstub_int(uint8_t vector)
+/* The real-mode handler of a vector (IVT), or 0. */
+static uint32_t
+gdbstub_ivt_handler(uint8_t vector)
 {
-    if (!intlog_on && !catch_count)
+    uint8_t ivt[4];
+    int     old_in_gdbstub = in_gdbstub;
+    int     ok;
+
+    in_gdbstub = 1;
+    ok         = gdbstub_peek(vector * 4, ivt, 4) == 4;
+    in_gdbstub = old_in_gdbstub;
+    return ok ? ((ivt[2] | (ivt[3] << 8)) << 4) + (ivt[0] | (ivt[1] << 8)) : 0;
+}
+
+static void
+gdbstub_chain_add(uint8_t vector, uint32_t addr)
+{
+    if (!addr)
         return;
+    for (int i = 0; i < chain_count; i++) {
+        if (chain_addr[i] == addr)
+            return;
+    }
+    if (chain_count < CHAIN_MAX) {
+        chain_addr[chain_count]   = addr;
+        chain_vector[chain_count] = vector;
+        chain_count++;
+    }
+}
 
-    uint32_t ip = use32 ? cpu_state.pc : (cpu_state.pc & 0xffff);
-
-    int track = intlog_vectors[vector] || (catch_count && gdbstub_catch_match(vector, AH, AL, 2));
-    if (!track)
-        return;
-
+/* Log a call (unless the vector isn't logged) and remember where it returns
+   to: (sel_cs, base_cs, ip) is shown as its caller, ret and sp are where and
+   with which stack pointer it returns. */
+static void
+gdbstub_int_call(uint8_t vector, uint32_t sel_cs, uint32_t base_cs, uint32_t ip, uint32_t ret, uint32_t sp, int chained)
+{
     int      mode = !(msw & 1) ? 0 : ((cpu_state.eflags & VM_FLAG) ? 1 : (use32 ? 3 : 2));
-    uint32_t sp   = stack32 ? ESP : SP;
     uint32_t seq  = 0;
 
     if (intlog_vectors[vector] && intlog) {
@@ -2630,12 +2669,12 @@ gdbstub_int(uint8_t vector)
         memset(rec, 0, sizeof(gdbstub_intlog_t));
         rec->seq     = seq;
         rec->count   = 1;
-        rec->info    = vector | (mode << 8) | (MIN(int_pending_count, 255) << 16) | (INTLOG_PENDING_CALL << 24);
+        rec->info    = vector | (mode << 8) | (MIN(int_pending_count, 255) << 16) | ((INTLOG_PENDING_CALL | (chained ? INTLOG_CHAINED : 0)) << 24);
         rec->tsc_lo  = (uint32_t) tsc;
         rec->tsc_hi  = (uint32_t) (tsc >> 32);
-        rec->sel_cs  = CS;
-        rec->base_cs = cs;
-        rec->eip     = (ip - 2) & (use32 ? 0xffffffff : 0xffff);
+        rec->sel_cs  = sel_cs;
+        rec->base_cs = base_cs;
+        rec->eip     = ip;
         rec->sel_ss  = SS;
         rec->esp     = sp;
         rec->sel_ds  = DS;
@@ -2658,7 +2697,7 @@ gdbstub_int(uint8_t vector)
     if (int_pending_count == INTLOG_PENDING)
         gdbstub_int_pop(0, INTLOG_NO_RETURN);
     gdbstub_intpending_t *pending = &int_pending[int_pending_count++];
-    pending->ret                  = cs + ip;
+    pending->ret                  = ret;
     pending->stack_sel            = SS;
     pending->stack_ptr            = sp;
     pending->seq                  = seq;
@@ -2666,6 +2705,106 @@ gdbstub_int(uint8_t vector)
     pending->ah                   = AH;
     pending->al                   = AL;
     int_ret_hash[INT_RET_HASH(pending->ret)]++;
+}
+
+/* Called by INT n instructions with EIP already past the instruction: logs
+   the call and remembers where it returns to. */
+void
+gdbstub_int(uint8_t vector)
+{
+    if (!intlog_on && !catch_count)
+        return;
+
+    uint32_t ip = use32 ? cpu_state.pc : (cpu_state.pc & 0xffff);
+
+    int track = intlog_vectors[vector] || (catch_count && gdbstub_catch_match(vector, AH, AL, 2));
+    if (!track)
+        return;
+
+    /* In real and V86 mode, where it enters: its handler, which a program
+       hooking the vector may later call directly. */
+    if (!(msw & 1) || (cpu_state.eflags & VM_FLAG)) {
+        int_entry_pc = gdbstub_ivt_handler(vector);
+        if (intlog_vectors[vector])
+            gdbstub_chain_add(vector, int_entry_pc);
+    }
+    gdbstub_int_call(vector, CS, cs, (ip - 2) & (use32 ? 0xffffffff : 0xffff), cs + ip, stack32 ? ESP : SP, 0);
+}
+
+/* Entering a logged vector's real-mode handler: through its INT (or a
+   hardware interrupt) that is expected; otherwise a program that hooked the
+   vector calls the old handler (pushf; call far [old]): log that call, with
+   the far return address on the stack as its caller. A jump to the old
+   handler continues the call already pending and isn't logged again. */
+/* Whether a far call instruction (9A, or FF /3 with 16-bit addressing) ends
+   right at linear ret. */
+static int
+gdbstub_far_call_before(uint32_t ret)
+{
+    uint8_t code[7];
+    int     old_in_gdbstub = in_gdbstub;
+    int     ok;
+
+    in_gdbstub = 1;
+    ok         = gdbstub_peek(ret - 7, code, 7) == 7;
+    in_gdbstub = old_in_gdbstub;
+    if (!ok)
+        return 0;
+    if (code[2] == 0x9a) /* call far ptr16:16 */
+        return 1;
+    for (int len = 2; len <= 5; len++) {
+        uint8_t *insn = &code[7 - len];
+        uint8_t  modrm;
+        int      disp;
+        if (insn[0] != 0xff)
+            continue;
+        modrm = insn[1];
+        if (((modrm >> 3) & 7) != 3 || (modrm >> 6) == 3)
+            continue;
+        disp = ((modrm >> 6) == 1) ? 1 : (((modrm >> 6) == 2) || (((modrm >> 6) == 0) && ((modrm & 7) == 6))) ? 2
+                                                                                                              : 0;
+        if (2 + disp == len) /* a segment prefix may come before it */
+            return 1;
+    }
+    return 0;
+}
+
+static void
+gdbstub_chain_check(uint32_t addr)
+{
+    uint8_t  frame[6];
+    uint32_t sp, ret, ret_sp;
+    int      old_in_gdbstub = in_gdbstub;
+    int      i;
+
+    for (i = 0; (i < chain_count) && (chain_addr[i] != addr); i++)
+        ;
+    if (i == chain_count)
+        return;
+    if (int_entry_pc == addr) {
+        int_entry_pc = 0;
+        return;
+    }
+    if ((msw & 1) && !(cpu_state.eflags & VM_FLAG))
+        return;
+    sp         = SP;
+    in_gdbstub = 1;
+    if (gdbstub_peek(ss + sp, frame, 6) != 6) {
+        in_gdbstub = old_in_gdbstub;
+        return;
+    }
+    in_gdbstub = old_in_gdbstub;
+    /* pushf; call far: IP, CS, then FLAGS (bit 1 always set, bits 3, 5, 15 clear),
+       and a far call instruction right before the return address. */
+    if (!(frame[4] & 0x02) || (frame[4] & 0x28) || (frame[5] & 0x80))
+        return;
+    ret = (((frame[2] | (frame[3] << 8)) << 4) + (frame[0] | (frame[1] << 8)));
+    if (!gdbstub_far_call_before(ret))
+        return;
+    ret_sp = (sp + 6) & 0xffff; /* the handler's IRET pops IP, CS and FLAGS */
+    if (int_pending_count && (int_pending[int_pending_count - 1].ret == ret) && (int_pending[int_pending_count - 1].stack_ptr == ret_sp))
+        return;
+    gdbstub_int_call(chain_vector[i], frame[2] | (frame[3] << 8), (frame[2] | (frame[3] << 8)) << 4, frame[0] | (frame[1] << 8), ret, ret_sp, 1);
 }
 
 /* Check whether the instruction about to run is where a pending INT call
@@ -2691,7 +2830,7 @@ gdbstub_int_returned(uint32_t addr, int may_stop)
             gdbstub_intlog_t *rec = &intlog[pending->seq & (INTLOG_SIZE - 1)];
             if (rec->seq == pending->seq) {
                 int old_in_gdbstub = in_gdbstub;
-                rec->info          = (rec->info & 0x00ffffff) | (INTLOG_RETURNED << 24);
+                rec->info          = (rec->info & 0x80ffffff) | (INTLOG_RETURNED << 24);
                 rec->out[0]        = EAX;
                 rec->out[1]        = EBX;
                 rec->out[2]        = ECX;
@@ -2809,6 +2948,8 @@ gdbstub_irq(uint8_t vector)
 {
     int mode = !(msw & 1) ? 0 : ((cpu_state.eflags & VM_FLAG) ? 1 : (use32 ? 3 : 2));
 
+    if (chain_count && (mode < 2))
+        int_entry_pc = gdbstub_ivt_handler(vector);
     last_irq.info = vector | (mode << 8) | (1 << 16);
     last_irq.lin  = gdbstub_pc();
     last_irq.sel  = CS;
@@ -2915,11 +3056,14 @@ gdbstub_instruction(void)
     /* A stop raised during the instruction (watchpoint, INT 3) wins over the checks below. */
     int stopped = (gdbstub_step >= GDBSTUB_BREAK_SW);
 
-    if (int_pending_count | xrange_count | xrange_pm32 | catch_count) {
+    if (int_pending_count | xrange_count | xrange_pm32 | catch_count | chain_count) {
         uint32_t addr = gdbstub_pc();
         /* INT calls returning; their results are logged even when stopping for something else. */
         if (int_pending_count && int_ret_hash[INT_RET_HASH(addr)] && gdbstub_int_returned(addr, !stopped))
             return 1;
+        /* A program chaining to a logged vector's old handler. */
+        if (chain_count && intlog_on)
+            gdbstub_chain_check(addr);
         if (!stopped) {
             /* Execution entering a watched range. */
             if (xrange_pm32 && (msw & 1) && !(cpu_state.eflags & VM_FLAG) && use32 && !gdbstub_pm32_skipped(CS, addr)) {

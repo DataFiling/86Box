@@ -1093,6 +1093,83 @@ With the map, a breakpoint on `_Quit` and `read_stack` show at once why the
 game stops: `_CheckForEpisodes` found no data files. `identify_functions`
 doesn't apply: Borland's runtime libraries aren't available here.
 
+### 25. Second Reality: a real failure, debugged blind
+
+Future Crew's Second Reality (1993) has been public domain since 2013;
+github.com/mtuomi/SecondReality holds its source and data. `MAIN/2NDFIX.EXE`
+(31,644 bytes, "SECOND.EXE ... (beta)") is the loader, and
+`MAIN/DATA/REALITY.FC` is the same size as the release's (992,188 bytes).
+With those two in `C:\SR` on the Pentium + JemmEx machine it printed
+"FATAL: Could not load or execute internal subfile". Nobody knew why, so a
+fresh agent got the machine, the symptom and the tools, without the
+repository.
+
+**The agent's diagnosis** (correct; 25 minutes, about 75 tool runs):
+
+- The loader looks for its parts archive appended to SECOND.EXE. It reads
+  the last dword, XORs it with 12345678h to get the archive's offset, and
+  expects the word 0FC0h there.
+- This SECOND.EXE has no appended data: its MZ image size is its file size,
+  and the last dword is 0.
+- REALITY.FC is the music: the S3M module "UnreaL ][".
+- The loader's INT 21h hook then tries loose files: `START.EXE` (error 2)
+  and `DATA\START.EXE` (error 3).
+
+It concluded that the original 1.45 MB SECOND.EXE is needed. I checked the
+MZ size and the zero trailer. The agent couldn't know that the repository
+has the parts as loose files in `MAIN/DATA`. Copied to `C:\SR\DATA` (79
+files, the number of entries in the loader's directory, text files
+included), the demo runs: the setup screen (Sound Blaster Pro, with JemmEx's
+EMS), the Dolby Surround intro, the starfield landscape, the checkerboard
+and the interference circles.
+
+**Tool gaps the agent hit, and the fixes:**
+
+- **Chained DOS calls were invisible.** The loader passes calls to DOS from
+  its hook with `pushf; call far cs:[old]`, so the log showed `open
+  START.EXE -> (never returned)` and none of the failing opens. The stub now
+  logs entries into a logged vector's previous real-mode handlers that
+  don't come from an `INT` or a hardware interrupt, flagged "via hook" (a
+  status bit; the record layout is unchanged).
+  - The handlers are those in the IVT when logging starts, plus each one
+    seen at a logged INT.
+  - The return address on the stack must follow a far call instruction (`9A`
+    or `FF /3`), and the word above it must look like FLAGS. Without these
+    checks, entries to INT 10h's handler that weren't calls were logged too,
+    and stayed pending.
+  - A jump to the old handler continues the pending call, so it isn't
+    logged again.
+
+  The log now reads: open "START.EXE" -> error 02h (file not found) (from
+  125D:0C5E via hook), then open "DATA\START.EXE" -> error 03h (path not
+  found) (from 125D:0CE4 via hook). Those are the addresses the agent found
+  by stepping.
+- **`watch_program` said "WAITING for keyboard input" (at the shell
+  prompt).** FreeCOM reloads its code at 125D, where SECOND.EXE had run, so
+  the shell's address range swallowed the program's calls, its exit
+  included. Calls nested inside the shell's exec are now the program's
+  whatever their address, and calls before the exec (the shell finding the
+  program) are left out. The outcome is now: EXITED WITH ERROR ... it
+  printed "FATAL: Could not load or execute internal subfile", with the two
+  failed opens listed. "Allocate FFFFh paragraphs" (how programs ask how
+  much memory is free) no longer counts as a failure.
+- **A breakpoint set inside an instruction silently never fired.**
+  `set_breakpoint` now decodes from the function's start (a symbol, or the
+  nearest call target) and warns when the address isn't on an instruction
+  boundary.
+- **`read_memory format=text` showed the bytes after a string's NUL.** It
+  stops there now, and says so; `raw_text` shows everything.
+
+Not done:
+
+- A tool to read guest files: the agent reused the program's own
+  open/seek/read code to look at file headers.
+- Filtering `find_references` hits that only decode from the middle of an
+  instruction.
+
+`testdata/add_real_titles.sh` puts Second Reality (and Wolfenstein 3D) on
+an image. `smoke_test.py` passes on all five VMs.
+
 ## Test results
 
 Test machines, built with `-DQT=OFF -DSDL2=ON -DGDBSTUB=ON` and run headless

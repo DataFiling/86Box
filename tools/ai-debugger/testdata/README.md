@@ -141,3 +141,20 @@ mode through VCPI, as on most 386+ DOS setups of the time. Use it in place of
 `boot.img` (the Pentium test machine with it is `vms/pentium.cfg` with
 `fdd_01_fn = boot-emm.img`). All four extenders (DOS/4GW, DOS/32A, PMODE/W,
 CauseWay) and FastDoom were tested on it.
+
+## Two more real titles: Second Reality and Wolfenstein 3D
+
+`add_real_titles.sh IMAGE [OFFSET]` copies them from their public GitHub
+releases onto a disk image (with mtools, while the emulator is stopped):
+
+- **Second Reality** (Future Crew, 1993, public domain) goes in `C:\SR`.
+  The release has the loader (`MAIN/2NDFIX.EXE`, run as `SECOND.EXE`)
+  without the parts archive the original had appended to it. The loader
+  also accepts its 79 parts as loose files in `SR\DATA`, so they go there.
+  It runs on the Pentium + JemmEx machine (EMS for Sound Blaster music):
+  the setup screen, then the demo's parts.
+- **Wolfenstein 3D**: id Software's own Borland-built `WOLF3D.EXE` goes in
+  `C:\WOLF3D`; its map, `WOLF3D.MAP`, is for `load_symbols`. The game data
+  isn't released, so it stops at its data-file check.
+
+DEVLOG sections 24 and 25 describe what debugging them found.

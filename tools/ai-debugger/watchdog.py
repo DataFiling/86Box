@@ -97,11 +97,32 @@ def error_lines(text):
 
 def own_calls(calls, shell_ranges):
     """Leave out the shell's own calls (made from its code), except the exec
-    that started the program."""
+    that started the program. Calls nested inside that exec are the program's
+    whatever their address: a shell such as FreeCOM reloads its code where the
+    program ran once it has exited, so addresses alone can mislead."""
     def from_shell(c):
         a = c.caller_linear()
         return any(lo <= a < hi for lo, hi in shell_ranges)
-    return [c for c in calls if not from_shell(c) or (c.vector == 0x21 and c.r("ah") == 0x4B)]
+    calls = sorted(calls, key=lambda c: c.seq)
+    # Before the shell's exec, the calls are the shell finding the program
+    # (PATH search, .COM before .EXE).
+    first = next((i for i, c in enumerate(calls) if c.vector == 0x21 and c.r("ah") == 0x4B and c.r("al") == 0
+                  and from_shell(c)), None)
+    if first is not None:
+        calls = calls[first:]
+    out, inside = [], None  # inside: depth of the shell's exec while it runs
+    for c in calls:
+        if inside is not None and c.depth > inside:
+            out.append(c)
+            continue
+        inside = None
+        if c.vector == 0x21 and c.r("ah") == 0x4B:
+            out.append(c)
+            if c.r("al") == 0 and from_shell(c):
+                inside = c.depth
+        elif not from_shell(c):
+            out.append(c)
+    return out
 
 
 def innermost_pending(calls):
@@ -154,6 +175,8 @@ def failed_calls(calls):
     for c in drop_reflections(calls):
         if not c.returned or not c.cf():
             continue
+        if c.vector == 0x21 and c.r("ah") == 0x48 and c.r("bx") == 0xFFFF:
+            continue  # "allocate 1 MB": the usual way to ask how much memory is free
         if c.vector == 0x21 and dosinfo._dos_uses_cf(c.r("ah")) and c.r("ah") not in (0x4E, 0x4F, 0x71):
             out.append(c)
         elif c.vector == 0x31:
@@ -170,7 +193,8 @@ def summarize(calls, limit=12):
         key |= c.vector == 0x10 and c.r("ah") == 0x00 or (c.vector == 0x10 and c.r("ax") == 0x4F02)
         key |= c.vector == 0x31 and c.r("ax") in (0x0501, 0x0100)
         key |= c.returned and c.cf() and ((c.vector == 0x21 and dosinfo._dos_uses_cf(c.r("ah")) and
-                                           c.r("ah") not in (0x4E, 0x4F, 0x71)) or c.vector == 0x31)
+                                           c.r("ah") not in (0x4E, 0x4F, 0x71) and
+                                           not (c.r("ah") == 0x48 and c.r("bx") == 0xFFFF)) or c.vector == 0x31)
         if key:
             k = (c.vector, what, result, c.caller_linear())
             if k in seen:  # the same event again: count it on its first line
