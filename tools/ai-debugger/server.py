@@ -645,11 +645,16 @@ def read_stack(entries: int = 16) -> str:
         sp, w, mask, fmt = regs["esp"], 4, 0xFFFFFFFF, "%04X:%08X  %08X"
     c = client()
     lines = []
+    far_segment = False  # this entry is the CS of a far return address found above
     for i in range(entries):
         off = (sp + i * w) & mask  # a 16-bit stack wraps within its 64 KiB segment
         data = c.read_memory((ss["base"] + off) & 0xFFFFFFFF, w)
         val = int.from_bytes(data, "little") if len(data) == w else None
         line = fmt % (ss["sel"], off, val) if val is not None else (fmt[:-6] % (ss["sel"], off)) + "  ??"
+        if far_segment:
+            far_segment = False
+            lines.append(line + "  (its segment)")
+            continue
         if val is not None and val >= 0x100:
             # A 16-bit stack's values are near offsets in CS; 32-bit ones are flat.
             lin = (dos.seg_cache(regs, "cs")["base"] + val) if w == 2 else val
@@ -667,7 +672,22 @@ def read_stack(entries: int = 16) -> str:
                 if len(nxt) == 2:
                     far = int.from_bytes(nxt, "little") * 16 + val
                     if dos.segmented(regs) and 0x500 <= far < 0x100000 and _looks_like_far_return(c, far):
-                        line += "  <- far return address %04X:%04X" % (int.from_bytes(nxt, "little"), val)
+                        # Named in its own segment, not the current CS.
+                        fn = table.code_name_at(far) if table else None
+                        line = (fmt % (ss["sel"], off, val) + (" (%s)" % fn if fn else "") +
+                                "  <- far return address %04X:%04X" % (int.from_bytes(nxt, "little"), val))
+                        far_segment = True
+                    else:
+                        # A pointer to a string (e.g. a message argument): near in DS, or
+                        # far (offset, then segment).
+                        near = dos._string_at((dos.seg_cache(regs, "ds")["base"] + val) & 0xFFFFFFFF)
+                        text = "" if near or not 0x500 <= far < 0x100000 else dos._string_at(far)
+                        if near:
+                            line = fmt % (ss["sel"], off, val) + "  <- DS:%04X ->%s" % (val, near)
+                        elif text:
+                            line = fmt % (ss["sel"], off, val) + "  <- far pointer %04X:%04X ->%s" % (
+                                int.from_bytes(nxt, "little"), val, text)
+                            far_segment = True
         lines.append(line)
     return "\n".join(lines)
 
@@ -2211,7 +2231,8 @@ def _parse_bases(text):
 
 @tool
 def load_symbols(map_path: str, bases: str = "auto") -> str:
-    """Load an Open Watcom linker map (.map) so that addresses can be given as
+    """Load a linker map (.map: Open Watcom's, or Borland TLINK's for Borland
+    C/Turbo C/Pascal-era programs such as Wolfenstein 3D) so that addresses can be given as
     names (set_breakpoint address="TS_ServiceSchedule_", read_memory
     address="_HeadTask") and are shown as name+offset in disassembly, the CPU
     state and stack dumps. map_path is a file on the machine running the bridge;

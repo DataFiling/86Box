@@ -391,7 +391,15 @@ def _symbol_comment(mnemonic, op_str, seg_base, bits, data_base):
         return ""
     word = mnemonic.split()[-1]
     if word in ("lcall", "ljmp") or ("ptr [" not in op_str and "[" not in op_str and ":" in op_str and word in _BRANCH):
-        return ""  # far branch: SEG:OFF, not an offset in this segment
+        # Far branch to SEG:OFF: in real mode SEG*16+OFF; a protected-mode
+        # selector can't be read that way, so only a symbol starting exactly
+        # there counts.
+        far = re.fullmatch(r"\s*(0x[0-9a-f]+|\d+)\s*[,:]\s*(0x[0-9a-f]+|\d+)\s*", op_str)
+        if far and namer is not None and bits == 16:
+            n = namer(((int(far.group(1), 0) << 4) + int(far.group(2), 0)) & 0xFFFFF, 0)
+            if n:
+                return "  ; " + n
+        return ""
     branch = word in _BRANCH or word.startswith("j")
     names = []
     for m in _HEX.finditer(op_str):

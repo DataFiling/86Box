@@ -25,6 +25,14 @@ def _module_name(text):
     return base.rsplit(".", 1)[0] if "." in base else base
 
 
+# Borland TLINK maps: a segment table of 20-bit offsets from the load segment,
+# then publics as SSSS:OOOO (by name, then again by value), no modules.
+_BC_SEG_HEAD = re.compile(r"^\s*Start\s+Stop\s+Length\s+Name\s+Class\s*$")
+_BC_SEG = re.compile(r"^\s*([0-9A-F]{5,6})H\s+([0-9A-F]{5,6})H\s+([0-9A-F]{5,6})H\s+(\S+)\s+(\S+)\s*$")
+_BC_SYM = re.compile(r"^\s*([0-9A-F]{4}):([0-9A-F]{4})\s+(idle\s+|Abs\s+)?(\S.*?)\s*$")
+_BC_ENTRY = re.compile(r"^Program entry point at\s+([0-9A-F]{4}):([0-9A-F]{4})")
+
+
 class MapFile:
     def __init__(self, path):
         self.path = path
@@ -34,38 +42,70 @@ class MapFile:
         self.image = ""
         self.wide = False   # 32-bit object:offset addresses
         self.com = False    # .COM program: offsets relative to the PSP
-        section, module = "", ""
+        self.linker = "Open Watcom"
         with open(path, encoding="latin-1") as f:
-            for line in f:
-                if line.strip().startswith("|") and line.strip().endswith("|"):
-                    section = line.strip(" |\n")
-                    continue
-                if line.startswith("Executable Image:"):
-                    self.image = line.split(":", 1)[1].strip()
-                if line.startswith("creating a DOS .COM"):
-                    self.com = True
-                m = _ENTRY.match(line)
-                if m:
-                    self.entry = (int(m.group(1), 16), int(m.group(2), 16))
-                    continue
-                if section == "Segments":
-                    m = _SEG.match(line)
-                    if m:
-                        self.segments.append((m.group(1), m.group(2), m.group(3), int(m.group(4), 16),
-                                              int(m.group(5), 16), int(m.group(6), 16)))
-                elif section == "Memory Map":
-                    m = _MODULE.match(line)
-                    if m:
-                        module = _module_name(m.group(2) or m.group(1))
-                        continue
-                    m = _SYM.match(line)
-                    if m:
-                        if len(m.group(2)) == 8:
-                            self.wide = True
-                        # C++ names keep their spaces: "int near Foo::bar( int )".
-                        self.symbols.append((int(m.group(1), 16), int(m.group(2), 16), m.group(4), module))
+            lines = f.read().splitlines()
+        if any(_BC_SEG_HEAD.match(line) for line in lines[:20]):
+            self._read_borland(lines)
+        else:
+            self._read_watcom(lines)
         if not self.symbols:
-            raise ValueError("%s: no symbols found (is it an Open Watcom map file?)" % path)
+            raise ValueError("%s: no symbols found (is it an Open Watcom or Borland map file?)" % path)
+
+    def _read_borland(self, lines):
+        self.linker = "Borland"
+        self.image = re.split(r"[\\/]", self.path)[-1].rsplit(".", 1)[0] + ".EXE"
+        section, seen = "", set()
+        for line in lines:
+            if "Publics by" in line:
+                section = "publics"
+                continue
+            m = _BC_ENTRY.match(line)
+            if m:
+                self.entry = (int(m.group(1), 16), int(m.group(2), 16))
+                continue
+            m = _BC_SEG.match(line)
+            if m and section == "":
+                start, length = int(m.group(1), 16), int(m.group(3), 16)
+                self.segments.append((m.group(4), m.group(5), "", start >> 4, start & 0xF, length))
+                continue
+            m = _BC_SYM.match(line)
+            if m and section == "publics" and not (m.group(3) or "").startswith("Abs"):
+                sym = (int(m.group(1), 16), int(m.group(2), 16), m.group(4), "")
+                if sym not in seen:
+                    seen.add(sym)
+                    self.symbols.append(sym)
+
+    def _read_watcom(self, lines):
+        section, module = "", ""
+        for line in lines:
+            if line.strip().startswith("|") and line.strip().endswith("|"):
+                section = line.strip(" |\n")
+                continue
+            if line.startswith("Executable Image:"):
+                self.image = line.split(":", 1)[1].strip()
+            if line.startswith("creating a DOS .COM"):
+                self.com = True
+            m = _ENTRY.match(line)
+            if m:
+                self.entry = (int(m.group(1), 16), int(m.group(2), 16))
+                continue
+            if section == "Segments":
+                m = _SEG.match(line)
+                if m:
+                    self.segments.append((m.group(1), m.group(2), m.group(3), int(m.group(4), 16),
+                                          int(m.group(5), 16), int(m.group(6), 16)))
+            elif section == "Memory Map":
+                m = _MODULE.match(line)
+                if m:
+                    module = _module_name(m.group(2) or m.group(1))
+                    continue
+                m = _SYM.match(line)
+                if m:
+                    if len(m.group(2)) == 8:
+                        self.wide = True
+                    # C++ names keep their spaces: "int near Foo::bar( int )".
+                    self.symbols.append((int(m.group(1), 16), int(m.group(2), 16), m.group(4), module))
 
     def object_sizes(self):
         """Size of each object (32-bit maps) from the segment table."""

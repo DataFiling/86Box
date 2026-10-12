@@ -1050,6 +1050,49 @@ Results, with the program running and no program start seen:
 COINS, CAVES and SBTEST (also under JemmEx) give the same results as
 before. `smoke_test.py` passes on all five VMs.
 
+### 24. Borland maps, and Wolfenstein 3D's own executable
+
+The archive and shareware sites are blocked here, but GitHub isn't. id
+Software's Wolfenstein 3D source release (github.com/id-Software/wolf3d)
+includes the `WOLF3D.EXE` id built with Borland C++ 3.0, and its TLINK map.
+The game data isn't included, so the game stops at its data-file check.
+That still makes it the first program here built by a commercial
+developer's compiler and linker.
+
+**Borland TLINK maps** (`symbols.MapFile`):
+
+- The segment table holds 20-bit offsets from the load segment (`19127H`);
+  a segment becomes frame `1912` offset `7`, as symbols use it.
+- Publics are `SSSS:OOOO [idle] name`, listed by name and again by value
+  (read once each); `Abs` constants are skipped.
+- `Program entry point at SSSS:OOOO`.
+- There are no module names.
+
+The Watcom reader is unchanged.
+
+**On the 486, from the floppy** (`wait_for_program_start` then
+`load_symbols`): 1,551 symbols in 74 segments (large model, many code
+segments). 168 of 231 call targets found in memory are functions in the
+map, so the map is from this build. Against the shell that was running
+before, the same map was refused (1 of 150).
+
+**Fixes found on the way:**
+
+- **Far calls weren't labelled.** Disassembly skipped `lcall SEG:OFF`. In
+  real mode that is SEG*16+OFF, so a symbol starting exactly there is shown
+  now: `lcall 0x2ab3, 0x3c30 ; _CheckForEpisodes`.
+- **`read_stack` mislabelled far return addresses.** It named
+  `2AB3:3CF7` with the offset taken in the current CS (`_DrawCtlScreen+FC`);
+  it is `_CheckForEpisodes+C7`. The segment word after it is now marked
+  "(its segment)" rather than named as code.
+- **Strings on the stack.** 16-bit stack entries that point to a string
+  (near in DS, or a far offset:segment pair) show it. `_Quit`'s argument
+  reads `<- DS:0A5B -> "NO WOLFENSTEIN 3-D DATA FILES to be found!"`.
+
+With the map, a breakpoint on `_Quit` and `read_stack` show at once why the
+game stops: `_CheckForEpisodes` found no data files. `identify_functions`
+doesn't apply: Borland's runtime libraries aren't available here.
+
 ## Test results
 
 Test machines, built with `-DQT=OFF -DSDL2=ON -DGDBSTUB=ON` and run headless
