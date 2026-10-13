@@ -6,11 +6,15 @@ It is `tools/ai-debugger/testdata/make_game_vm.sh`'s output, prebuilt so you
 don't need to build the DOS tools (Open Watcom, FreeDOS) yourself.
 
 ```sh
+mkdir -p ~/86box-vms
 git fetch origin vm-kit
-git show origin/vm-kit:game-vm.tar.xz | tar -xJ -C ~/86box-vms   # makes ~/86box-vms/game-vm
+git show origin/vm-kit:game-vm.tar.xz | tar -xJ --skip-old-files -C ~/86box-vms   # makes ~/86box-vms/game-vm
 ```
 
-SHA-256 of game-vm.tar.xz: 57dec3818bfecbc085a4b02afc5176efaa9aa01783b4ee8513a034da566bb471
+`--skip-old-files` keeps the files of a game-vm you already have, so the
+games on its disk survive unpacking the kit again.
+
+SHA-256 of game-vm.tar.xz: 40d997c98cbcf622512ca5c15cbd5dddad81cf9f7470837909f0fdca5d50ec04
 
 ## What's in game-vm/
 
@@ -18,7 +22,7 @@ SHA-256 of game-vm.tar.xz: 57dec3818bfecbc085a4b02afc5176efaa9aa01783b4ee8513a03
 |---|---|
 | `86box.cfg` | ASUS P/I-P55T2P4, Pentium MMX 200, 32 MB, VGA, PS/2 wheel mouse, Sound Blaster 16 at 220h IRQ 7 DMA 1/5 (DOSBox's settings, which GOG's DOS games are configured for), debugger port 12345 |
 | `boot.img` | FreeDOS boot floppy: kernel, FreeCOM, JemmEx (EMS/XMS), CuteMouse, BLASTER set; ends at `C:\>`. Also small test programs (TXTGAME, VGAGAME, DATAGAME, MOUSETST) |
-| `hd.img` | Empty 499 MB FAT16 hard disk, C:, for games; partition at byte 32256 (`gog_import.py ... --offset 32256`) |
+| `hd.img` | Empty 499 MB FAT16 hard disk, C:, for games; partition at byte 32256 (`gog_import.py` finds it by itself) |
 | `nvr/p55t2p4.nvr` | CMOS settings (floppy drive, IDE auto-detect), so the first boot needs no BIOS setup |
 
 Run it with an 86Box built with `-DGDBSTUB=ON`: `86Box -P ~/86box-vms/game-vm -R ~/86box-roms`.
