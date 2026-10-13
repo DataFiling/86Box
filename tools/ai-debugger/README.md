@@ -105,6 +105,29 @@ paused between commands (and keeps its breakpoints), while one left running
 keeps running. The bridge's modules (`gdb_rsp.py`, `dos.py`, `pcinput.py`)
 can also be imported directly from Python.
 
+## GOG games
+
+GOG's DOS games come wrapped in DOSBox. `gog_import.py` puts one on an
+86Box disk image (with mtools; stop the emulator first):
+
+```sh
+python3 tools/ai-debugger/gog_import.py setup_game.exe vm/hd.img --offset 32256   # an installer (needs innoextract)
+python3 tools/ai-debugger/gog_import.py "/path/to/GOG Games/Game" vm/hd.img --offset 32256   # or an installed game
+```
+
+- It follows the game's "Play" task (`goggame-*.info`) to its DOSBox
+  configs, and copies what DOSBox mounted as C: (the folder the game runs
+  in). GOG's DOSBox, installer files, manuals and CD images are left out.
+- It writes a batch file at C:\ that runs the game's own commands.
+- It reports what the VM needs to match DOSBox: a CD image to attach as a
+  drive, EMS, the Sound Blaster settings, memory and CPU speed.
+
+`--offset` is the FAT partition's byte offset in a hard disk image (32256
+for a partition at sector 63; 0 for a floppy). Downloading stays with you
+(gog.com, or GOG's own tools), so no GOG credentials reach the bridge.
+`testdata/test_gog_import.sh` tests it on two folders laid out as GOG
+installs games.
+
 ## Tools
 
 | Area | Tools |

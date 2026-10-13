@@ -1170,6 +1170,39 @@ Not done:
 `testdata/add_real_titles.sh` puts Second Reality (and Wolfenstein 3D) on
 an image. `smoke_test.py` passes on all five VMs.
 
+### 26. Importing GOG games
+
+`gog_import.py` takes a GOG installer, unpacked with innoextract (whose
+`--gog` mode is made for these), or an installed game folder. It:
+
+1. reads `goggame-*.info`'s primary play task: its DOSBox configs, and the
+   working directory DOSBox runs in (`DOSBOX`; mounts like `mount C ".."`
+   are relative to it, not to the configs);
+2. merges the configs and reads `[autoexec]`: the mounts (skipping GOG's
+   cloud-save overlay; `imgmount` CD images) and the commands, leaving out
+   DOSBox's own commands;
+3. copies the folder the game runs in (its `cd` from C:), or, for a game
+   run from C:'s root, all of C: into a folder of its own. GOG's DOSBox,
+   installer files, PDF manuals and mounted CD images stay out;
+4. writes `C:\<NAME>.BAT` with the game's commands, rooted correctly;
+5. reports what the VM needs: a CD image to attach, EMS, the Sound
+   Blaster port/IRQ/DMA, memory and cycles from the configs.
+
+Tested:
+
+- **Second Reality, laid out as GOG installs a DOS game.** Imported onto
+  the Pentium + JemmEx machine's disk, `C:\SECONDRE.BAT` ran the demo to
+  its setup screen.
+- **A root-level game with a CD image** (Wolfenstein 3D's EXE). The game
+  went to `C:\WOLFENST` without the CD image or the manual, and the CD
+  image was reported.
+- **A file that isn't an installer** is refused with innoextract's message.
+
+`testdata/test_gog_import.sh` repeats the two imports and checks the result.
+
+Not tested: a real GOG installer. GitHub release downloads (403) and gog.com
+are blocked here.
+
 ## Test results
 
 Test machines, built with `-DQT=OFF -DSDL2=ON -DGDBSTUB=ON` and run headless
