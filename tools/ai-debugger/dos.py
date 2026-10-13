@@ -533,14 +533,23 @@ def read_text_screen(client, include_attributes=False):
 
 def vga_text_base(client):
     """Base of text memory if the VGA graphics controller is in text mode,
-    else None. Reads GC register 6 (Miscellaneous) through 3CEh/3CFh."""
+    else None. Reads GC register 6 (Miscellaneous) through 3CEh/3CFh, with
+    the CPU paused: the guest must not run while the GC index is changed."""
     def inb(port):
         return int(client.monitor("ib 0x%x 1" % port).split()[1], 16)
 
-    index = inb(0x3CE)
-    client.monitor("ob 0x3ce 0x6")
-    misc = inb(0x3CF)
-    client.monitor("ob 0x3ce 0x%x" % index)
+    resume = False
+    if client.running:
+        stop = client.pause()
+        resume = stop is not None and stop.reason == "pause"  # else it stopped for a reason of its own
+    try:
+        index = inb(0x3CE)
+        client.monitor("ob 0x3ce 0x6")
+        misc = inb(0x3CF)
+        client.monitor("ob 0x3ce 0x%x" % index)
+    finally:
+        if resume:
+            client.resume()
     if misc & 1:  # graphics
         return None
     return {0: 0xA0000, 1: 0xA0000, 2: 0xB0000, 3: 0xB8000}[(misc >> 2) & 3]

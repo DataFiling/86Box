@@ -93,7 +93,10 @@ async def main():
                 if not cond:
                     failures.append(what)
 
-            await call("status")
+            out = await call("status")
+            if "Cannot reach" in out or "CPU is" not in out:
+                print("\nRESULT: FAIL (cannot reach 86Box: %s)" % out.strip().splitlines()[0])
+                return 1
             # Let the BIOS finish POST (the timer interrupt is only enabled late).
             for _ in range(10):
                 await call("run_for", seconds=3)
@@ -107,9 +110,12 @@ async def main():
             await call("clear_breakpoint", address="all")
 
             vec = await call("read_interrupt_vectors", first="8", count=1)
-            handler = re.search(r"-> ([0-9A-F]{4}:[0-9A-F]{4})", vec).group(1)
-            out = await call("run_until", address=handler, timeout_seconds=3)
-            expect("hit breakpoint" in out and handler in out, "breakpoint at INT 08h handler")
+            m = re.search(r"-> ([0-9A-F]{4}:[0-9A-F]{4})", vec)
+            expect(m is not None, "INT 08h vector")
+            if m:
+                handler = m.group(1)
+                out = await call("run_until", address=handler, timeout_seconds=3)
+                expect("hit breakpoint" in out and handler in out, "breakpoint at INT 08h handler")
 
             await call("step", count=3)
             await call("step_over")
@@ -138,4 +144,11 @@ async def main():
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    try:
+        sys.exit(asyncio.run(main()))
+    except Exception as e:  # e.g. the bridge itself failed to start (see its error above)
+        group = getattr(__import__("builtins"), "BaseExceptionGroup", ())  # Python 3.11+
+        while group and isinstance(e, group) and e.exceptions:
+            e = e.exceptions[0]
+        print("\nRESULT: FAIL (%s: %s)" % (type(e).__name__, e))
+        sys.exit(1)

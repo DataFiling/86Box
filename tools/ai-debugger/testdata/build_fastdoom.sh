@@ -13,7 +13,7 @@
 # (bind_dos32a.py does what its SB/SS tools would); PMODE/W and CauseWay come
 # with Open Watcom, and the game is relinked with their stub.
 #
-# Needs: git and curl access to GitHub, Open Watcom v2 (WATCOM), nasm, mtools.
+# Needs: git and curl access to GitHub, Open Watcom v2 (WATCOM), nasm, mtools, unzip.
 
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -54,10 +54,11 @@ pmodew|causeway)
 *) echo "FASTDOOM_EXTENDER is dos4gw, dos32a, pmodew or causeway"; exit 1 ;;
 esac
 
-if [ ! -f freedoom1.wad ]; then
-    curl -sSL -o freedoom.zip \
+if [ ! -s freedoom1.wad ]; then
+    curl -fsSL -o freedoom.zip \
         "https://github.com/freedoom/freedoom/releases/download/v$FREEDOOM_VERSION/freedoom-$FREEDOOM_VERSION.zip"
-    unzip -p freedoom.zip "freedoom-$FREEDOOM_VERSION/freedoom1.wad" > freedoom1.wad
+    unzip -p freedoom.zip "freedoom-$FREEDOOM_VERSION/freedoom1.wad" > freedoom1.wad.part
+    mv freedoom1.wad.part freedoom1.wad   # only a complete one: a failed run is retried
 fi
 
 # 64 MB disk (130 cylinders, 16 heads, 63 sectors), one FAT16 partition from

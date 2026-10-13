@@ -28,6 +28,7 @@
 #include <86box/device.h>
 #include <86box/keyboard.h>
 #include <86box/plat.h>
+#include <86box/thread.h>
 
 #include "cpu.h"
 
@@ -146,9 +147,16 @@ keyboard_toggle_override(void)
     override_capture ^= 1;
 }
 
+/* Keys come from the UI thread, and from a debugger injecting them on the
+   emulation thread: one at a time, as both update the same state and queues. */
+static mutex_t *input_mutex;
+
 void
 keyboard_init(void)
 {
+    if (!input_mutex) /* first called at startup, before those threads run */
+        input_mutex = thread_create_mutex();
+
     num_lock     = 0;
     caps_lock    = 0;
     scroll_lock  = 0;
@@ -298,11 +306,21 @@ key_process(uint16_t scan, int down)
 
 static void keyboard_input_common(int down, uint16_t scan, int injected);
 
+static void
+keyboard_input_serialized(int down, uint16_t scan, int injected)
+{
+    if (input_mutex)
+        thread_wait_mutex(input_mutex);
+    keyboard_input_common(down, scan, injected);
+    if (input_mutex)
+        thread_release_mutex(input_mutex);
+}
+
 /* Handle a keystroke event from the UI layer. */
 void
 keyboard_input(int down, uint16_t scan)
 {
-    keyboard_input_common(down, scan, 0);
+    keyboard_input_serialized(down, scan, 0);
 }
 
 /* Handle a keystroke injected by a debugger, which reaches the guest even
@@ -310,7 +328,7 @@ keyboard_input(int down, uint16_t scan)
 void
 keyboard_input_injected(int down, uint16_t scan)
 {
-    keyboard_input_common(down, scan, 1);
+    keyboard_input_serialized(down, scan, 1);
 }
 
 static void

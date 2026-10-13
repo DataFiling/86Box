@@ -20,7 +20,7 @@ import struct
 
 MIN_KNOWN = 10      # known (unmasked) bytes a signature needs to be matched on its own
 MAX_COMPARE = 1024  # bytes of a function compared
-FORMAT = 1          # of the cached signatures: bump when the reader changes
+FORMAT = 2          # of the cached signatures: bump when the reader changes
 WEAK = 16           # matches with fewer known bytes need more evidence (see identify)
 
 
@@ -142,7 +142,7 @@ def read_modules(data):
                 m.easy = True  # Phar Lap Easy OMF-386: 16-bit record types with 32-bit fields
             elif rtype in (0x80, 0x82):
                 m.name, _ = _name(body, 0)
-            elif rtype == 0x96:
+            elif rtype in (0x96, 0xCA):  # LNAMES, LLNAMES (one index space)
                 i = 0
                 while i < len(body):
                     n, i = _name(body, i)
@@ -206,10 +206,12 @@ def read_modules(data):
                     buf[off:off + len(chunk)] = chunk
                     kn[off:off + len(chunk)] = b"\1" * len(chunk)
                 m.last = (seg, off)
-            elif rtype in (0xA2, 0xA3):  # LIDATA (repeated data): left unknown
-                m.last = None
+            elif rtype in (0xA2, 0xA3, 0xC2, 0xC3):  # LIDATA (repeated data), COMDAT: left unknown,
+                m.last = None                       # and so are the fixups that follow them
             elif rtype in (0x9C, 0x9D):
-                _parse_fixupp(m, body, rtype & 1)
+                _parse_fixupp(m, body, wide)
+        if end_pos == pos:
+            raise OmfError("truncated module at %d" % pos)
         modules.append(m)
         pos = end_pos
         if page:
@@ -642,7 +644,7 @@ def load(paths, cache_dir=None):
             data = f.read()
         try:
             fs = functions(read_modules(data))
-        except (OmfError, IndexError, struct.error):
+        except (OmfError, IndexError, struct.error, TypeError, AttributeError):
             continue  # not OMF, or a format this reader doesn't know: skip the file
         if cache:
             try:

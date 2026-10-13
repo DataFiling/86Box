@@ -29,6 +29,7 @@ def _module_name(text):
 # then publics as SSSS:OOOO (by name, then again by value), no modules.
 _BC_SEG_HEAD = re.compile(r"^\s*Start\s+Stop\s+Length\s+Name\s+Class\s*$")
 _BC_SEG = re.compile(r"^\s*([0-9A-F]{5,6})H\s+([0-9A-F]{5,6})H\s+([0-9A-F]{5,6})H\s+(\S+)\s+(\S+)\s*$")
+_BC_ABSOLUTE = re.compile(r"F[IJ][A-Z]RQQ$|__AHINCR$|__AHSHIFT$")
 _BC_SYM = re.compile(r"^\s*([0-9A-F]{4}):([0-9A-F]{4})\s+(idle\s+|Abs\s+)?(\S.*?)\s*$")
 _BC_ENTRY = re.compile(r"^Program entry point at\s+([0-9A-F]{4}):([0-9A-F]{4})")
 
@@ -70,7 +71,11 @@ class MapFile:
                 self.segments.append((m.group(4), m.group(5), "", start >> 4, start & 0xF, length))
                 continue
             m = _BC_SYM.match(line)
-            if m and section == "publics" and not (m.group(3) or "").startswith("Abs"):
+            # Absolute constants aren't addresses. TLINK marks them "Abs", or
+            # "idle" (as any symbol) when unreferenced: the 8087 emulator's
+            # fixup values (FIARQQ...) and huge-pointer constants by name.
+            if m and section == "publics" and not (m.group(3) or "").startswith("Abs") and \
+                    not _BC_ABSOLUTE.match(m.group(4)):
                 sym = (int(m.group(1), 16), int(m.group(2), 16), m.group(4), "")
                 if sym not in seen:
                     seen.add(sym)

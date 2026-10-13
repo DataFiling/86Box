@@ -93,7 +93,9 @@ class GdbClient:
         self.replies = queue.Queue()
         self.stops = queue.Queue()
         self.lock = threading.Lock()  # one request/response at a time
+        self._stop_lock = threading.Lock()  # running/last_stop/stops change together
         self.running = False  # whether we told the CPU to run
+        self.attached_running = False  # whether the CPU ran when we connected (before the stub paused it)
         self.last_stop = None
         self._reader = None
         self._closed = threading.Event()
@@ -108,27 +110,32 @@ class GdbClient:
         self._reader.start()
         self.request("qSupported:swbreak+;hwbreak+")
         # The stub pauses the CPU when a client connects, unless an earlier
-        # client asked it to hold the run state across connections.
+        # client asked it to hold the run state across connections. Asking
+        # for its state also arms the report of a running CPU's next stop.
+        self._drain_stops()
         self.running = False
-        if self.query_running():
-            self.resume()  # re-arms stop reporting for this connection
+        st = self.stub_state()
+        self.attached_running = st["attached_running"]
+        if st["running"]:
+            self.running = True
         else:
             self.last_stop = self.query_stop()
 
     def stub_state(self):
-        """The stub's "state": {"running": bool, "stops": count or None}
-        ({"running": False} on builds without it)."""
+        """The stub's "state": {"running": bool, "stops": count or None,
+        "attached_running": bool} ({"running": False} on builds without it).
+        If the CPU runs, the stub reports its next stop to this client."""
+        st = {"running": False, "stops": None, "attached_running": False}
         try:
             text = self.monitor("state")
         except GdbError as e:
             if "unknown" in str(e):
-                return {"running": False, "stops": None}
+                return st
             raise
-        st = {"running": False, "stops": None}
         for line in text.splitlines():
             words = line.split()
-            if len(words) == 2 and words[0] == "running":
-                st["running"] = words[1] == "1"
+            if len(words) == 2 and words[0] in ("running", "attached_running"):
+                st[words[0]] = words[1] == "1"
             elif len(words) == 2 and words[0] == "stops":
                 st["stops"] = int(words[1], 16)
         return st
@@ -170,9 +177,10 @@ class GdbClient:
 
     def _read_loop(self):
         buf = b""
+        sock = self.sock  # close() clears self.sock while this thread may still run
         try:
             while True:
-                data = self.sock.recv(65536)
+                data = sock.recv(65536)
                 if not data:
                     break
                 buf += data
@@ -190,7 +198,7 @@ class GdbClient:
                         break
                     payload = buf[start + 1:end].decode("latin-1")
                     buf = buf[end + 3:]
-                    self.sock.sendall(b"+")
+                    sock.sendall(b"+")
                     self._dispatch(payload)
         except OSError:
             pass
@@ -204,9 +212,10 @@ class GdbClient:
         # replies are hex data, "OK", "Exx", "O<hex>" or empty, never 'T'/'S'.
         if payload[:1] in ("T", "S") and not self._expect_stop_reply:
             stop = StopEvent(payload)
-            self.last_stop = stop
-            self.running = False
-            self.stops.put(stop)
+            with self._stop_lock:
+                self.last_stop = stop
+                self.running = False
+                self.stops.put(stop)
         else:
             self.replies.put(payload)
 
@@ -227,7 +236,9 @@ class GdbClient:
             # request, so drop the connection; the next call reconnects.
             self.close()
             raise GdbError("timed out waiting for the emulator (is 86Box paused from its own UI?); "
-                           "disconnected, the next call reconnects")
+                           "disconnected, the next call reconnects. Unless a client asked the stub to "
+                           "hold, disconnecting removed the breakpoints, watchpoints and catchpoints "
+                           "and lets the CPU run")
         if reply is None:
             raise GdbError("connection to 86Box closed")
         return reply
@@ -246,14 +257,14 @@ class GdbClient:
                 return
 
     def resume(self):
-        with self.lock:
+        with self.lock, self._stop_lock:
             self._drain_stops()
             # Set before sending: the reader clears it when the stop reply comes.
             self.running = True
             self._send_packet("c")
 
     def step(self, timeout=None):
-        with self.lock:
+        with self.lock, self._stop_lock:
             self._drain_stops()
             self.running = True
             self._send_packet("s")

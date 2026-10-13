@@ -7,11 +7,14 @@ process, then exits. Values are parsed as JSON when possible ("5", "true",
 "\"0040:006C\"") and used as strings otherwise. Screenshots are written to
 a PNG file whose path is printed. Exits 1 if the tool raised an error.
 
-Each run opens and closes its own debugger connection. The stub pauses the
-CPU when a client connects; this script asks it to "hold", so a CPU that is
-paused when the script ends stays paused, and one left running (resume,
-input tools) keeps running. Scripts, tests and agents without MCP support
-can therefore drive the bridge one command at a time.
+Each run opens and closes its own debugger connection, and leaves the CPU
+as it found it: running or paused. The stub pauses the CPU when a client
+connects; this script resumes it if it was running, and asks the stub to
+"hold", so a CPU that is paused when the script ends stays paused (with its
+breakpoints), and one left running (resume, input tools) keeps running.
+Scripts, tests and agents without MCP support can therefore drive the
+bridge one command at a time. The MCP server turns "hold" off again when
+it connects.
 """
 
 import argparse
@@ -22,7 +25,6 @@ import os
 import re
 import signal
 import sys
-import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -116,20 +118,45 @@ async def call(tool_name, kwargs, image_dir):
         raise SystemExit("unknown tool %r; tools: %s" % (tool_name, ", ".join(names)))
     fn = getattr(server, tool_name)
     kwargs = coerce(fn, kwargs)
-    server.client().set_hold(True)
+    server.HOLD = True
+    c = server.client()
+    if c.attached_running and not c.running:
+        c.resume()  # undo the pause the stub makes when a client connects without hold
     result = await fn(**kwargs)
     items = result if isinstance(result, list) else [result]
     for item in items:
         data = getattr(item, "data", None)
         if isinstance(data, (bytes, bytearray)):
-            path = os.path.join(image_dir, "screen_%d.png" % int(time.time() * 1000))
-            with open(path, "wb") as f:
-                f.write(data)
-            print("[image saved to %s]" % path)
+            print("[image saved to %s]" % save_image(image_dir, data))
         elif isinstance(item, (dict, list)):
             print(json.dumps(item, indent=2, ensure_ascii=False))
         else:
             print(item)
+
+
+def save_image(image_dir, data):
+    """Write a screenshot to a new file in image_dir (by default a "screens"
+    folder in the bridge's private per-user state directory); returns its path."""
+    if image_dir is None:
+        import memscan  # noqa: E402
+
+        image_dir = os.path.join(memscan.state_dir(os.environ["BOX86_GDB_HOST"], int(os.environ["BOX86_GDB_PORT"])),
+                                 "screens")
+        os.makedirs(image_dir, mode=0o700, exist_ok=True)
+    else:
+        os.makedirs(image_dir, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    stamp = int(time.time() * 1000)
+    while True:
+        path = os.path.join(image_dir, "screen_%d.png" % stamp)
+        try:
+            fd = os.open(path, flags, 0o600)
+            break
+        except FileExistsError:
+            stamp += 1
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    return path
 
 
 def main():
@@ -138,14 +165,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", type=int, default=int(os.environ.get("BOX86_GDB_PORT", "12345")))
     ap.add_argument("--host", default=os.environ.get("BOX86_GDB_HOST", "127.0.0.1"))
-    ap.add_argument("--image-dir", default=os.path.join(tempfile.gettempdir(), "86box-screens"))
+    ap.add_argument("--image-dir", help="where screenshots go (default: a private folder of this user's)")
     ap.add_argument("tool")
     ap.add_argument("args", nargs="*", help="key=value")
     a = ap.parse_args()
 
     os.environ["BOX86_GDB_PORT"] = str(a.port)
     os.environ["BOX86_GDB_HOST"] = a.host
-    os.makedirs(a.image_dir, exist_ok=True)
     kwargs = {}
     if a.tool == "help":  # "help TOOL..." takes bare tool names
         a.args = [n + "=" for n in a.args]

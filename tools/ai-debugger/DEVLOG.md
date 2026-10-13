@@ -1203,6 +1203,164 @@ Tested:
 Not tested: a real GOG installer. GitHub release downloads (403) and gog.com
 are blocked here.
 
+### 27. A setup for new users on Linux
+
+`SETUP-LINUX.md` takes someone from nothing to Claude Code debugging a DOS
+game; `testdata/make_game_vm.sh` makes the machine it uses, and the
+orphan `vm-kit` branch carries that machine prebuilt (`game-vm.tar.xz`, a
+README with the licenses and source commits of the DOS programs on its
+floppy; DOS/4GW is left out).
+
+- **The machine:** ASUS P/I-P55T2P4, Pentium MMX 200, 32 MB, VGA, PS/2
+  wheel mouse, Sound Blaster 16 at 220/IRQ 7/DMA 1/high DMA 5 (DOSBox's
+  settings, which GOG's games are configured for), the JemmEx floppy with
+  `BLASTER` set, an empty FAT16 C: (partition at sector 63, an MBR that
+  boots the floppy) and CMOS settings, so the first boot needs no BIOS
+  setup. Checked: boots to `C:\` and sees the 499 MB disk; the card raises
+  IRQ 7 (DSP command F2h, then PIC IRR bit 7).
+- **Qt builds:** the Qt 5 and Qt 6 frontends with `-DGDBSTUB=ON` pass
+  `smoke_test.py`, screenshots and mouse injection. They need
+  `-DSDL2=ON` where SDL 3 isn't packaged (Ubuntu 24.04 and older).
+
+**A fresh walkthrough** of the guide, by an agent with an empty home
+directory, found one blocker: `mcp` 2.x dropped `mcp.server.fastmcp`, so
+`requirements.txt` now pins `mcp<2`. With that, everything worked: build,
+ROMs, kit, bridge registration, `smoke_test.py`, an import, and Second
+Reality's setup screen from `C:\SECONDRE.BAT`. It also turned up, now fixed:
+
+- `gog_import.py`: mtools failures were tracebacks (now mtools' message
+  and what to check); `--offset` had to be given (now read from the
+  partition table); GOG's Linux installers (a shell script with a zip
+  appended, the game under `data/noarch`) failed with innoextract's
+  message (now unpacked with zipfile, the name taken from `gameinfo`, the
+  one-player DOSBox configs used); an innoextract failure now names its
+  version and the Inno Setup versions it reads; sound and EMS advice is
+  given only where the game's DOSBox setup differs from the game VM's.
+- `make_game_vm.sh`: `-s 16` made FAT12 under a FAT16 partition type (the
+  minimum is now 17 MB); `confirm_exit` was in the VM's config, where
+  86Box ignores it (it is a global setting).
+- `smoke_test.py`: a bridge that can't start or reach 86Box now ends in
+  `RESULT: FAIL (...)` instead of a traceback.
+- The guide: prerequisites; checking for a running 86Box (a second one
+  can't bind the port and runs without the debugger); closing 86Box (its
+  window or Action > Exit: Ctrl+C and `kill` don't stop the Qt build);
+  `claude mcp remove` before registering again; allowing `mcp__86box` to
+  avoid a prompt per tool; speed (about half of real time on a 2.1 GHz
+  server core under JemmEx); the port has no password and listens on
+  all interfaces, as upstream's stub does; General MIDI music needs
+  FluidSynth and a SoundFont; unpacking the kit again keeps an existing
+  disk (`tar --skip-old-files`); a "Next time" section.
+
+`test_gog_import.sh` adds a Linux installer imported onto a partitioned
+disk without `--offset`, and a wrong `--offset` that must fail cleanly.
+Still not tried: a real GOG download of either kind.
+
+### 28. A code review of the whole branch
+
+Six reviewers read the branch by area (the stub's protocol code, its
+per-instruction hooks, threads and devices, the bridge's plumbing, its
+tools, the analysis scripts), and each finding went to a verifier told to
+refute it: 46 of 49 were confirmed (a few were found in two areas). Refuted: a race between the bridge's
+reader thread and a resume (the GIL makes it unreachable on CPython; a
+small lock now rules it out anyway), a watchpoint CPU-mode filter that
+stays on (documented behaviour), and importer mounts outside the game's
+folder (DOSBox follows them too). Fixed:
+
+**Stub (`src/gdbstub.c`):**
+
+- A watchpoint range reaching the top of the address space
+  (`Z2,fffffffe,4`) made a memset clear about 32 GB: 86Box crashed. The
+  whole page map is cleared now, and empty or wrapping ranges are refused.
+- A break (0x03) arriving while a reply streams (`fb` screenshots, `mr`,
+  `tl`, `ll`, `i`) deadlocked the emulator: the client thread waited for
+  the packet to finish, so it never read the acknowledgements the stream
+  waited for. It now breaks at once and again after the packet before it.
+  Waits for an acknowledgement are skipped once the client is gone (one
+  departure could be consumed by an earlier wait).
+- A break right after a continue, before the CPU ran, replied with the
+  previous stop's reason again; `?` replied with the registers of the time
+  of the stop. Both are rebuilt now.
+- The last client leaving could leave the CPU paused for good, with its
+  points deleted, when one of them fired in the same time slice. The
+  emulation thread now does the cleanup and resumes the CPU.
+- `xr` wrote its skip lists into the armed catch before checking the rest
+  of the command.
+- A conditional watchpoint that matched hid every other watchpoint on that
+  access; only one condition per instruction was tested.
+- Logpoints, exec ranges, INT catches, chained-call checks and hardware
+  breakpoints ran between the passes of one instruction: after each prefix
+  and REP iteration on the 8086-class cores (`completed` is 0 there), and
+  after each slice of a long REP string instruction on the others (which
+  restart at its first byte). One `rep stosb` gave a logpoint 316 hits,
+  and a breakpoint on it stopped again mid-instruction.
+- Logpoint records had a wrong EFLAGS (high word not shifted, lazy flags
+  not rebuilt), and a logpoint was skipped when something else stopped the
+  CPU at the same place.
+- Chained-call detection never matched on 8086-class CPUs, whose PUSHF sets
+  bits 12-15.
+- On the V20/V30, EIP was reported one byte past the address breakpoints
+  use (the core prefetches the next opcode); writing EIP now also drops
+  that prefetched byte.
+- `has_packet` and `waiting_stop`, written by different threads, shared a
+  byte as bit fields.
+- Injected mouse buttons released on disconnect were never reported to the
+  guest (the mouse stopped reporting at once); keys from the UI thread and
+  from the debugger could interleave in the keyboard's queue
+  (`keyboard.c` now takes a mutex).
+
+**Bridge:**
+
+- `run_tool.py` set the stub's *hold* for the rest of the 86Box process, so
+  after one use, quitting Claude left the CPU frozen with its breakpoints.
+  The bridge now sets *hold* on every connection, off for the MCP server
+  and on for `run_tool.py` (`server.HOLD`); `run_tool.py` also undoes the
+  pause the stub makes when it connects (`state` reports whether the CPU
+  was running then), so it leaves a running CPU running.
+- Connecting to a running CPU sent `c` to arm stop reporting, which could
+  resume past a stop in that moment; `state` arms it now.
+- `step(count)` stepped past watchpoint, breakpoint and catch stops;
+  `step_out` took an interrupt handler's IRET for the function's return;
+  `run_until`/`step_over`/`step_out` never stopped at a conditional
+  breakpoint already at the target.
+- A bad condition deleted the breakpoint already at that address.
+- `patch_code` undo restored the wrong bytes after a second, longer patch
+  at the same address, or after the program was reloaded.
+- `read_text_screen` changed the VGA graphics controller's index while the
+  guest ran; it pauses for the probe now.
+- `log_hits` took any INT 21h catch for the program's exit;
+  `_attach_watcom` swallowed the user's breakpoint stops; `find_references`
+  in real mode searched from the address on, not its segment or DOS block;
+  identified names outlived a guest reset; `type_text` waited 30 s per key for a
+  program that never empties the BIOS buffer; `watch_program` typed half
+  a command it couldn't finish; `load_symbols` took `psp=` as the load
+  segment.
+- `run_tool.py` wrote screenshots to a shared, predictable folder in /tmp.
+- The OMF reader looped forever on a file truncated after a module header,
+  applied fixups after COMDAT records to the previous data record (giving
+  C++ library functions bogus call references), ignored LLNAMES, and read
+  Easy OMF fixups as 16-bit. Borland maps' unreferenced absolute constants
+  (`FIARQQ`...) labelled real functions.
+
+**Importer and scripts:** `mmd` on an existing folder waited for an
+answer on the terminal (a second import hung); DOSBox comment lines became
+batch commands; a CD image's cue sheet was excluded but not the tracks it
+names; games whose names start alike overwrote each other's batch files
+(each batch file now names its game, and a clash gets another name); the
+unpack folder leaked when unpacking failed. `build_fastdoom.sh` kept an empty WAD after a
+failed download.
+
+`testdata/test_gog_import.sh` covers the importer changes. The stub fixes
+were checked against the 486 VM with scratch code: the old build gave a
+REP logpoint 316 hits, logged EFLAGS without ZF, stopped mid-REP at a
+breakpoint, let a false conditional watchpoint hide an unconditional one,
+crashed on `Z2,fffffffe,4`, replayed an old stop reason and stayed paused
+with a watchpoint armed after its client left; the new build passes all of
+these and 12 breaks in the middle of streamed screenshots.
+
+Not changed: a reply timeout still drops the connection (with *hold* off,
+that removes the session's points); its message now says so. Discarding
+late replies instead would keep them.
+
 ## Test results
 
 Test machines, built with `-DQT=OFF -DSDL2=ON -DGDBSTUB=ON` and run headless

@@ -86,6 +86,12 @@ then hard-resets the machine at the end. The basic test was verified on an
 IBM PC 5150 (8088) and an AMI 486 (OPTi 495); the protected-mode part on the
 486.
 
+`stub_test.py` checks the stub's harder cases on a 386+ machine at a DOS
+prompt: logpoints and breakpoints on REP instructions, conditional
+watchpoints, a break in the middle of a streamed screenshot, a break right
+after a continue, and the cleanup when a client leaves. It runs scratch code
+in the guest, so restart the machine afterwards.
+
 For testing on real DOS software, [testdata/](testdata/README.md) builds a
 FreeDOS boot floppy with test games that have planted bugs, and configs for
 386, 486 and Pentium machines.
@@ -109,9 +115,12 @@ python3 tools/ai-debugger/run_tool.py help scan_next  # one tool's parameters an
 Values are JSON when they parse as JSON, else strings (where `\n`, `\t` and
 `\\` are unescaped, so `type_text text="DIR\n"` presses Enter); integer
 parameters also take `0x` hex. Each command connects
-for just that call and asks the stub to *hold*: a CPU left paused stays
-paused between commands (and keeps its breakpoints), while one left running
-keeps running. The bridge's modules (`gdb_rsp.py`, `dos.py`, `pcinput.py`)
+for just that call and leaves the CPU as it found it: it undoes the pause
+the stub makes when a client connects, and asks the stub to *hold*, so a CPU
+left paused stays paused between commands (and keeps its breakpoints), while
+one left running keeps running. The MCP server turns *hold* off when it
+connects, so quitting the AI client resumes the CPU and drops its points.
+Screenshots are saved in a private per-user folder (its path is printed). The bridge's modules (`gdb_rsp.py`, `dos.py`, `pcinput.py`)
 can also be imported directly from Python.
 
 ## GOG games
@@ -120,22 +129,27 @@ GOG's DOS games come wrapped in DOSBox. `gog_import.py` puts one on an
 86Box disk image (with mtools; stop the emulator first):
 
 ```sh
-python3 tools/ai-debugger/gog_import.py setup_game.exe vm/hd.img --offset 32256   # an installer (needs innoextract)
-python3 tools/ai-debugger/gog_import.py "/path/to/GOG Games/Game" vm/hd.img --offset 32256   # or an installed game
+python3 tools/ai-debugger/gog_import.py setup_game.exe vm/hd.img       # a Windows installer (needs innoextract)
+python3 tools/ai-debugger/gog_import.py gog_game.sh vm/hd.img          # a Linux installer
+python3 tools/ai-debugger/gog_import.py "/path/to/GOG Games/Game" vm/hd.img   # or an installed game
 ```
 
 - It follows the game's "Play" task (`goggame-*.info`) to its DOSBox
-  configs, and copies what DOSBox mounted as C: (the folder the game runs
-  in). GOG's DOSBox, installer files, manuals and CD images are left out.
+  configs, or takes the one-player configs when there is none (Linux
+  installers), and copies what DOSBox mounted as C: (the folder the game
+  runs in). GOG's DOSBox, installer files, manuals and CD images are left
+  out.
 - It writes a batch file at C:\ that runs the game's own commands.
-- It reports what the VM needs to match DOSBox: a CD image to attach as a
-  drive, EMS, the Sound Blaster settings, memory and CPU speed.
+- It reports where the game's DOSBox setup differs from the game VM's
+  (`testdata/make_game_vm.sh`): a CD image to attach as a drive, other
+  Sound Blaster settings, no EMS; and DOSBox's memory and CPU speed.
 
-`--offset` is the FAT partition's byte offset in a hard disk image (32256
-for a partition at sector 63; 0 for a floppy). Downloading stays with you
-(gog.com, or GOG's own tools), so no GOG credentials reach the bridge.
-`testdata/test_gog_import.sh` tests it on two folders laid out as GOG
-installs games.
+It finds the FAT partition from the image's partition table; `--offset`
+gives its byte offset instead (0 for a floppy). An mtools error is shown
+as such, with what to check. Downloading stays with you (gog.com, or GOG's
+own tools), so no GOG credentials reach the bridge. No real GOG download
+has been imported yet: `testdata/test_gog_import.sh` tests it on folders
+and a Linux installer laid out as GOG's.
 
 ## Tools
 
@@ -238,19 +252,27 @@ All of these only take effect in builds with `-DGDBSTUB=ON`.
   release keys by scan code (`keyboard_input_injected()`, which works even
   when the keyboard requires capture), `mm`/`mb` move the mouse, turn the
   wheel (`mouse_wheel_clicks()`) and set its buttons, `bl` lists breakpoints
-  and watchpoints, `state` says whether the CPU is running, and `hold` keeps
-  a paused CPU paused, with its breakpoints, when the last client
+  and watchpoints, `state` says whether the CPU is running (and whether it
+  was when this client connected; a running CPU's next stop is reported to
+  the client that asked, without a `c` that could run past one), and `hold`
+  keeps a paused CPU paused, with its breakpoints, when the last client
   disconnects (and stops a new connection from pausing a running CPU). The
   stop reason is kept while the CPU stays stopped, so a client that
-  reconnects learns why it stopped. `src/video/video.c` hands
+  reconnects learns why it stopped; `?` reports the registers as they are
+  now. `src/video/video.c` hands
   each completed frame to the stub, which keeps a copy.
 - **Clean disconnects.** When the last client leaves (and isn't holding),
   its breakpoints and watchpoints are removed so the guest can't stop with
-  nobody attached; injected keys and mouse buttons are always released.
+  nobody attached, and the CPU runs, even if one of them fired as the
+  client left; the emulation thread does this between time slices.
+  Injected keys and mouse buttons are always released.
 - **Injected mouse input is delivered without a host mouse grab.** Serial,
   PS/2 and bus mice only accept input while the host mouse is captured; a
-  `mouse_injected` flag, set by `mm`/`mb` and cleared when the debugger
-  disconnects, lets it through without grabbing the user's real mouse.
+  `mouse_injected` flag, set by `mm`/`mb` and cleared a tenth of an
+  emulated second after the debugger disconnects (so the mouse reports the
+  buttons' release), lets it through without grabbing the user's real
+  mouse. Keys from the UI and injected ones are queued one at a time
+  (a mutex in `keyboard.c`), as they come from different threads.
 - **Software interrupt log and catchpoints** (`src/gdbstub.c`; the `INT n`
   implementations in `src/cpu/x86_ops_int.h`, `808x.c` and `vx0.c` call
   `gdbstub_int()`). Monitor commands `tv`/`ts`/`tl`/`tc` log calls to chosen

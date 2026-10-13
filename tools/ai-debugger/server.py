@@ -7,6 +7,7 @@ Env:  BOX86_GDB_HOST (default 127.0.0.1), BOX86_GDB_PORT (default 12345)
 
 import bisect
 import collections
+import contextlib
 import functools
 import json
 import os
@@ -74,6 +75,10 @@ mcp = FastMCP("86box-debugger", instructions=INSTRUCTIONS)
 
 _client = None
 _client_lock = threading.Lock()
+# Whether the stub keeps the CPU's state when this bridge disconnects: off for
+# an MCP session, so that quitting the client resumes the CPU and drops its
+# points; run_tool.py turns it on, as it connects once per command.
+HOLD = False
 _points = {}  # (kind, linear) -> {"kind":..., "address":..., "length":..., "expr":...}
 
 KIND_NAMES = {BP_SOFTWARE: "sw-breakpoint", BP_HARDWARE: "breakpoint", WP_WRITE: "write-watch", WP_READ: "read-watch",
@@ -93,6 +98,7 @@ def client():
                 raise GdbError(
                     "Cannot reach the 86Box GDB stub at %s:%d (%s). Start 86Box built with "
                     "-DGDBSTUB=ON; the port is set by gdbstub_port in 86box.cfg." % (host, port, e))
+            c.set_hold(HOLD)  # also after a reconnect; an earlier run_tool.py may have left it on
             _client = c
             _points.clear()
             # Points can outlive a connection when the stub holds them (run_tool.py);
@@ -106,14 +112,15 @@ def client():
                 info = saved.get("%d:%X" % (kind, addr), {})
                 _points[(kind, addr)] = {"kind": kind, "address": addr, "length": length,
                                          "expr": info.get("expr", "set by an earlier command"),
-                                         "condition": info.get("condition", "")}
+                                         "condition": info.get("condition", ""), "cond": info.get("cond")}
         return _client
 
 
 def _save_points():
     try:
         with open(os.path.join(_state_dir(), "points.json"), "w") as f:
-            json.dump({"%d:%X" % key: {"expr": p["expr"], "condition": p.get("condition", "")}
+            json.dump({"%d:%X" % key: {"expr": p["expr"], "condition": p.get("condition", ""),
+                                       "cond": p.get("cond")}
                        for key, p in _points.items()}, f)
     except (OSError, RuntimeError):
         pass
@@ -143,8 +150,9 @@ def _symbols():
         return None
     info = memscan.load(d, "symbols")
     if info and info.get("identified") and \
-            (memscan.load(d, "last-start") or {}).get("tsc") != info.get("start_tsc"):
-        info = None  # identified names belong to the program started then; another has started
+            ((memscan.load(d, "last-start") or {}).get("tsc") != info.get("start_tsc") or
+             (info.get("start_tsc") and not _last_start(client()))):
+        info = None  # identified names belong to the program started then; another has started, or a reset
     if not info:
         _symcache.update(key=None, table=None)
         return None
@@ -340,7 +348,11 @@ def step(count: int = 1) -> str:
         stop = c.step()
         if stop is None:
             return "Step timed out (is the emulator paused from its own UI?)"
+        if stop.reason not in ("trap", "pause"):
+            break  # a watchpoint, breakpoint or catch: report it, don't step past it
     out = _state_report(stop)
+    if count > 1 and stop.reason not in ("trap", "pause"):
+        out = "Stopped at step %d of %d: %s.\n\n%s" % (len(trace), count, stop.describe(), out)
     if trace:
         out = "Executed:\n" + "\n".join(trace[-50:]) + "\n\n" + out
     return out
@@ -372,21 +384,34 @@ def step_over(timeout_seconds: float = 10.0) -> str:
     return _run_to(target, timeout_seconds)
 
 
+@contextlib.contextmanager
+def _temp_breakpoint(c, linear):
+    """A breakpoint at linear for the duration: a temporary one, or the
+    user's one there with its condition lifted (else it might not stop)."""
+    p = _points.get((BP_HARDWARE, linear))
+    if p is None:
+        c.set_point(BP_HARDWARE, linear)
+    elif p.get("condition"):
+        c.set_condition(BP_HARDWARE, linear, None)
+    try:
+        yield
+    finally:
+        if p is None:
+            c.clear_point(BP_HARDWARE, linear)
+        elif p.get("condition"):
+            cond = p.get("cond") or _parse_condition(p["condition"], _regs())[0]
+            c.set_condition(BP_HARDWARE, linear, tuple(cond))
+
+
 def _run_to(linear, timeout):
     c = client()
-    temp = (BP_HARDWARE, linear) not in _points
-    if temp:
-        c.set_point(BP_HARDWARE, linear)
-    try:
+    with _temp_breakpoint(c, linear):
         c.resume()
         stop = c.wait_stop(timeout=timeout)
         if stop is None:
             stop = c.pause()
             return "Target %08X not reached within %.1fs; paused.\n\n%s" % (linear, timeout, _state_report(stop))
         return _state_report(stop)
-    finally:
-        if temp:
-            c.clear_point(BP_HARDWARE, linear)
 
 
 @tool
@@ -400,27 +425,32 @@ def step_out(max_steps: int = 20000) -> str:
     if dos.capstone is None:
         return "step_out needs capstone (pip install capstone)."
     md = dos.capstone.Cs(dos.capstone.CS_ARCH_X86, dos.capstone.CS_MODE_16)
+
+    def stack_top(regs):
+        sp = regs["esp"] & (0xFFFF if dos.stack_bits(regs) == 16 else 0xFFFFFFFF)
+        return regs["ss"], (dos.seg_cache(regs, "ss")["base"] + sp) & 0xFFFFFFFF
+
+    start_ss, start_top = stack_top(_regs())
     for n in range(max(1, max_steps)):
         regs = _regs()
         md.mode = dos.capstone.CS_MODE_16 if dos.code_bits(regs) == 16 else dos.capstone.CS_MODE_32
         insn = next(md.disasm(c.read_memory(regs["eip"], 15), 0), None)
         word = insn.mnemonic.split()[0] if insn is not None else ""
-        if word in ("ret", "retf", "iret", "iretd", "retn"):
+        ss, top = stack_top(regs)
+        # A return on the starting stack, not one of a hardware interrupt's
+        # handler that a step ran into (it runs deeper, or on another stack).
+        if word in ("ret", "retf", "iret", "iretd", "retn") and ss == start_ss and top >= start_top:
             return "Returned after %d instruction(s).\n\n%s" % (n + 1, _state_report(c.step()))
         if word in ("call", "lcall", "int", "int1", "int3", "into"):
             stop = None
             target = regs["eip"] + insn.size
-            temp = (BP_HARDWARE, target) not in _points
-            if temp:
-                c.set_point(BP_HARDWARE, target)
-            try:
-                c.resume()
-                stop = c.wait_stop(timeout=30)
-            finally:
-                if stop is None:
-                    c.pause()
-                if temp:
-                    c.clear_point(BP_HARDWARE, target)
+            with _temp_breakpoint(c, target):
+                try:
+                    c.resume()
+                    stop = c.wait_stop(timeout=30)
+                finally:
+                    if stop is None:
+                        c.pause()
             if stop is None or stop.reason != "breakpoint" or _regs()["eip"] != target:
                 return "Stopped inside a call before the function returned.\n\n" + _state_report(stop)
         else:
@@ -785,23 +815,31 @@ def _parse_condition(text, regs, watch=None):
     return (src, reg, arg, size, op, value), notes
 
 
-def _apply_condition(c, kind, linear, condition, regs, watch=None):
-    """Set (or with "" remove) a point's condition; returns a note for the reply."""
-    if not condition.strip():
+def _place_point(c, kind, linear, length, expr, condition, regs, watch=None):
+    """Set a point, with an optional condition; one of the same kind already
+    at `linear` is replaced (to change its length or condition). The condition
+    is parsed first, so a bad one leaves the old point as it was. Returns a
+    note for the reply."""
+    cond, notes = _parse_condition(condition, regs, watch) if condition.strip() else (None, [])
+    old = _points.pop((kind, linear), None)
+    if old is not None:
         try:
-            c.set_condition(kind, linear, None)
+            c.clear_point(kind, linear, old["length"])
         except GdbError:
-            pass  # an older build without conditions
+            pass  # gone from the stub already
+        _save_points()
+    c.set_point(kind, linear, length)
+    _points[(kind, linear)] = {"kind": kind, "address": linear, "length": length, "expr": expr,
+                               "condition": condition.strip() if cond else "", "cond": cond}
+    _save_points()
+    if cond is None:
         return ""
-    try:
-        cond, notes = _parse_condition(condition, regs, watch)
-    except ValueError:
-        c.clear_point(kind, linear, watch[1] if watch else 1)
-        raise
     try:
         c.set_condition(kind, linear, cond)
     except GdbError as e:
-        c.clear_point(kind, linear, watch[1] if watch else 1)
+        c.clear_point(kind, linear, length)
+        del _points[(kind, linear)]
+        _save_points()
         raise GdbError("could not set the condition (%s); the point was removed" % e)
     return " Stops only when %s.%s" % (condition.strip(), "".join(" Note: %s." % n for n in notes))
 
@@ -840,18 +878,6 @@ def _mid_instruction_note(regs, linear):
         return ""
 
 
-def _set_point(c, kind, linear, length):
-    """Set a point; one of the same kind already at `linear` is replaced (to
-    change its length or condition)."""
-    old = _points.pop((kind, linear), None)
-    if old is not None:
-        try:
-            c.clear_point(kind, linear, old["length"])
-        except GdbError:
-            pass  # gone from the stub already
-    c.set_point(kind, linear, length)
-
-
 @tool
 def set_breakpoint(address: str, condition: str = "") -> str:
     """Set an execution breakpoint (hardware-style; works in ROM and does not modify memory).
@@ -873,11 +899,7 @@ def set_breakpoint(address: str, condition: str = "") -> str:
     regs = _regs()
     loc = _resolve(address, regs)
     linear = loc.linear
-    _set_point(c, BP_HARDWARE, linear, 1)
-    note = _apply_condition(c, BP_HARDWARE, linear, condition, regs) + _mid_instruction_note(regs, linear)
-    _points[(BP_HARDWARE, linear)] = {"kind": BP_HARDWARE, "address": linear, "length": 1, "expr": address,
-                                      "condition": condition.strip()}
-    _save_points()
+    note = _place_point(c, BP_HARDWARE, linear, 1, address, condition, regs) + _mid_instruction_note(regs, linear)
     return "Breakpoint set at %s = %s.%s" % (address, dos.describe(loc, regs), note)
 
 
@@ -909,11 +931,7 @@ def set_watchpoint(address: str, length: int = 1, kind: str = "write", cpu_mode:
     regs = _regs()
     loc = _resolve(address, regs)
     linear = loc.linear
-    _set_point(c, k, linear, max(1, length))
-    note = _apply_condition(c, k, linear, condition, regs, (linear, max(1, length))) + note
-    _points[(k, linear)] = {"kind": k, "address": linear, "length": max(1, length), "expr": address,
-                            "condition": condition.strip()}
-    _save_points()
+    note = _place_point(c, k, linear, max(1, length), address, condition, regs, (linear, max(1, length))) + note
     return "%s watchpoint on %s, %d byte(s) = %s.%s" % (kind.capitalize(), address, max(1, length),
                                                          dos.describe(loc, regs), note)
 
@@ -1147,8 +1165,11 @@ def type_text(text: str, delay_ms: int = 60) -> str:
     plan = [pcinput.char_keys(ch) for ch in text]
     note = _ensure_running()
     shift = pcinput.KEYS["shift"]
+    wait = True
     for n, (needs_shift, scan) in enumerate(plan):
-        _wait_key_buffer(c)
+        # A program that never empties the buffer (it reads the keyboard
+        # itself) would make every key wait: give up waiting after one timeout.
+        wait = wait and _wait_key_buffer(c)
         pcinput.press_combo(c, [shift, scan] if needs_shift else [scan], delay_ms / 2000.0)
         time.sleep(delay_ms / 2000.0)
         stopped = _stopped_during_input(n + 1, len(plan), "characters")
@@ -1161,23 +1182,25 @@ def _wait_key_buffer(c, limit=8, timeout=30.0):
     """Wait while the BIOS keyboard buffer holds `limit` or more keys: a busy
     program (DOS copying a file) doesn't read them, and the BIOS drops keys
     once its 15-key buffer is full. Programs with their own keyboard handler
-    don't use the buffer, so it stays empty and this returns at once."""
+    don't use the buffer, so it stays empty and this returns at once. False
+    if it timed out."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             bda = c.read_memory(0x41A, 4) + c.read_memory(0x480, 4)
         except GdbError:
-            return
+            return True
         if len(bda) < 8:
-            return
+            return True
         head, tail, start, end = (int.from_bytes(bda[i:i + 2], "little") for i in (0, 2, 4, 6))
         if not (0x1E <= start < end <= 0x200 and start <= head < end and start <= tail < end):
             start, end = 0x1E, 0x3E  # BIOS default when 0040:0080/0082 aren't set
             if not (start <= head < end and start <= tail < end):
-                return
+                return True
         if ((tail - head) % (end - start)) // 2 < limit:
-            return
+            return True
         time.sleep(0.1)
+    return False
 
 
 @tool
@@ -1405,6 +1428,9 @@ def _attach_watcom(c, regs):
                 stop = c.wait_stop(timeout=5)
                 if stop is None:
                     c.pause()
+                    break
+                if stop.reason != "range":  # the user's breakpoint, watchpoint or catch: leave the CPU there
+                    was_running = False
                     break
                 regs = _regs()
                 found = running_copy(regs)
@@ -1708,11 +1734,11 @@ def _type_command(c, text):
     """Type text (to start a program) while a wait is armed; stops early if the CPU stops."""
     if not text:
         return
+    plan = [pcinput.char_keys(ch) for ch in text]  # all of it typeable, or nothing is typed
     if not c.running:
         c.resume()
     shift = pcinput.KEYS["shift"]
-    for ch in text:
-        needs_shift, scan = pcinput.char_keys(ch)
+    for needs_shift, scan in plan:
         pcinput.press_combo(c, [shift, scan] if needs_shift else [scan], 0.03)
         time.sleep(0.03)
         if not c.running:
@@ -2131,6 +2157,8 @@ def watch_program(command: str = "", seconds: float = 60.0, hang_seconds: float 
     progress, disassembly), key events from the INT log (program starts, video
     modes, files, failed calls), and the text the program printed."""
     c = client()
+    for ch in command:
+        pcinput.char_keys(ch)  # refuse an untypeable command before changing anything
     st0 = c.int_status()
     traced = list(st0["vectors"])
     want = sorted(set(traced) | set(watchdog.LOG_VECTORS))
@@ -2138,13 +2166,13 @@ def watch_program(command: str = "", seconds: float = 60.0, hang_seconds: float 
         c.int_trace(want)
     start_seq = st0["next"]
     stops = {w.strip() for w in stop_when.lower().split(",") if w.strip()}
-    _type_command(c, command)
-    if not c.running and c.stops.empty():
-        c.resume()
-    t0 = time.time()
     samples, calls, outcome, detail, sigs = [], {}, None, "", []
     shell_psp, prog_psp, prog_name, last_check, shell_ranges = None, None, "", 0.0, []
     try:
+        _type_command(c, command)
+        if not c.running and c.stops.empty():
+            c.resume()
+        t0 = time.time()
         while True:
             now = time.time() - t0
             if not c.running:
@@ -2267,7 +2295,10 @@ def watch_program(command: str = "", seconds: float = 60.0, hang_seconds: float 
 def _parse_bases(text):
     bases = {}
     for k, v in re.findall(r"(\w+)\s*=\s*(?:0x)?([0-9a-fA-F]+)h?", text):
-        bases["load" if k.lower() in ("load", "seg", "segment", "psp") else int(k, 10)] = int(v, 16)
+        if k.lower() == "psp":  # the program is loaded right after its PSP
+            bases["load"] = int(v, 16) + 0x10
+        else:
+            bases["load" if k.lower() in ("load", "seg", "segment") else int(k, 10)] = int(v, 16)
     if not bases:
         raise ValueError("bases look like \"load=240E\" (16-bit) or \"1=174000,2=1FF000\" (objects)")
     return bases
@@ -2289,7 +2320,8 @@ def load_symbols(map_path: str, bases: str = "auto") -> str:
     wait_for_program_start(protected_mode=true) (entry point and DPMI blocks),
     or for an Open Watcom program already running, from its entry point found
     in memory (pause it while its own code runs).
-    Or give them: "load=240E" (16-bit) or "1=174000,2=1FF000" (object bases)."""
+    Or give them: "load=240E" (16-bit; or "psp=23FE", the same program by its
+    PSP) or "1=174000,2=1FF000" (object bases)."""
     d = _state_dir()
     if map_path.strip().lower() in ("", "none", "off"):
         try:
@@ -2709,10 +2741,11 @@ def _linear_code_bits(regs, linear):
     return dos.code_bits(regs)
 
 
-def _code_region(regs, linear):
+def _code_region(regs, linear, seg_base=None):
     """(lo, hi, bits) of the code to analyse around `linear`: the extender's
-    memory block holding it (from wait_for_program_start), the DOS program
-    block, or the 64 KiB code segment in real mode; else 1 MiB around it."""
+    memory block holding it (from wait_for_program_start), or in real mode
+    the code segment (CS's, or seg_base's when given), else the DOS memory
+    block holding it; else 1 MiB around it."""
     start = _last_start(client())
     for lo, hi in start.get("blocks", []):
         if lo <= linear < hi:
@@ -2726,8 +2759,17 @@ def _code_region(regs, linear):
         cs = dos.seg_cache(regs, "cs")["base"]
         if cs <= linear < cs + 0x10000:
             return cs, cs + 0x10000, 16
-        seg = linear & ~0xF
-        return seg, seg + 0x10000, 16
+        if seg_base is not None and seg_base <= linear < seg_base + 0x10000:
+            return seg_base, seg_base + 0x10000, 16
+        try:
+            chain = _dos_state(client())[1] or []
+        except (GdbError, ValueError):
+            chain = []
+        for b in chain:
+            if b.owner and b.contains_linear(linear):
+                return b.start * 16, b.end * 16, 16
+        lo = max(0, linear - 0x8000) & ~0xF
+        return lo, lo + 0x10000, 16
     return max(0, linear - 0x80000), linear + 0x80000, _linear_code_bits(regs, linear)
 
 
@@ -2747,13 +2789,14 @@ def find_references(target: str, code: str = "", max_results: int = 50) -> str:
     and near call/jmp/jcc to it.
     Use it to find every place that uses a variable, or every caller of a
     function. code: the address of some code in the program to search (default:
-    the code around target if it is code, else the code at CS:EIP); the search
-    covers that code's memory block or segment (by default the code at CS:EIP,
-    so pause in the program first)."""
+    the code at CS:EIP, so pause in the program first); the search covers that
+    code's memory block, or in real mode its segment (CS's, or the one given
+    as SEG:OFF) or DOS memory block."""
     regs = _regs()
     tloc = _resolve(target, regs)
-    where = _resolve(code, regs).linear if code else regs["eip"]
-    lo, hi, bits = _code_region(regs, where)
+    wloc = _resolve(code, regs) if code else None
+    where = wloc.linear if wloc else regs["eip"]
+    lo, hi, bits = _code_region(regs, where, wloc.base if wloc else None)
     data = _region_bytes(lo, hi)
     off16 = None
     if bits == 16:
@@ -2929,8 +2972,8 @@ def log_hits(address: str, seconds: float = 10.0, max_hits: int = 200, registers
                 break
         stopped = None if c.running else c.last_stop
         if stopped is not None and stopped.reason == "catch" and getattr(stopped, "int_vector", None) == 0x21 \
-                and exit_catch:
-            exited, stopped = True, None
+                and exit_catch and not stopped.int_return and (stopped.regs.get("eax", 0) >> 8) & 0xFF == 0x4C:
+            exited, stopped = True, None  # our exit catch, not one of the user's INT 21h catches
         if c.running and not was_running:
             c.pause()
     finally:
@@ -3057,9 +3100,16 @@ def patch_code(address: str, action: str, target: str = "", length: int = 0) -> 
     if action == "undo":
         if at not in patches:
             return "No patch recorded at %08X (have: %s)." % (at, ", ".join("%08X" % a for a in patches) or "none")
-        old = patches.pop(at)
-        if isinstance(old, tuple):  # (original bytes, code size at patch time)
-            old, bits = old
+        old = patches[at]
+        patched = None
+        if isinstance(old, tuple):  # (original bytes, code size at patch time[, bytes the patch wrote])
+            old, bits, patched = (old + (None,))[:3]
+        if patched is not None and c.read_memory(at, len(patched)) != patched:
+            del patches[at]
+            memscan.save(d, "patches", patches)
+            return ("The code at %08X is no longer the patch made there (the program was reloaded or changed), "
+                    "so nothing was restored; the record is dropped." % at)
+        del patches[at]
         c.write_memory(at, old)
         memscan.save(d, "patches", patches)
         return "Restored %d byte(s) at %08X.\n%s" % (len(old), at, dos.disassemble(c.read_memory(at, 16), at, bits, None, 3))
@@ -3083,9 +3133,16 @@ def patch_code(address: str, action: str, target: str = "", length: int = 0) -> 
         note = " (+%d NOP byte(s) to the end of the instruction it overwrote)" % (end - len(new))
         new += b"\x90" * (end - len(new))
     before = dos.disassemble(before_bytes, at, bits, None, 4)
-    if at not in patches:
-        patches[at] = (before_bytes[:len(new)], bits)
-        memscan.save(d, "patches", patches)
+    # Record the original bytes, for undo. Over an earlier patch that is still
+    # in memory, they are its originals, plus the bytes a longer patch also
+    # covers; a record whose patch is gone (a reload) is replaced.
+    rec = patches.get(at)
+    if isinstance(rec, tuple) and len(rec) == 3 and before_bytes[:len(rec[2])] == rec[2]:
+        orig = rec[0] + before_bytes[len(rec[0]):len(new)]
+    else:
+        orig = before_bytes[:len(new)]
+    patches[at] = (orig, bits, bytes(new))
+    memscan.save(d, "patches", patches)
     c.write_memory(at, new)
     after = dos.disassemble(c.read_memory(at, 16), at, bits, None, 3)
     warn = ""

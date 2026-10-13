@@ -35,7 +35,7 @@ mkdir -p "$SRC"
 fetch mtuomi/SecondReality SecondReality MAIN/2NDFIX.EXE MAIN/DATA
 fetch id-Software/wolf3d wolf3d WOLFSRC/WOLF3D.EXE WOLFSRC/WOLF3D.MAP
 
-mmd -i "$T" ::/SR ::/SR/DATA ::/WOLF3D 2>/dev/null || true
+mmd -D s -i "$T" ::/SR ::/SR/DATA ::/WOLF3D 2>/dev/null || true  # -D s: don't ask about existing ones
 mcopy -o -i "$T" "$SRC/SecondReality/MAIN/2NDFIX.EXE" ::/SR/SECOND.EXE
 mcopy -o -i "$T" "$SRC/SecondReality/MAIN/DATA/REALITY.FC" ::/SR/REALITY.FC
 for f in "$SRC"/SecondReality/MAIN/DATA/*; do

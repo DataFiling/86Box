@@ -7,8 +7,8 @@
 #                  for), the debugger on port 12345 (-p to change)
 #   DIR/boot.img   the FreeDOS boot floppy with JemmEx (EMS/XMS), CuteMouse
 #                  and BLASTER set; it boots to A:\> and switches to C:
-#   DIR/hd.img     an empty FAT16 hard disk, C: (-s MB, up to 504), for games:
-#                  gog_import.py DIR/hd.img --offset 32256 puts one there
+#   DIR/hd.img     an empty FAT16 hard disk, C: (-s MB, 17 to 504), for games:
+#                  gog_import.py setup_game.exe DIR/hd.img puts one there
 #   DIR/nvr/       the CMOS settings (floppy drive, IDE auto-detect), so the
 #                  first boot needs no BIOS setup
 #
@@ -30,7 +30,7 @@ while getopts "s:p:f:" o; do
     esac
 done
 [ -f "$FLOPPY" ] || { echo "No boot floppy at $FLOPPY: build it with build_emm_floppy.sh, or give one with -f."; exit 1; }
-[ "$SIZE" -ge 16 ] && [ "$SIZE" -le 504 ] || { echo "-s: 16 to 504 (MB; a CHS disk without translation)"; exit 1; }
+[ "$SIZE" -ge 17 ] && [ "$SIZE" -le 504 ] || { echo "-s: 17 to 504 (MB; FAT16 on a CHS disk without translation)"; exit 1; }
 for t in mformat mcopy mtype python3; do
     command -v $t >/dev/null || { echo "Needs $t (mtools, python3)"; exit 1; }
 done
@@ -91,7 +91,6 @@ rm -f "$A" "$A.new"
 
 cat > "$DIR/86box.cfg" <<EOF
 [General]
-confirm_exit = 0
 gdbstub_port = $PORT
 
 [Machine]
