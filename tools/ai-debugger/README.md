@@ -15,6 +15,11 @@ cheat-finder style searches for variables such as lives or score.
 Claude ──MCP (stdio)──> server.py ──GDB remote protocol (TCP 12345)──> 86Box gdbstub
 ```
 
+**New here? [SETUP-LINUX.md](SETUP-LINUX.md)** goes from nothing to a
+working setup with Claude Code: 86Box with the debugger, a ready DOS game
+machine (a prebuilt kit on the `vm-kit` branch), the bridge, and importing
+GOG games.
+
 It covers steps 1 to 5 of a larger plan (see [Roadmap](#roadmap)).
 
 ## 1. Build 86Box with the GDB stub
@@ -24,10 +29,12 @@ dynamic recompiler is incompatible with breakpoints, so the guest runs slower.
 That is fine for DOS-era machines.
 
 ```sh
-# Debian/Ubuntu dependencies: see .github/workflows/cmake_linux.yml
-cmake --preset regular -DGDBSTUB=ON          # add -DQT=OFF -DSDL2=ON for the SDL frontend
+# Debian/Ubuntu dependencies: see SETUP-LINUX.md or .github/workflows/cmake_linux.yml
+cmake --preset regular -DGDBSTUB=ON          # add -DSDL2=ON without SDL 3 (Ubuntu 24.04 and older)
 cmake --build build/regular
 ```
+
+Tested with the Qt 5, Qt 6 (`-DUSE_QT6=ON`) and SDL (`-DQT=OFF`) frontends, on Linux.
 
 The stub listens on TCP port 12345. To change it, set `gdbstub_port = N`
 under `[General]` in the VM's `86box.cfg`. **With the stub enabled, 86Box
@@ -39,8 +46,8 @@ When the debugger disconnects, the CPU runs freely again.
 ```sh
 pip install -r tools/ai-debugger/requirements.txt
 
-# Claude Code (run from anywhere):
-claude mcp add 86box -- python3 /absolute/path/to/86Box/tools/ai-debugger/server.py
+# Claude Code (--scope user: available in every directory, not just this one):
+claude mcp add --scope user 86box -- python3 /absolute/path/to/86Box/tools/ai-debugger/server.py
 ```
 
 Claude Desktop (`~/.config/Claude/claude_desktop_config.json` on Linux):
@@ -60,7 +67,9 @@ Claude Desktop (`~/.config/Claude/claude_desktop_config.json` on Linux):
 `BOX86_GDB_HOST` / `BOX86_GDB_PORT` select the emulator. The bridge connects
 on first use and reconnects if 86Box is restarted. `WATCOM` (Open Watcom's
 directory) lets `identify_functions` find the compiler's libraries; it is
-also found from `wcl386` on the `PATH` (`claude mcp add -e WATCOM=/opt/watcom ...`).
+also found from `wcl386` on the `PATH` (`claude mcp add --scope user 86box -e WATCOM=/opt/watcom -- ...`).
+On distributions that refuse `pip install` outside a virtual environment,
+install into a venv and register its python (SETUP-LINUX.md, step 5).
 
 ## 3. Check it works
 
