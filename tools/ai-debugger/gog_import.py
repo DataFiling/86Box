@@ -910,8 +910,7 @@ def prepare_cd(source, dest, label=None, tracks=()):
         for n, t in enumerate(tracks):
             lines += ['FILE "%s" %s' % (os.path.basename(t), "MP3" if t.lower().endswith(".mp3") else "WAVE"),
                       "  TRACK %02d AUDIO" % (n + 2), "    PREGAP 00:02:00", "    INDEX 01 00:00:00"]
-        notes.append("wrote a cue sheet for it and its %d music tracks (%s...)" % (
-            len(tracks), os.path.basename(tracks[0])))
+        notes.append("wrote a cue sheet for it and its music (%s)" % ", ".join(os.path.basename(t) for t in tracks))
         return rewrite_cue(lines, os.path.dirname(source), dest, stem, notes), notes
     if not cue_files(source) and ext.lower() != ".cue":
         to = os.path.join(dest, os.path.basename(source))  # an ISO, or another image with its files
@@ -1453,7 +1452,7 @@ def rank_programs(folder, games, hints, title):
             score -= 10
         if LOW.fullmatch(stem):
             score, why = score - 40, why + ["an intro or demo"]
-        ranked.append((score, os.path.getsize(path), p, why or ["the biggest"]))
+        ranked.append((score, os.path.getsize(path), p, why or ["the only one" if len(games) == 1 else "the biggest"]))
     ranked.sort(key=lambda r: (r[0], r[1]), reverse=True)
     return [(p, s, why) for s, _, p, why in ranked]
 
