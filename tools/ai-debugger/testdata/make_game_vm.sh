@@ -4,32 +4,38 @@
 #   DIR/86box.cfg  Pentium MMX 200 (ASUS P/I-P55T2P4), 32 MB, VGA, PS/2 wheel
 #                  mouse, Sound Blaster 16 set like DOSBox's (220h, IRQ 7,
 #                  DMA 1, high DMA 5: what GOG pre-configures its DOS games
-#                  for), the debugger on port 12345 (-p to change)
-#   DIR/boot.img   the FreeDOS boot floppy with JemmEx (EMS/XMS), CuteMouse
-#                  and BLASTER set; it boots to A:\> and switches to C:
+#                  for), an IDE CD-ROM drive (secondary master) for game
+#                  CDs, the debugger on port 12345 (-p to change)
+#   DIR/boot.img   the FreeDOS boot floppy with JemmEx (EMS/XMS), DOS and the
+#                  CD-ROM driver loaded high, the CD as D: (GCDROM, SHSUCDX),
+#                  CuteMouse and BLASTER set; it boots to A:\> and switches to C:
 #   DIR/hd.img     an empty FAT16 hard disk, C: (-s MB, 17 to 504), for games:
 #                  gog_import.py setup_game.exe DIR/hd.img puts one there
 #   DIR/nvr/       the CMOS settings (floppy drive, IDE auto-detect), so the
 #                  first boot needs no BIOS setup
 #
-# Usage: make_game_vm.sh DIR [-s MB] [-p PORT] [-f FLOPPY]
+# Usage: make_game_vm.sh DIR [-s MB] [-p PORT] [-f FLOPPY] [-c CDDIR]
 #   FLOPPY: a boot floppy from build_emm_floppy.sh (default out/boot-emm.img).
+#   CDDIR: GCDROM.SYS and SHSUCDX.COM from build_cd_drivers.sh (default out/cd).
 # Then: 86Box -P DIR -R /path/to/roms   (86Box built with -DGDBSTUB=ON)
 
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
-DIR=${1:?usage: $0 DIR [-s MB] [-p PORT] [-f FLOPPY]}
+DIR=${1:?usage: $0 DIR [-s MB] [-p PORT] [-f FLOPPY] [-c CDDIR]}
 shift
-SIZE=500 PORT=12345 FLOPPY="$HERE/out/boot-emm.img"
-while getopts "s:p:f:" o; do
+SIZE=500 PORT=12345 FLOPPY="$HERE/out/boot-emm.img" CDDIR="$HERE/out/cd"
+while getopts "s:p:f:c:" o; do
     case $o in
         s) SIZE=$OPTARG ;;
         p) PORT=$OPTARG ;;
         f) FLOPPY=$OPTARG ;;
+        c) CDDIR=$OPTARG ;;
         *) exit 1 ;;
     esac
 done
 [ -f "$FLOPPY" ] || { echo "No boot floppy at $FLOPPY: build it with build_emm_floppy.sh, or give one with -f."; exit 1; }
+[ -f "$CDDIR/GCDROM.SYS" ] && [ -f "$CDDIR/SHSUCDX.COM" ] ||
+    { echo "No CD-ROM drivers in $CDDIR: build them with build_cd_drivers.sh, or give their folder with -c."; exit 1; }
 [ "$SIZE" -ge 17 ] && [ "$SIZE" -le 504 ] || { echo "-s: 17 to 504 (MB; FAT16 on a CHS disk without translation)"; exit 1; }
 for t in mformat mcopy mtype python3; do
     command -v $t >/dev/null || { echo "Needs $t (mtools, python3)"; exit 1; }
@@ -71,14 +77,30 @@ with open(img, "r+b") as f:
 PY
 mformat -i "$DIR/hd.img@@$((S * 512))" -T $((TOTAL - S)) -h $H -s $S -H $S -v GAMES ::
 
-# The floppy: a copy, with BLASTER set to match the card, and C: as the
-# current drive once it has booted.
+# The floppy: a copy, with BLASTER set to match the card, the CD-ROM drive
+# as D:, and C: as the current drive once it has booted. DOS, the CD-ROM
+# driver and SHSUCDX go into upper memory (JemmEx provides it), so games keep
+# their conventional memory.
 cp "$FLOPPY" "$DIR/boot.img"
+mcopy -o -i "$DIR/boot.img" "$CDDIR/GCDROM.SYS" ::/GCDROM.SYS
+mcopy -o -i "$DIR/boot.img" "$CDDIR/SHSUCDX.COM" ::/SHSUCDX.COM
 A=$(mktemp)
-mtype -i "$DIR/boot.img" ::/AUTOEXEC.BAT | tr -d '\r' | grep -v -i '^SET BLASTER=' > "$A"
-{
-    grep -v -i '^ECHO READY' "$A"
+mtype -i "$DIR/boot.img" ::/FDCONFIG.SYS | tr -d '\r' > "$A"
+python3 - "$A" <<'PY'
+import re, sys
+lines = [l for l in open(sys.argv[1]).read().splitlines()
+         if not re.match(r"(DOS=|DEVICE(HIGH)?=GCDROM)", l, re.I)]
+at = next((i for i, l in enumerate(lines) if re.match(r"SHELL=", l, re.I)), len(lines))
+lines[at:at] = ["DEVICEHIGH=GCDROM.SYS /D:CDROM1"]
+lines.insert(0, "DOS=HIGH,UMB")
+open(sys.argv[1], "w").write("".join(l + "\r\n" for l in lines))
+PY
+mcopy -o -i "$DIR/boot.img" "$A" ::/FDCONFIG.SYS
+mtype -i "$DIR/boot.img" ::/AUTOEXEC.BAT | tr -d '\r' > "$A"
+{   # (the lines added below are dropped first: the floppy may be one made before)
+    grep -v -i -x 'SET BLASTER=.*\|SHSUCDX .*\|PATH A:\\;C:\\\|C:\|ECHO READY' "$A"
     echo 'SET BLASTER=A220 I7 D1 H5 P330 T6'
+    echo 'SHSUCDX /D:?CDROM1,D'
     echo 'PATH A:\;C:\'
     echo 'C:'
     echo 'ECHO READY'
@@ -124,6 +146,8 @@ dma16 = 5
 fdd_01_type = 35_2hd
 fdd_01_fn = boot.img
 fdd_02_type = none
+cdrom_01_parameters = 1, atapi
+cdrom_01_ide_channel = 1:0
 
 [Hard disks]
 hdd_01_parameters = $S, $H, $C, 0, ide

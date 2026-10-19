@@ -8,7 +8,7 @@ You end up with:
 
 - 86Box built with the debugger,
 - a ready DOS machine (Pentium MMX 200, FreeDOS with EMS, Sound Blaster 16,
-  mouse, an empty 500 MB C: for games),
+  mouse, a CD-ROM drive, an empty 500 MB C: for games),
 - the debugger bridge registered in Claude Code.
 
 Before you start, you need:
@@ -162,7 +162,13 @@ Close 86Box first: the disk image must not change while the machine runs.
   the error then says so.
 - **What it does:** it copies the game to C: and writes `C:\GAMENAME.BAT`,
   which starts it the way GOG's DOSBox did. It then says what else the
-  game expects, such as a CD image.
+  game expects.
+- **CD games:** the game's CD goes into the machine's CD-ROM drive, D: in
+  DOS. The importer copies it into `~/86box-vms/game-vm/cd/`. A game with
+  several discs gets the others in 86Box's Media menu (CD-ROM 1, recent
+  images), where you change discs. CD music tracks must be 44.1 kHz
+  stereo; with `ffmpeg` installed (`sudo apt install ffmpeg`) the
+  importer converts others, and otherwise it says which.
 - **Sound and EMS need no setup.** The machine's Sound Blaster and its
   EMS are set the way GOG's DOSBox sets them. The importer says when a
   game was set up differently.
@@ -208,7 +214,8 @@ cmake --build ~/86Box/build/regular
 | `Not a supported Inno Setup installer` | The installer is newer than your innoextract: use the game's installed folder (step 7), or a newer innoextract (github.com/dscharrer/innoextract) |
 | A game has no sound | Run its setup program and pick Sound Blaster 16 at 220, IRQ 7, DMA 1 (high DMA 5) |
 | Sound effects play but the music is silent | The game plays General MIDI music, which needs a synthesizer: `sudo apt install fluid-soundfont-gm`, then in 86Box's Settings > Sound > MIDI, set MIDI Out Device to FluidSynth. Or pick Sound Blaster or AdLib music in the game's setup |
-| A game needs its CD | The machine has no CD-ROM drive or DOS CD driver yet; games that need their CD don't run yet |
+| A game can't find its CD | In the machine, `DIR D:` should list the CD. If the importer said the game used another letter, change `SHSUCDX /D:?CDROM1,D` in `A:\AUTOEXEC.BAT` to that letter. An empty drive means 86Box refused the image: see the importer's notes about its tracks |
+| The machine has no CD-ROM drive | It was unpacked from a kit older than CD support: unpack the kit into another folder and copy its `boot.img` and `86box.cfg` into your machine's folder (your games on `hd.img` stay) |
 
 ## Other AI clients
 

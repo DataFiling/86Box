@@ -11,6 +11,11 @@
 #      goggame-*.info (modelled on descriptions of GOG's Linux installers,
 #      not checked against a real one), imported onto a partitioned hard
 #      disk image without --offset.
+#   4. A game whose CD is a GOG-style cue sheet (game.ins naming GAME.GOG,
+#      with the file in lower case, a CD audio track at 22 kHz mono, an "OGG"
+#      file type 86Box doesn't know) plus a second disc, imported onto that
+#      disk with an 86box.cfg next to it: the CD goes into the VM's drive.
+#   5. A game whose CD is a folder DOSBox mounts as a CD-ROM, as E:.
 # To run an import in a VM, give it the VM's disk image instead.
 
 set -e
@@ -78,6 +83,33 @@ open(sys.argv[1], "r+b").write(mbr)' "$HD"
 mformat -i "$HD@@32256" -T $((40 * 16 * 63 - 63)) -h 16 -s 63 -H 63 ::
 python3 "$HERE/../gog_import.py" "$W/wolf.sh" "$HD"
 
+# 4. A CD game, imported onto a VM's disk: 86box.cfg next to it, with a drive.
+printf '[Floppy and CD-ROM drives]\ncdrom_01_parameters = 1, atapi\ncdrom_01_ide_channel = 1:0\n' > "$W/86box.cfg"
+G4="$W/cdgame"
+mkdir -p "$G4/DOSBOX" "$G4/GAME"
+cp "$SRC/wolf3d/WOLFSRC/WOLF3D.EXE" "$G4/GAME/GAME.EXE"
+head -c 51200 /dev/urandom > "$G4/game.gog"
+python3 -c '
+import struct, sys, wave
+for name, ch, rate in (("track02.wav", 2, 44100), ("Track03.WAV", 1, 22050)):
+    w = wave.open(sys.argv[1] + "/" + name, "wb"); w.setnchannels(ch); w.setsampwidth(2); w.setframerate(rate)
+    w.writeframes(b"\0\0" * ch * rate); w.close()' "$G4"
+printf 'FILE "GAME.GOG" BINARY\r\n  TRACK 01 MODE1/2048\r\n    INDEX 01 00:00:00\r\nFILE "track02.wav" WAVE\r\n  TRACK 02 AUDIO\r\n    INDEX 01 00:00:00\r\nFILE "Track03.WAV" OGG\r\n  TRACK 03 AUDIO\r\n    INDEX 01 00:00:00\r\n' > "$G4/game.ins"
+head -c 4096 /dev/urandom > "$G4/disc2.iso"
+printf '[autoexec]\nmount C ".."\nimgmount D "..\\game.ins" "..\\disc2.iso" -t iso\nc:\ncd GAME\nGAME.EXE\n' > "$G4/dosbox_cd.conf"
+printf '{"name": "CD Game", "playTasks": [{"isPrimary": true, "arguments": "-conf \\"..\\\\dosbox_cd.conf\\"", "workingDir": "DOSBOX"}]}\n' > "$G4/goggame-4.info"
+python3 "$HERE/../gog_import.py" "$G4" "$HD" | tee "$W/cd.out"
+cp "$W/86box.cfg" "$W/86box.cfg.4"
+
+# 5. A folder DOSBox mounts as a CD-ROM, as E:.
+G5="$W/cdfolder"
+mkdir -p "$G5/DOSBOX" "$G5/CD/DATA"
+cp "$SRC/wolf3d/WOLFSRC/WOLF3D.EXE" "$G5/RUN.EXE"
+echo level > "$G5/CD/DATA/LEVEL1.DAT"
+printf '[autoexec]\nmount C ".."\nmount E "..\\CD" -t cdrom\nc:\nRUN.EXE\n' > "$G5/dosbox_f.conf"
+printf '{"name": "Folder CD", "playTasks": [{"isPrimary": true, "arguments": "-conf \\"..\\\\dosbox_f.conf\\"", "workingDir": "DOSBOX"}]}\n' > "$G5/goggame-5.info"
+python3 "$HERE/../gog_import.py" "$G5" "$HD" | tee "$W/folder.out"
+
 fail() { echo "FAIL: $*"; exit 1; }
 [ "$(mdir -b -i "$IMG" ::/SR/DATA | wc -l)" = 79 ] || fail "SR\\DATA should hold 79 parts"
 mtype -i "$IMG" ::/SECONDRE.BAT | tr -d '\r' | grep -qx "cd SR" || fail "SECONDRE.BAT should cd into SR"
@@ -92,4 +124,23 @@ mtype -i "$IMG" ::/SECONDR1.BAT | tr -d '\r' | grep -qx 'cd \\SR2' || fail "SECO
 mtype -i "$HD@@32256" ::/WOLFENST.BAT | tr -d '\r' | grep -q SETUP && fail "the setup config was used"
 out=$(python3 "$HERE/../gog_import.py" "$G" "$IMG" --offset 512 2>&1) && fail "a wrong --offset should fail"
 case "$out" in *Traceback*|"") fail "a wrong --offset should fail with mtools' error: $out" ;; esac
+# 4: the cue sheet as 86Box needs it, the second disc in the recent images.
+C4="$W/cd/CDGAME"
+grep -qx 'cdrom_01_image_path = cd/CDGAME/game.cue' "$W/86box.cfg.4" || fail "the VM's drive should hold cd/CDGAME/game.cue"
+grep -qx 'cdrom_01_image_history_01 = cd/CDGAME/disc2.iso' "$W/86box.cfg.4" || fail "disc 2 should be in the recent images"
+tr -d '\r' < "$C4/game.cue" | grep -qx 'FILE "game.gog" BINARY' || fail "the cue should name game.gog as it is on disk"
+[ "$(stat -c %h "$C4/game.gog")" = 2 ] || fail "the data track should be a hard link, not a copy"
+if command -v ffmpeg > /dev/null; then
+    tr -d '\r' < "$C4/game.cue" | grep -qx 'FILE "Track03.wav" WAVE' || fail "track 3 should be converted to Track03.wav"
+    python3 -c 'import sys, wave; w = wave.open(sys.argv[1]); sys.exit((w.getnchannels(), w.getframerate()) != (2, 44100))' \
+        "$C4/Track03.wav" || fail "Track03.wav should be 44.1 kHz stereo"
+else
+    grep -q "Track03.WAV is 1 channels at 22050 Hz" "$W/cd.out" || fail "track 3's format should be reported"
+fi
+mdir -b -i "$HD@@32256" ::/GAME | grep -qi "gog\|ins\|iso" && fail "the CD's files were copied to C:"
+# 5: the folder as the CD, not on C:, and the letter noted.
+grep -qx 'cdrom_01_image_path = cd/FOLDERCD/CD' "$W/86box.cfg" || fail "the VM's drive should hold the folder cd/FOLDERCD/CD"
+[ -f "$W/cd/FOLDERCD/CD/DATA/LEVEL1.DAT" ] || fail "the CD folder should be copied whole"
+mdir -b -i "$HD@@32256" ::/FOLDERCD | grep -q "/CD" && fail "the CD folder was copied to C:"
+grep -q "as E:" "$W/folder.out" || fail "the E: letter should be reported"
 echo "PASS"

@@ -140,9 +140,17 @@ python3 tools/ai-debugger/gog_import.py "/path/to/GOG Games/Game" vm/hd.img   # 
   runs in). GOG's DOSBox, installer files, manuals and CD images are left
   out.
 - It writes a batch file at C:\ that runs the game's own commands.
+- When the disk image is a VM's (`86box.cfg` next to it), it puts the
+  game's CD into the VM's CD-ROM drive: a cue sheet with its tracks (GOG's
+  `.ins`/`.gog` pairs too), an ISO, or a folder DOSBox mounted as a CD,
+  copied into the VM's `cd/` folder (hard-linked where it can). A cue
+  sheet is rewritten for 86Box: named `.cue`, file names as on disk, file
+  types 86Box reads, and audio tracks converted to 44.1 kHz stereo with
+  ffmpeg when they aren't (86Box refuses the disc otherwise). Further
+  discs go into the drive's recent images in 86Box's Media menu.
 - It reports where the game's DOSBox setup differs from the game VM's
-  (`testdata/make_game_vm.sh`): a CD image to attach as a drive, other
-  Sound Blaster settings, no EMS; and DOSBox's memory and CPU speed.
+  (`testdata/make_game_vm.sh`): a CD letter other than D:, other Sound
+  Blaster settings, no EMS; and DOSBox's memory and CPU speed.
 
 It finds the FAT partition from the image's partition table; `--offset`
 gives its byte offset instead (0 for a floppy). An mtools error is shown
@@ -157,7 +165,7 @@ and a Linux installer laid out as GOG's.
 |---|---|
 | Execution | `status`, `pause`, `resume`, `run_for`, `wait_for_stop`, `step`, `step_over`, `step_out`, `run_until`, `hard_reset` |
 | DOS programs | `dos_memory_map` (MCB chain, programs, which one is running), `wait_for_program_start` (stop at a program's first instruction; `protected_mode` for a DOS-extender program's 32-bit entry (DOS/4GW, DOS/32A, PMODE/W, CauseWay); `command` types the command that starts it) |
-| Interrupt calls | `log_interrupts` + `read_interrupt_log` (INT 21h DOS, 31h DPMI, 10h video, 33h mouse... with decoded arguments, file names, buffers and results), `catch_interrupt` (stop on a call or its return), `clear_interrupt_catches` |
+| Interrupt calls | `log_interrupts` + `read_interrupt_log` (INT 21h DOS, 31h DPMI, 10h video, 33h mouse, 2Fh MSCDEX and redirector... with decoded arguments, file names, buffers and results), `catch_interrupt` (stop on a call or its return), `clear_interrupt_catches` |
 | Symbols | `load_symbols` (an Open Watcom or Borland TLINK linker map, placed automatically for 16-bit programs and for 32-bit extender programs (code from the entry point, data from the code's references to it), also for a 32-bit program already running (its entry point is found in memory), checked against the code in memory; `map_path=none` unloads), `lookup_symbol` (`module!name` for duplicated statics), `identify_functions` (no map: names the C runtime and other library functions from the compiler's OMF libraries, the runtime's variables, and every other called function `sub_ADDRESS`); names then work as addresses (`set_breakpoint address=main_`) and appear in disassembly, the CPU state, stacks, the INT log and watch_program |
 | Addresses | `what_is` (symbol, PC memory area, DOS block and owner, DPMI block, the function it is in) |
 | Code | `find_references` (instructions that use an address or call/jump to it; in 16-bit code also `[ofs]` operands and `mov ax,ofs`-style pointers), `log_hits` (the emulator records each time an address executes, without stopping: registers, a memory dword, callers, emulated time, a summary of the values; for an interrupt handler, the program addresses each interrupt came in at; stops when the program exits), `patch_code` (jmp/call/nop/ret, padded to whole instructions; `undo`) |

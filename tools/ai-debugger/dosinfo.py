@@ -436,7 +436,20 @@ SYSTEM_NAMES = {0x4F: "keyboard intercept", 0x86: "wait", 0x87: "move extended m
 MULTIPLEX_NAMES = {0x1600: "Windows check", 0x1680: "release time slice", 0x1687: "DPMI host check",
                    0x4300: "XMS check", 0x4310: "XMS entry", 0x1A00: "ANSI check", 0x1100: "network check",
                    0xAE00: "command line hook", 0xAE01: "command execute", 0x4A01: "HMA query",
-                   0x4A02: "HMA allocate", 0x1605: "Windows startup"}
+                   0x4A02: "HMA allocate", 0x1605: "Windows startup", 0x1000: "SHARE check"}
+# AH=11h: DOS hands file operations on redirected drives (a CD-ROM through
+# MSCDEX/SHSUCDX, a network drive) to the redirector.
+REDIRECTOR_NAMES = {0x00: "check", 0x05: "change directory", 0x06: "close file", 0x08: "read file",
+                    0x09: "write file", 0x0C: "disk info", 0x0F: "file attributes", 0x16: "open file",
+                    0x17: "create file", 0x1B: "find first", 0x1C: "find next", 0x1D: "close all files of a process",
+                    0x21: "seek from end", 0x22: "process exit", 0x23: "qualify file name", 0x2E: "extended open"}
+# MSCDEX (INT 2Fh, AH=15h): the CD-ROM extender (MSCDEX, SHSUCDX) gives CD-ROM
+# drives their letters and passes requests to the CD-ROM driver.
+MSCDEX_NAMES = {0x00: "CD-ROM installation check", 0x01: "CD-ROM drive device list",
+                0x02: "CD copyright file name", 0x03: "CD abstract file name", 0x04: "CD bibliography file name",
+                0x05: "CD read volume table of contents", 0x08: "CD absolute read", 0x09: "CD absolute write",
+                0x0B: "CD-ROM drive check", 0x0C: "MSCDEX version", 0x0D: "CD-ROM drive letters",
+                0x0E: "CD volume descriptor preference", 0x0F: "CD directory entry", 0x10: "CD device request"}
 EMS_NAMES = {0x40: "status", 0x41: "page frame", 0x42: "page counts", 0x43: "allocate pages", 0x44: "map page",
              0x45: "free pages", 0x46: "version", 0x47: "save map", 0x48: "restore map", 0x4B: "handle count",
              0x4C: "handle pages", 0x50: "map multiple", 0x58: "mappable pages", 0xDE: "VCPI"}
@@ -532,6 +545,32 @@ def _disk(c):
     return name, args, res, True
 
 
+def _multiplex(c):
+    ax = c.r("ax")
+    if ax >> 8 == 0x11 and ax not in MULTIPLEX_NAMES:
+        return "redirector " + REDIRECTOR_NAMES.get(ax & 0xFF, "function %02Xh" % (ax & 0xFF)), "", None, False
+    if ax >> 8 != 0x15:
+        return MULTIPLEX_NAMES.get(ax, "function %04Xh" % ax), "", None, False
+    al = ax & 0xFF
+    name = MSCDEX_NAMES.get(al, "MSCDEX function %02Xh" % al)
+    o = lambda r: c.r(r, out=True)
+    letter = lambda n: chr(ord("A") + n) + ":" if n < 26 else "drive %d" % n
+    args, res = "", None
+    if al in (0x02, 0x03, 0x04, 0x05, 0x08, 0x09, 0x0B, 0x10):
+        args = letter(c.r("cx"))
+    elif al == 0x0F:
+        args = letter(c.r("cx") & 0xFF)
+    if al == 0x00:
+        res = lambda: ("%d CD-ROM drive(s) from %s" % (o("bx"), letter(o("cx"))) if o("bx") else
+                       "no CD-ROM extender, or no drives")
+    elif al == 0x0B:
+        res = lambda: ("not a CD-ROM drive" if not o("ax") else "a CD-ROM drive") + (
+            "" if o("bx") == 0xADAD else " (no MSCDEX answering)")
+    elif al == 0x0C:
+        res = lambda: "version %d.%02d" % (o("bx") >> 8, o("bx") & 0xFF)
+    return name, args, res, al in (0x01, 0x02, 0x03, 0x04, 0x05, 0x08, 0x09, 0x0F)
+
+
 def _byname(table, key_reg):
     def f(c):
         k = c.r(key_reg)
@@ -542,7 +581,7 @@ def _byname(table, key_reg):
 VECTOR_INFO = {
     0x10: ("video", _video), 0x13: ("disk", _disk), 0x15: ("system", _byname(SYSTEM_NAMES, "ah")),
     0x16: ("keyboard", _keyboard), 0x1A: ("clock", _byname(CLOCK_NAMES, "ah")), 0x21: ("DOS", _dos),
-    0x2F: ("multiplex", _byname(MULTIPLEX_NAMES, "ax")), 0x31: ("DPMI", _dpmi), 0x33: ("mouse", _mouse),
+    0x2F: ("multiplex", _multiplex), 0x31: ("DPMI", _dpmi), 0x33: ("mouse", _mouse),
     0x67: ("EMS", _byname(EMS_NAMES, "ah")),
 }
 SIMPLE_VECTORS = {0x20: "terminate program", 0x28: "DOS idle", 0x05: "print screen", 0x11: "equipment list",

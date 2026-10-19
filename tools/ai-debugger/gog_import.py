@@ -9,9 +9,10 @@ says which configurations the "Play" button uses.
 
 This reads those, copies what DOSBox would have mounted as C: onto a FAT
 disk image (with mtools; the emulator must not be running on it), writes a
-batch file that runs the game's own commands, and reports what the virtual
-machine still needs (a CD image, sound card settings other than the game
-VM's).
+batch file that runs the game's own commands, puts the game's CD (an image
+or a folder DOSBox mounted) into the VM's CD-ROM drive when the image is a
+VM's disk (86box.cfg next to it), and reports what else the VM needs (sound
+card settings other than the game VM's).
 
   gog_import.py setup_game.exe IMAGE [--offset BYTES] [--dir NAME]
   gog_import.py gog_game.sh IMAGE ...            (GOG's Linux installer)
@@ -187,19 +188,23 @@ def parse_autoexec(lines, bases):
         if not words:
             continue
         cmd = words[0].lower()
+        opts = [w.lower() for w in words[3:]]
+        mtype = opts[opts.index("-t") + 1] if "-t" in opts[:-1] else ""
         if cmd == "mount" and len(words) >= 3:
-            if "-t" in [w.lower() for w in words[3:]] and "overlay" in [w.lower() for w in words[3:]]:
+            if mtype == "overlay":
                 continue  # GOG's cloud-save overlay on top of C:
             drive = words[1].rstrip(":").upper()
             path = find(words[2])
-            mounts.setdefault(drive, ("dir", path) if path else ("missing", words[2]))
+            kind = "cdfolder" if mtype == "cdrom" else "dir"  # a folder DOSBox presents as a CD
+            mounts.setdefault(drive, (kind, path) if path else ("missing", words[2]))
         elif cmd == "imgmount" and len(words) >= 3:
             drive = words[1].rstrip(":").upper()
             images, i = [], 2
             while i < len(words) and not words[i].startswith("-"):
                 images.append(find(words[i]) or words[i])
                 i += 1
-            mounts[drive] = ("image", images)
+            # CD images (-t iso or cdrom); floppy and hard disk images are attached differently.
+            mounts[drive] = ("disk" if mtype in ("floppy", "hdd") else "image", images)
         elif cmd in ("exit", "cls", "echo", "@echo") or cmd.startswith("config"):
             continue
         elif cmd in ("cycles", "core", "mixer", "keyb", "intro", "rescan", "boot"):
@@ -227,6 +232,144 @@ def cue_files(image):
     return found
 
 
+# 86Box's CD-ROM drive reads ISO images, cue sheets (with BINARY data tracks
+# and WAVE/AIFF/MP3 audio tracks, opened with libsndfile, which also reads
+# OGG and FLAC under "WAVE") and folders (as a "virtual ISO"). Audio tracks
+# must be 44.1 kHz stereo, or 86Box refuses the whole disc.
+CUE_TYPES = ("BINARY", "MOTOROLA", "WAVE", "AIFF", "MP3")
+
+
+def audio_format(path):
+    """(channels, sample rate) of a WAV, AIFF, OGG (Vorbis, Opus) or FLAC file;
+    None if it can't be told (MP3, or another format)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(65536)
+    except OSError:
+        return None
+    if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        i = 12
+        while i + 16 <= len(head):
+            size = struct.unpack_from("<I", head, i + 4)[0]
+            if head[i:i + 4] == b"fmt ":
+                return struct.unpack_from("<H", head, i + 10)[0], struct.unpack_from("<I", head, i + 12)[0]
+            i += 8 + size + (size & 1)
+    elif head[:4] == b"OggS":
+        j = head.find(b"\x01vorbis")
+        if j >= 0 and j + 16 <= len(head):
+            return head[j + 11], struct.unpack_from("<I", head, j + 12)[0]
+        j = head.find(b"OpusHead")
+        if j >= 0 and j + 10 <= len(head):
+            return head[j + 9], 48000  # Opus always decodes at 48 kHz
+    elif head[:4] == b"fLaC" and len(head) >= 26:
+        rate = (head[18] << 12) | (head[19] << 4) | (head[20] >> 4)
+        return ((head[20] >> 1) & 7) + 1, rate
+    elif head[:4] == b"FORM" and head[8:12] in (b"AIFF", b"AIFC"):
+        i = 12
+        while i + 26 <= len(head):
+            size = struct.unpack_from(">I", head, i + 4)[0]
+            if head[i:i + 4] == b"COMM":  # rate: an 80-bit float
+                exp, mant = struct.unpack_from(">HQ", head, i + 16)
+                return struct.unpack_from(">H", head, i + 8)[0], int(mant * 2.0 ** ((exp & 0x7FFF) - 16383 - 63))
+            i += 8 + size + (size & 1)
+    return None
+
+
+def link_or_copy(src, dst):
+    """A hard link where it can (no second copy of a big track), else a copy."""
+    if os.path.exists(dst):
+        os.unlink(dst)
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copyfile(src, dst)
+
+
+def prepare_cd(source, dest):
+    """Put a CD (an image, a cue sheet with its tracks, or a folder) into the
+    folder dest for 86Box: a cue sheet is renamed .cue (86Box goes by the
+    extension), names the tracks as they are on disk (case), uses file types
+    86Box knows, and has audio tracks 86Box can play (converted with ffmpeg
+    when needed and possible). Returns (path of what to put in the drive,
+    notes)."""
+    notes = []
+    os.makedirs(dest, exist_ok=True)
+    if os.path.isdir(source):
+        to = os.path.join(dest, os.path.basename(source.rstrip("/")))
+        if os.path.exists(to):
+            shutil.rmtree(to)
+        shutil.copytree(source, to, copy_function=lambda a, b: link_or_copy(a, b))
+        return to, notes
+    stem = os.path.splitext(os.path.basename(source))[0]
+    if not cue_files(source) and not source.lower().endswith(".cue"):
+        to = os.path.join(dest, os.path.basename(source))  # an ISO
+        link_or_copy(source, to)
+        return to, notes
+    with open(source, encoding="latin-1") as f:
+        lines = f.read().splitlines()
+    out = []
+    for line in lines:
+        m = re.match(r'(\s*)FILE\s+(?:"([^"]+)"|(\S+))\s*(\S*)', line, re.I)
+        if not m:
+            out.append(line)
+            continue
+        indent, name, ftype = m.group(1), m.group(2) or m.group(3), m.group(4).upper()
+        track = find_ci(os.path.dirname(source), name)
+        if track is None:
+            notes.append("the cue sheet names %s, which isn't there: 86Box will refuse the disc" % name)
+            out.append(line)
+            continue
+        new = os.path.basename(track)
+        if ftype not in ("BINARY", "MOTOROLA"):
+            fmt = audio_format(track)
+            ftype = ftype if ftype in ("WAVE", "AIFF", "MP3") else "WAVE"
+            if fmt is not None and fmt != (2, 44100):
+                wav = os.path.splitext(new)[0] + ".wav"
+                if shutil.which("ffmpeg") and subprocess.run(
+                        ["ffmpeg", "-v", "error", "-y", "-i", track, "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le",
+                         os.path.join(dest, wav)], capture_output=True).returncode == 0:
+                    notes.append("converted %s (%d channels, %d Hz) to 44.1 kHz stereo" % (new, fmt[0], fmt[1]))
+                    new, ftype, track = wav, "WAVE", None
+                else:
+                    notes.append("%s is %d channels at %d Hz; 86Box plays only 44.1 kHz stereo and refuses the "
+                                 "disc: convert it, e.g. ffmpeg -i %s -ac 2 -ar 44100 %s.wav" % (
+                                     new, fmt[0], fmt[1], new, os.path.splitext(new)[0]))
+        if track is not None:
+            link_or_copy(track, os.path.join(dest, new))
+        out.append('%sFILE "%s" %s' % (indent, new, ftype))
+    to = os.path.join(dest, stem + ".cue")
+    with open(to, "w", encoding="latin-1", newline="\r\n") as f:
+        f.write("\n".join(out) + "\n")
+    return to, notes
+
+
+def set_cd_image(cfg, image, others=()):
+    """Put image into the VM's first CD-ROM drive in 86box.cfg (as a path
+    relative to the VM's folder), with others (more discs) in the drive's
+    recent images (86Box's Media menu). False if the VM has no CD-ROM drive."""
+    with open(cfg, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    sec = next((i for i, l in enumerate(lines) if l.strip().lower() == "[floppy and cd-rom drives]"), None)
+    if sec is None:
+        return False
+    end = next((i for i in range(sec + 1, len(lines)) if lines[i].startswith("[")), len(lines))
+    keys = [l.split("=", 1)[0].strip() for l in lines[sec + 1:end]]
+    if "cdrom_01_parameters" not in keys or "none" in lines[sec + 1 + keys.index("cdrom_01_parameters")]:
+        return False
+    body = [l for k, l in zip(keys, lines[sec + 1:end])
+            if not re.match(r"cdrom_01_image_(path|history_\d+)$", k)]
+    vmdir = os.path.dirname(os.path.abspath(cfg))
+    rel = [os.path.relpath(p, vmdir) for p in [image] + list(others)[:10]]
+    at = next((i + 1 for i, l in enumerate(body) if l.split("=", 1)[0].strip() == "cdrom_01_ide_channel"),
+              next((i + 1 for i, l in enumerate(body) if l.split("=", 1)[0].strip() == "cdrom_01_parameters")))
+    body[at:at] = ["cdrom_01_image_path = %s" % rel[0]] + [
+        "cdrom_01_image_history_%02d = %s" % (n + 1, r) for n, r in enumerate(rel[1:])]
+    lines[sec + 1:end] = body
+    with open(cfg, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return True
+
+
 def mtools(*args, check=True):
     r = subprocess.run(list(args), capture_output=True, text=True)
     if check and r.returncode:
@@ -239,8 +382,8 @@ def mtools(*args, check=True):
 
 def copy_tree(src, image, offset, dest, exclude=()):
     """Copy src's game files to ::dest on the image, leaving out GOG's own
-    files at its top, manuals (PDF) and the files in exclude (CD images,
-    which the VM mounts as a drive); returns (files, bytes)."""
+    files at its top, manuals (PDF) and the files and folders in exclude (CD
+    images, which the VM mounts as a drive); returns (files, bytes)."""
     exclude = {os.path.realpath(p) for p in exclude}
     target = "%s@@%d" % (image, offset)
     mtools("mmd", "-D", "s", "-i", target, "::" + dest, check=False)  # -D s: an existing one is fine
@@ -249,6 +392,7 @@ def copy_tree(src, image, offset, dest, exclude=()):
         rel = os.path.relpath(dirpath, src)
         if rel == ".":
             dirnames[:] = [d for d in dirnames if d.lower() not in SKIP_DIRS]
+        dirnames[:] = [d for d in dirnames if os.path.realpath(os.path.join(dirpath, d)) not in exclude]
         for d in dirnames:
             mtools("mmd", "-D", "s", "-i", target, "::" + "/".join(p for p in (dest, rel, d) if p and p != "."),
                    check=False)
@@ -261,6 +405,43 @@ def copy_tree(src, image, offset, dest, exclude=()):
             files += 1
             size += os.path.getsize(os.path.join(dirpath, name))
     return files, size
+
+
+def attach_cds(discs, cfg, short):
+    """Put the game's CD (the first of discs, [(drive letter, image or
+    folder)]) into the VM's CD-ROM drive when the image is a VM's disk
+    (86box.cfg next to it), copied to its folder cd/SHORT; further discs go
+    into the drive's recent images. Else say what to attach."""
+    if not discs:
+        return
+    if not os.path.isfile(cfg):
+        for drive, what in discs:
+            print("Drive %s: is a CD in DOSBox: %s. Put it in the VM's CD-ROM drive (86Box's Media menu)." % (
+                drive, what))
+        return
+    dest = os.path.join(os.path.dirname(cfg), "cd", short)
+    ready = []
+    for drive, what in discs:
+        if not os.path.exists(what):
+            print("Drive %s: is the CD %s in DOSBox, which isn't there." % (drive, what))
+            continue
+        to, notes = prepare_cd(what, dest)
+        ready.append((drive, to))
+        for note in notes:
+            print("CD %s: %s." % (os.path.basename(to), note))
+    if not ready:
+        return
+    if not set_cd_image(cfg, ready[0][1], [to for _, to in ready[1:]]):
+        print("The VM has no CD-ROM drive: add one (86Box's Settings, Storage) or make the VM again with "
+              "make_game_vm.sh, then put %s in it." % ready[0][1])
+        return
+    print("CD: %s is in the VM's CD-ROM drive, D: in DOS (copied to %s)." % (os.path.basename(ready[0][1]), dest))
+    if ready[0][0] != "D":
+        print("DOSBox gave the game its CD as %s:. If the game needs that letter, change the VM's "
+              "A:\\AUTOEXEC.BAT line to SHSUCDX /D:?CDROM1,%s." % (ready[0][0], ready[0][0]))
+    if len(ready) > 1:
+        print("More discs: %s, in 86Box's Media menu (CD-ROM 1, recent images) to change discs." % ", ".join(
+            os.path.basename(to) for _, to in ready[1:]))
 
 
 BAT_MARK = "rem gog_import.py: "  # the batch file's second line names the game it starts
@@ -344,9 +525,12 @@ def main():
                 commands = ["cd \\"] + commands  # its "cd" was from C:'s root
         images = [p for kind, what in mounts.values() if kind == "image" for p in what]
         images += [f for p in images for f in cue_files(p)]  # and the tracks their cue sheets list
+        images += [what for kind, what in mounts.values() if kind == "cdfolder"]
         files, size = copy_tree(src, a.image, offset, "/" + dest, images)
+        on_cd = {os.path.realpath(p) for p in images}  # attached as the CD, not left behind
         others = [n for n in os.listdir(game_root) if os.path.join(game_root, n) != src and
-                  not (n.lower() in SKIP_DIRS or SKIP_FILES.match(n))]
+                  not (n.lower() in SKIP_DIRS or SKIP_FILES.match(n)) and
+                  os.path.realpath(os.path.join(game_root, n)) not in on_cd]
 
         # The batch file: the game's commands, on C: (the image's drive).
         bat = (a.batch or short) + ".BAT"
@@ -361,14 +545,22 @@ def main():
         print("%s runs: %s" % (bat, " | ".join(lines[1:])))
         if others and src != game_root:
             print("Not copied (next to the game in GOG's folder): %s" % ", ".join(sorted(others)[:12]))
+        discs = []  # (drive letter, image or folder)
         for drive, (kind, what) in sorted(mounts.items()):
-            if drive != "C" and kind == "image":
-                print("Drive %s: is a CD image in DOSBox: %s. Give the VM a CD-ROM drive with it (and a CD "
-                      "driver plus SHSUCDX/MSCDEX in DOS) for the game to find it." % (drive, ", ".join(what)))
-            elif drive != "C" and kind == "dir":
+            if drive == "C":
+                continue
+            if kind == "image":
+                discs += [(drive, p) for p in what]
+            elif kind == "cdfolder":
+                discs.append((drive, what))
+            elif kind == "disk":
+                print("Drive %s: is the disk image %s in DOSBox: attach it to the VM in 86Box's settings if the "
+                      "game needs it." % (drive, ", ".join(what)))
+            elif kind == "dir":
                 print("Drive %s: is the folder %s in DOSBox; copy it too if the game needs it." % (drive, what))
-            elif drive != "C":
+            else:
                 print("Drive %s: is the folder %s in DOSBox, which isn't there." % (drive, what))
+        attach_cds(discs, os.path.join(os.path.dirname(os.path.abspath(a.image)), "86box.cfg"), short)
         # make_game_vm.sh's machine has DOSBox's defaults: a Sound Blaster 16
         # at 220, IRQ 7, DMA 1, high DMA 5, and EMS (JemmEx).
         sb = settings.get("sblaster", {})

@@ -142,6 +142,47 @@ mode through VCPI, as on most 386+ DOS setups of the time. Use it in place of
 `fdd_01_fn = boot-emm.img`). All four extenders (DOS/4GW, DOS/32A, PMODE/W,
 CauseWay) and FastDoom were tested on it.
 
+## CD-ROM
+
+The game VM (`make_game_vm.sh`) has an IDE CD-ROM drive on the secondary
+channel, and its floppy loads two DOS programs for it, which
+`build_cd_drivers.sh` assembles into `out/cd/` (needs git, patch and nasm):
+
+- `GCDROM.SYS`, the IDE/ATAPI CD-ROM driver: Jack R. Ellis's XCDROM as
+  FreeDOS packages it (GPL 2 or later), at a pinned commit. That version was
+  adapted for SATA and looked for drives at ports 0080h and 0000h unless a
+  native-mode controller was found, so it missed the drive on the PIIX3's
+  legacy channels. `gcdrom-legacy-ide.diff` puts back 01F0h and 0170h, as
+  in XCDROM, and marks the version string "(86Box: legacy IDE)".
+- `SHSUCDX.COM`, the CD-ROM extender (an MSCDEX replacement) that gives the
+  drive a letter: Jason Hood's version of John McCoy's SHSUCDX (zlib
+  license), at a pinned commit.
+
+FDCONFIG.SYS loads GCDROM with `DEVICEHIGH` and `DOS=HIGH,UMB` (JemmEx
+provides the upper memory), and AUTOEXEC.BAT runs `SHSUCDX /D:?CDROM1,D`,
+so the CD is D:. 549 KB of conventional memory stays free.
+
+The disc is an image in the VM's folder: `cdrom_01_image_path` in
+`86box.cfg`, or the Media menu. 86Box reads ISO, cue sheets (BIN and WAV,
+OGG, FLAC or MP3 audio tracks, which must be stereo at 44.1 kHz), CCD, MDS
+and TOC images, and a folder, which it shows as an ISO. `gog_import.py`
+copies a game's disc into the VM folder's `cd/` and sets the path; it
+rewrites GOG's cue sheets (`.ins` naming a `.gog` file) and converts audio
+tracks in other formats with ffmpeg.
+
+`cdinfo.c` checks a drive from inside DOS (Open Watcom:
+`wcl -ms -bt=dos -0 -os cdinfo.c`): through the MSCDEX interface it prints
+the drive letter and the disc's tracks, plays the first audio track for a
+second and checks that the play position moves. It ends with
+`CDINFO: OK (audio plays)` (or `(no audio tracks)`).
+
+Tested on a game VM: an ISO's files read from D:; a GOG-style disc (cue
+sheet, data track, an OGG track at 44.1 kHz stereo and one at 22 kHz mono,
+which the importer converted) imported with `gog_import.py`, where CDINFO
+listed the three tracks and track 2 played; a folder as the disc;
+`smoke_test.py`. `test_gog_import.sh` cases 4 and 5 check the importer's
+CD handling without the emulator.
+
 ## Two more real titles: Second Reality and Wolfenstein 3D
 
 `add_real_titles.sh IMAGE [OFFSET]` copies them from their public GitHub

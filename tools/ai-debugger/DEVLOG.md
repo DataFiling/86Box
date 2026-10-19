@@ -1361,6 +1361,74 @@ Not changed: a reply timeout still drops the connection (with *hold* off,
 that removes the session's points); its message now says so. Discarding
 late replies instead would keep them.
 
+### 29. Game CDs
+
+Many GOG DOS games come with a CD image: GOG's `.ins` cue sheet naming a
+`.gog` data track, often with OGG audio tracks, or a folder DOSBox mounts
+as a CD. 86Box emulates the drive (an ATAPI drive on an IDE channel) and
+reads the disc from an image file; DOS needs a CD driver and an MSCDEX-type
+extender to give it a letter.
+
+**Drivers.** `build_cd_drivers.sh` assembles both from source at pinned
+commits, with nasm: GCDROM (Jack R. Ellis's XCDROM as FreeDOS packages it,
+GPL 2+) and SHSUCDX (Jason Hood after John McCoy, zlib). Unpatched, GCDROM
+found no drive in the game VM. This version was adapted for SATA: with no
+native-mode PCI IDE controller, it looked for drives at 0080h and 0000h
+(`CDATA equ 00080h`) rather than 01F0h and 0170h. The PIIX3 runs its
+channels in legacy mode, so the driver searched the wrong ports.
+`gcdrom-legacy-ide.diff` restores XCDROM's 01F0h; the driver then
+reports "Unit 0: Secondary-master, 86B_CD00, PIO mode".
+
+**Game VM.** `make_game_vm.sh` adds an ATAPI drive at secondary master
+(`cdrom_01_parameters = 1, atapi`, `cdrom_01_ide_channel = 1:0`) and puts
+both programs on the floppy. GCDROM loads with `DEVICEHIGH` and
+`DOS=HIGH,UMB` (JemmEx's upper memory). Free conventional memory went from
+489 KB to 549 KB, with the CD driver loaded. AUTOEXEC.BAT runs
+`SHSUCDX /D:?CDROM1,D`, so the CD is D:, the letter most GOG configs give
+it. Running the script again on a made floppy leaves it unchanged.
+
+**Importer.** `gog_import.py` reads `imgmount` lines (other than floppy
+and hard disk images) and `mount ... -t cdrom` folders as the game's CD.
+It copies the disc to `cd/<GAME>` in the VM's folder, hard-linking when it
+can, and sets `cdrom_01_image_path` in `86box.cfg` relative to that folder.
+Further discs go in the drive's recent images (Media menu). A cue sheet is
+rewritten for 86Box:
+
+- as `.cue`, since 86Box picks the parser by extension and would read
+  `.ins` as an ISO;
+- with `FILE` names as they are on disk;
+- with BINARY, WAVE, AIFF or MP3 types (OGG and FLAC tracks are WAVE;
+  libsndfile reads them by content).
+
+86Box needs audio tracks in stereo at 44.1 kHz and refuses the whole disc
+when one isn't, so the importer reads each track's header (WAV, OGG
+Vorbis, Opus, FLAC, AIFF) and converts the others to WAV with ffmpeg. Without
+ffmpeg it says which tracks won't play. It reports a CD letter other than D:,
+with the AUTOEXEC.BAT change, and the CD's files are no longer listed as
+"Not copied".
+
+**INT log.** `dosinfo.py` decodes INT 2Fh: MSCDEX calls (AH=15h, with the
+drive letter and the installation check's result), redirector calls
+(AH=11h) and the SHARE check. `watch_program` showed SHSUCDX's
+"CD-ROM installation check -> 1 CD-ROM drive(s) from D:".
+
+**Test.** `testdata/cdinfo.c` checks the drive from DOS through MSCDEX: the
+drive letter, the tracks, and a second of the first audio track (the play
+position must move). On a game VM:
+
+- an ISO built with pycdlib read from D:;
+- a GOG-style game (`game.ins` naming `game.gog`, a 44.1 kHz stereo OGG
+  track and a 22 kHz mono one) imported with `gog_import.py`: the second
+  track was converted, D:\README.TXT read, CDINFO listed tracks 1-3, and
+  track 2 played (the position moved 0.74 s in one second, at a slow
+  emulation speed);
+- a folder as the disc;
+- `smoke_test.py`.
+
+`test_gog_import.sh` cases 4 and 5 cover the cue sheet, the conversion,
+the recent images, a CD folder on E:, and that none of the CD's files
+reach C:.
+
 ## Test results
 
 Test machines, built with `-DQT=OFF -DSDL2=ON -DGDBSTUB=ON` and run headless
