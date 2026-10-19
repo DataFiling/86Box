@@ -190,7 +190,8 @@ python3 tools/ai-debugger/gog_import.py game.iso vm/hd.img             # a CD im
     and never opened while scanning (a FIFO would hang);
   - a DOSBox config's mounts and a cue sheet's files must lie inside what
     was given (only a config named on the command line may point
-    elsewhere, as in DOSBox);
+    elsewhere, as in DOSBox); a missing track is written without its
+    folders, and an `.mds` naming its data by a path is refused;
   - names DOS can't have are left out and reported;
   - the host's and the image's free space is checked first (a re-import
     counts the game's earlier copy as free).
@@ -202,7 +203,8 @@ python3 tools/ai-debugger/gog_import.py game.iso vm/hd.img             # a CD im
   names for long ones, in code page 437). `--batch` takes a name without
   `.BAT`, `--dir` a path such as `GAMES\KEEN4`.
 - Each game's CDs get a folder of their own under the VM's `cd/` (CD1,
-  CD2... for several discs).
+  CD2... for several discs), marked with the game's name and the disc, so
+  two games of the same name don't share one.
 - It won't run while a process has the VM's disk open, or while an 86Box's
   command line names the VM (86Box rewrites `86box.cfg` when it closes).
   The report ends with the next steps. `--json` prints the report as JSON
@@ -215,7 +217,9 @@ own tools), so no GOG credentials reach the bridge. No real GOG download
 has been imported yet: `testdata/test_gog_import.sh` tests it on folders
 and a Linux installer laid out as GOG's, and on archives and CD images;
 `testdata/test_import_edge.sh` on hostile archives and the layouts of
-other DOS game collections.
+other DOS game collections; four more scripts there (`test_import_*.sh`)
+on hostile configs and cue sheets, plain games, DOSBox configs and CD
+images.
 
 ## Tools
 

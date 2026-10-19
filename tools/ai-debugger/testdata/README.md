@@ -203,8 +203,21 @@ headers). It tries:
 - `--json`;
 - an 86Box running in the VM's folder.
 
-7-Zip, bsdtar and ffmpeg cases are skipped where those aren't installed.
-`KEEP=1` keeps the work folder.
+Four more scripts check the fixes from the importer's second review, one
+area each, also with fake programs:
+
+| Script | Cases | What it checks |
+|---|---|---|
+| `test_import_security.sh` | 8 | A config, cue sheet or `.toc` in a download naming host files or `/dev/zero`; FIFOs; malformed tracks; `--json` errors; a running 86Box |
+| `test_import_plain.sh` | 15 | Which program the batch file starts, and that DOS can follow its `cd` and program names (8.3, CP437) |
+| `test_import_dosbox.sh` | 13 | GOG's and other packagers' configs: what lands on C:, and the batch file walked through as DOS would |
+| `test_import_cd.sh` | 9 | UTF-8 cue sheets, loose music per disc, `cd/` folders per game, cdrdao `.toc`, folders named CD that aren't one |
+
+These four print `FAIL: case N: why` for a failed case, carry on, and
+print `PASS` when none failed; `IMPORT=path` runs them on another copy of
+the importer. In all six scripts, cases needing 7-Zip, bsdtar, innoextract
+or ffmpeg are skipped where those aren't installed, and `KEEP=1` keeps the
+work folder.
 
 ## Two more real titles: Second Reality and Wolfenstein 3D
 

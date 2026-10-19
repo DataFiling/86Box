@@ -1646,11 +1646,32 @@ reproduced their findings: 56 of 57 held. The worst:
   - the 86Box check reads its command line as 86Box does, and looks for
     the open disk.
 
+**A test pass.** Four agents then wrote regression scripts for the fixes,
+one per area (security, plain games, DOSBox configs, CD images). Their 45
+cases found five more problems:
+
+- A cue sheet or `.toc` naming a missing file was copied with that name
+  as written, `../` or absolute, and 86Box would open it. The name is now
+  written without its folders. An Alcohol `.mds` names its data file
+  inside the image, and 86Box follows that path too; one naming a path is
+  refused (convert it to an ISO or BIN/CUE).
+- `--run "My Game.exe -x"` took `My` for the program. The program is now
+  the longest run of words naming a file.
+- `mshortname` prints short names in code page 437, which were read as
+  UTF-8: a batch file for 'Données' named a folder DOS doesn't have.
+- Two games of the same name shared one `cd/` folder, the second
+  overwriting the first's disc. The folder's mark now also holds the
+  disc's volume label and size.
+- A CD-named folder two levels down (`SOUND\CD`) in a game whose programs
+  are at the top went into the CD drive. It is now the game's data.
+
 **Tests.** `test_gog_import.sh` has cases 6-13: zip, 7z, ISO, raw image,
 nested GOG installer, installer-only folder, `--run`, a `../` 7z, and two
 same-named discs imported twice. `test_import_edge.sh` has 14 more cases,
-from the review's reproductions and the research's layouts; it runs
-without the real titles.
+from the review's reproductions and the research's layouts. The test
+pass's scripts are `test_import_security.sh`, `test_import_plain.sh`,
+`test_import_dosbox.sh` and `test_import_cd.sh`. Only `test_gog_import.sh`
+needs the real titles.
 
 ## Test results
 

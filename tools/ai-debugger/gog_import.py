@@ -1017,6 +1017,22 @@ def convert_track(track, dest, name):
     return ok
 
 
+def bare_name(name):
+    """A file name without its folders (or ".." or "/"), for a sheet that
+    names a file that isn't there."""
+    n = re.split(r"[\\/]", name)[-1]
+    return n if n not in ("", ".", "..") else "missing"
+
+
+def mds_paths(mds):
+    """The paths an Alcohol .mds names for its data (86Box opens them as
+    written, "../" and "/x" too): names with a folder in them."""
+    data = read_head(mds, 1 << 20)
+    names = [m.group(1).decode("latin-1") for m in re.finditer(rb"([\x20-\x7e]{3,})\x00", data)]
+    names += [m.group(1).decode("utf-16-le", "replace") for m in re.finditer(rb"((?:[\x20-\x7e]\x00){3,})\x00\x00", data)]
+    return [n for n in names if re.search(r"[\\/]|\.\.", n) and re.search(r"\.\w{2,4}$", n)]
+
+
 def playable(track):
     """86Box will play the track as it is, or ffmpeg can make it so."""
     return audio_format(track) == (2, 44100) or bool(shutil.which("ffmpeg"))
@@ -1037,9 +1053,9 @@ def rewrite_cue(lines, base, dest, stem, notes, known=None):
         indent, name, ftype = m.group(1), m.group(2) or m.group(3), m.group(4).upper()
         named += 1
         track = (known or {}).get(name) or cue_track(base, name)
-        if track is None:
+        if track is None:  # written as a bare name: 86Box would follow "../" or "/x" out of the VM's folder
             notes.append("the cue sheet names %s, which isn't there: 86Box will refuse the disc" % name)
-            out.append(line)
+            out.append('%sFILE "%s" %s' % (indent, bare_name(name), ftype or "BINARY"))
             continue
         found += 1
         new = os.path.basename(track)
@@ -1131,7 +1147,7 @@ def prepare_cd(source, dest, label=None, tracks=()):
             f = cue_track(os.path.dirname(source), m.group(2))
             if f is None:
                 notes.append("the .toc names %s, which isn't there: 86Box will refuse the disc" % m.group(2))
-                return m.group(0)
+                return m.group(1) + bare_name(m.group(2)) + m.group(3)
             link_or_copy(f, os.path.join(dest, os.path.basename(f)))
             return m.group(1) + os.path.basename(f) + m.group(3)
         text = re.sub(TOC_FILE, place, text, flags=re.M | re.I)
@@ -1142,6 +1158,11 @@ def prepare_cd(source, dest, label=None, tracks=()):
     if ext.lower() not in (".cue", ".ins") and not cue_files(source):
         to = os.path.join(dest, os.path.basename(source))  # an ISO, or another image with its files
         link_or_copy(source, to)
+        if ext.lower() == ".mds" and mds_paths(source):
+            os.unlink(to)
+            notes.append("it names its data as %s, a path 86Box would follow out of the VM's folder: convert the "
+                         "image to an ISO or BIN/CUE" % mds_paths(source)[0])
+            return None, notes
         if ext.lower() in (".ccd", ".mds"):
             for f in companions(source):  # 86Box opens a .ccd's or .mds's files by its stem, in lower case
                 link_or_copy(f, os.path.join(dest, stem + os.path.splitext(f)[1].lower()))
@@ -1211,18 +1232,29 @@ def set_cd_image(cfg, image, others=()):
 CD_MARK = ".gog_import"  # in each game's folder under cd/: the game's name
 
 
-def cd_folder(vmdir, short, game):
+def disc_id(what):
+    """What tells a disc from another with the same file names: a folder's
+    name, an image's volume label and data size."""
+    if os.path.isdir(what):
+        return os.path.basename(what.rstrip("/")).lower()
+    root, track = cd_root(what), data_track(what)
+    return "%s %d" % (root[0] if root else "", os.path.getsize(track) if track and regular(track) else 0)
+
+
+def cd_folder(vmdir, short, game, ident):
     """The game's folder under the VM's cd/: SHORT, or SHORT with a digit
-    when another game has that one (its mark file names the game)."""
+    when another game (or another disc of the same name) has that one; its
+    mark file names the game and the disc."""
     for n in range(10):
         d = os.path.join(vmdir, "cd", short if n == 0 else short[:7] + str(n))
         mark = os.path.join(d, CD_MARK)
         if not os.path.exists(d):
             os.makedirs(d)
             with open(mark, "w", encoding="utf-8") as f:
-                f.write(game + "\n")
+                f.write(game + "\n" + ident + "\n")
             return d
-        if regular(mark) and read_head(mark, 4096).decode("utf-8", "replace").strip().lower() == game.lower():
+        lines = read_head(mark, 4096).decode("utf-8", "replace").splitlines() if regular(mark) else []
+        if lines and lines[0].strip().lower() == game.lower() and (len(lines) < 2 or lines[1].strip() == ident):
             return d
     sys.exit("cd/%s and nine more folders like it hold other games' CDs." % short)
 
@@ -1256,7 +1288,7 @@ def attach_cds(discs, cfg, short, game):
         if inside(what, os.path.join(vmdir, "cd")):
             ready.append((drive, what))  # the VM's own copy, from an earlier import: used where it is
             continue
-        dest = dest or cd_folder(vmdir, short, game)
+        dest = dest or cd_folder(vmdir, short, game, disc_id(found[0][1]))
         to, notes = prepare_cd(what, os.path.join(dest, "CD%d" % (n + 1)) if len(found) > 1 else dest, label,
                                tracks)
         for note in notes:
@@ -1378,6 +1410,8 @@ def find_cds(top):
         while above != top and inside(above, top):  # inside a folder of programs: the game's own data
             nested = nested or holds_programs(above)
             above = os.path.dirname(above)
+        if os.path.dirname(d) != top:  # (a CD folder right beside the programs at the top is still a CD)
+            nested = nested or holds_programs(top)
         own = holds_programs(d) and not any(holds_programs(dp) for dp, _, _ in os.walk(top)
                                             if not inside(dp, d))
         if nested or own or any(os.path.realpath(f) in parts for f in files) or \
@@ -1719,26 +1753,34 @@ def rank_programs(folder, games, hints, title):
     return [(p, s, why) for s, _, p, why in ranked]
 
 
+def find_program(folder, name):
+    """A program in folder by its name, with or without extension (DOS's
+    order: .COM, .EXE, .BAT); None."""
+    p = find_ci(folder, name) if os.path.splitext(name)[1] else next(
+        (q for q in (find_ci(folder, name + e) for e in (".COM", ".EXE", ".BAT")) if q), None)
+    return p if p and regular(p) else None
+
+
 def resolve_run(folder, cmd, batch=None):
-    """--run's command with its program as named in folder (GAME gives
-    GAME.EXE, as DOS would pick; after LOADFIX, CALL or LH, the program is
-    the second word). A command whose program isn't there is written as
-    given (DOS's own commands), except one that would start the batch file
-    being written (DOS would find C:\\BATCH.BAT on the PATH, again and
-    again)."""
+    """--run's command as ([words before the program], program, [its
+    arguments]): the program as named in folder (GAME gives GAME.EXE, as DOS
+    would pick; a name with spaces is the longest run of words naming a
+    file; after LOADFIX, CALL or LH, it is the second word). A command whose
+    program isn't there is kept as given (DOS's own commands), except one
+    that would start the batch file being written (DOS would find
+    C:\\BATCH.BAT on the PATH, again and again)."""
     words = cmd.split()
     at = 1 if len(words) > 1 and words[0].lower() in ("loadfix", "call", "lh", "loadhigh") else 0
+    for end in range(len(words), at, -1):
+        found = find_program(folder, " ".join(words[at:end]).replace("\\", "/"))
+        if found:
+            return words[:at], os.path.relpath(found, folder), words[end:]
     prog = words[at]
-    found = find_ci(folder, prog) if os.path.splitext(prog)[1] else next(
-        (p for p in (find_ci(folder, prog + e) for e in (".COM", ".EXE", ".BAT")) if p), None)
-    if found and regular(found):
-        words[at] = os.path.relpath(found, folder).replace("/", "\\")
-        return " ".join(words)
     if batch and os.path.splitext(prog)[0].lower() == batch.lower():
         sys.exit("--run %s: there is no %s in the game's folder, and DOS would start C:\\%s.BAT itself "
                  "instead, again and again." % (cmd, prog, batch))
     warn("--run %s: %s isn't a program in the game's folder; written as given." % (cmd, prog))
-    return cmd
+    return words[:at], prog, words[at + 1:]
 
 
 # ---- names ---------------------------------------------------------------------
@@ -1859,8 +1901,12 @@ def write_batch(target, bat, name, commands):
 
 def dos_path(target, path):
     """The name DOS sees for ::path (its 8.3 short name, for a long one)."""
-    r = mtools("mshortname", "-i", target, "::" + path, check=False)
-    out = r.stdout.strip()
+    try:  # it prints the short name in DOS's code page, whatever the locale
+        r = subprocess.run(["mshortname", "-i", target, "::" + path], capture_output=True, env=MTOOLS_ENV,
+                           stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return path
+    out = r.stdout.decode("cp437").strip()
     return out[2:] if r.returncode == 0 and out.startswith("::") else path
 
 
@@ -2020,7 +2066,8 @@ def import_dosbox(a, root, name, settings, mounts, commands, target, cfg, owners
         if not cds[0].startswith("\\"):
             commands = ["cd \\"] + commands  # its "cd" was from C:'s root
     if a.run:
-        commands = ["cd " + run_dir, resolve_run(own, a.run, short)]
+        pre, prog, post = resolve_run(own, a.run, short)
+        commands = ["cd " + run_dir, " ".join(pre + [prog.replace(os.sep, "\\")] + post)]
     images = [p for m in mounts.values() if m[0] == "image" for p in m[1]]
     images += [f for p in images for f in companions(p)]  # and the tracks their cue sheets list
     images += [m[1] for m in mounts.values() if m[0] == "cdfolder"]
@@ -2126,18 +2173,17 @@ def rank_installers(folder, programs, why):
 
 
 def config_program(commands, folder):
-    """The program a DOSBox config's commands start that is in folder, with
-    its arguments (DOS's order: .COM, .EXE, .BAT), or None."""
+    """The program a DOSBox config's commands start that is in folder (DOS's
+    order: .COM, .EXE, .BAT), as ([], program, [its arguments]); None."""
     for c in commands:
         words = c.split()
         if words and words[0].lower() == "call":
             words = words[1:]
         if not words or re.fullmatch(r"[A-Za-z]:|cd(\s.*)?", words[0], re.I):
             continue
-        p = find_ci(folder, words[0]) if os.path.splitext(words[0])[1] else next(
-            (q for q in (find_ci(folder, words[0] + e) for e in (".COM", ".EXE", ".BAT")) if q), None)
-        if p and regular(p):
-            return " ".join([os.path.basename(p)] + words[1:])
+        p = find_program(folder, words[0])
+        if p:
+            return [], os.path.basename(p), words[1:]
     return None
 
 
@@ -2211,12 +2257,12 @@ def import_plain(a, top, name, target, cfg, owners, hint=()):
     installers = rank_installers(folder, programs, why)
     hints = [name, os.path.basename(folder) if folder != top or os.path.isdir(a.source) else ""]
     ranked = []
-    if a.run:
+    if a.run:  # start: ([words before], program, [arguments])
         start, how = resolve_run(folder, a.run, short), "given (--run)"
     else:
         ranked = rank_programs(folder, games, hints, name)
         configured = config_program(hint, folder)  # a DOSBox config's program
-        start = configured or (ranked[0][0] if ranked else None)
+        start = configured or (([], ranked[0][0], []) if ranked else None)
         how = "the DOSBox configuration" if configured else "guessed: %s" % ", ".join(ranked[0][2]) if ranked \
             else None
         REPORT["candidates"] = [{"program": p, "score": s, "why": w} for p, s, w in ranked[:5]]
@@ -2234,22 +2280,22 @@ def import_plain(a, top, name, target, cfg, owners, hint=()):
     dos_dir = dos_path(target, host_dir)
     run_in = "C:" + dos_dir.replace("/", "\\")
 
-    def dos_command(cmd):
-        words = cmd.split()
-        at = 1 if len(words) > 1 and words[0].lower() in ("loadfix", "call", "lh", "loadhigh") else 0
-        prog = words[at].replace("\\", "/")
-        if find_ci(folder, prog):
-            words[at] = dos_path(target, host_dir + "/" + os.path.relpath(find_ci(folder, prog), folder).replace(
-                os.sep, "/"))[len(dos_dir) + 1:].replace("/", "\\")
-        if not SHORT_NAME.match(words[at].split("\\")[-1]):
-            warn("%s isn't a name DOS can use; the batch file may not start it." % words[at])
-        return " ".join(words)
+    def dos_command(start):  # the program as DOS sees it on C:
+        pre, prog, post = start
+        found = find_ci(folder, prog.replace("\\", "/"))
+        name = dos_path(target, host_dir + "/" + os.path.relpath(found, folder).replace(os.sep, "/"))[
+            len(dos_dir) + 1:].replace("/", "\\") if found else prog
+        if not all(SHORT_NAME.match(x) for x in name.split("\\")) or \
+                os.path.splitext(name.split("\\")[-1])[0].lower() == short.lower() and not found:
+            sys.exit("The batch file can't name %s as DOS would (it has no 8.3 name to use): give --run "
+                     "with another program." % prog)
+        return " ".join(pre + [name] + post)
     REPORT.update(dir=where, run_source=how)
     if extras:
         REPORT["not_copied"] = extras
     bat = short + ".BAT"
     if start is None and installers:  # the batch file runs the installer
-        lines = write_batch(target, bat, name, ["cd " + run_in[2:], dos_command(installers[0])])
+        lines = write_batch(target, bat, name, ["cd " + run_in[2:], dos_command(([], installers[0], []))])
         REPORT.update(batch="C:\\" + bat, runs=lines, run_source="the game's installer", next=["C:\\" + bat])
         say("%s: %d files (%d KB) copied to %s." % (name, files, size // 1024, where))
         say("It is the game's installer: C:\\%s runs it (%s\\%s). Install the game to C:, then start it from "
@@ -2267,8 +2313,7 @@ def import_plain(a, top, name, target, cfg, owners, hint=()):
         say("%s: %d files (%d KB) copied to %s; run C:\\%s." % (name, files, size // 1024, where, bat))
         say("%s runs: %s (%s)" % (bat, " | ".join(lines), how))
         if not a.run:
-            started = start.split()[0].lower()
-            rest = [p for p in programs if p.lower() != started]
+            rest = [p for p in programs if p.lower() != start[1].lower()]
             close = [r for r in ranked[1:3] if r[1] == ranked[0][1]] if how.startswith("guessed") else []
             if close:
                 warn("It could also be %s: run the game once to see, and import again with --run \"PROGRAM\" "
