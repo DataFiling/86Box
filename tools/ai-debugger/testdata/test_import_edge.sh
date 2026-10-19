@@ -137,7 +137,7 @@ if command -v bsdtar > /dev/null; then
     ln -s /etc/passwd "$W/6/LINKY/PASSWD"
     mkfifo "$W/6/LINKY/FIFO"
     (cd "$W/6" && bsdtar --format 7zip -cf "$W/links.7z" LINKY)
-    for t in python3 bsdtar mdir mcopy mmd mtype minfo mdeltree mformat; do ln -s "$(command -v $t)" "$W/bsdonly/$t"; done
+    for t in python3 bsdtar mdir mcopy mmd mtype minfo mdeltree mformat mshortname mdu; do ln -s "$(command -v $t)" "$W/bsdonly/$t"; done
     PATH="$W/bsdonly" "$(command -v timeout)" 60 python3 "$IMPORT" "$W/links.7z" "$HD" > "$W/6.out" 2>&1 ||
         fail "the 7z with links should import (or it hung): $(cat "$W/6.out")"
     mdir -b -i "$C" ::/LINKY | grep -qi 'passwd\|fifo' && fail "the link or the FIFO reached C:"

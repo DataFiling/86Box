@@ -61,6 +61,7 @@ cp "$SRC/wolf3d/WOLFSRC/WOLF3D.EXE" "$G2/"
 printf 'FILE "game.gog" BINARY\r\n  TRACK 01 MODE1/2352\r\n    INDEX 01 00:00:00\r\n' > "$G2/game.ins"
 head -c 4096 /dev/zero > "$G2/game.gog"   # the CD's data track, which the cue sheet names
 echo manual > "$G2/manual.pdf"
+touch "$G2/unins000.exe" "$G2/gog.ico"   # GOG's own files, next to a game run from C:'s root
 printf '[sblaster]\nsbtype=sb16\nirq=5\n[dos]\nems=false\n[autoexec]\n# Lines in this section will be run at startup.\nmount C ".."\nimgmount D "..\\game.ins" -t iso\nc:\nWOLF3D.EXE\nexit\n' > "$G2/dosboxWolf.conf"
 printf '{"name": "Wolfenstein 3D", "playTasks": [{"isPrimary": true, "arguments": "-conf \\"..\\\\dosboxWolf.conf\\"", "workingDir": "DOSBOX"}]}\n' > "$G2/goggame-2.info"
 
@@ -227,6 +228,7 @@ if [ -n "$SEVEN" ]; then
         *) (cd "$W/7z" && "$SEVEN" a -bd "$W/Space Game.7z" SPACEGM CD > /dev/null) ;;
     esac
     python3 "$HERE/../gog_import.py" "$W/Space Game.7z" "$HD" > "$W/7z.out"; cat "$W/7z.out"
+    [ -z "$(ls -A "$(dirname "$HD")" | grep '^\.import-')" ] || fail "the unpacking folder was left behind"
     cp "$W/86box.cfg" "$W/86box.cfg.7"
 else
     echo "(no 7z or bsdtar: case 7 skipped)"
@@ -291,11 +293,13 @@ if command -v bsdtar > /dev/null; then
     (cd "$W/evil/in" && bsdtar --format 7zip -P -cf "$W/evil.7z" ../x.txt)
     out=$(python3 "$HERE/../gog_import.py" "$W/evil.7z" "$HD" 2>&1) && fail "a 7z with ../ should be refused"
     case "$out" in *outside*|*"Path contains"*|*".."*) ;; *) echo "FAIL: ../ refused with: $out"; exit 1 ;; esac
+else
+    echo "(no bsdtar: case 12 skipped)"
 fi
 
 [ "$(mdir -b -i "$IMG" ::/SR/DATA | wc -l)" = 79 ] || fail "SR\\DATA should hold 79 parts"
 mtype -i "$IMG" ::/SECONDRE.BAT | tr -d '\r' | grep -qx "cd SR" || fail "SECONDRE.BAT should cd into SR"
-mdir -b -i "$IMG" ::/ | grep -qi "unins000\|gog.ico\|dosbox" && fail "GOG's own files were copied"
+mdir -/ -b -i "$IMG" ::/ | grep -qi "unins000\|gog.ico\|dosbox\|goggame" && fail "GOG's own files were copied"
 [ "$(mdir -b -i "$IMG" ::/WOLFENST)" = "::/WOLFENST/WOLF3D.EXE" ] || fail "WOLFENST should hold only WOLF3D.EXE (no CD image, no manual)"
 mtype -i "$IMG" ::/WOLFENST.BAT | tr -d '\r' | grep -qx 'cd \\WOLFENST' || fail "WOLFENST.BAT should cd into its folder"
 mtype -i "$IMG" ::/WOLFENST.BAT | grep -q '#' && fail "a config comment became a command"
@@ -307,9 +311,9 @@ mtype -i "$HD@@32256" ::/WOLFENST.BAT | tr -d '\r' | grep -q SETUP && fail "the 
 out=$(python3 "$HERE/../gog_import.py" "$G" "$IMG" --offset 512 2>&1) && fail "a wrong --offset should fail"
 case "$out" in *Traceback*|"") fail "a wrong --offset should fail with mtools' error: $out" ;; esac
 # 4: the cue sheet as 86Box needs it, the second disc in the recent images.
-C4="$W/cd/CDGAME"
-grep -qx 'cdrom_01_image_path = cd/CDGAME/game.cue' "$W/86box.cfg.4" || fail "the VM's drive should hold cd/CDGAME/game.cue"
-grep -qx 'cdrom_01_image_history_01 = cd/CDGAME/disc2.iso' "$W/86box.cfg.4" || fail "disc 2 should be in the recent images"
+C4="$W/cd/CDGAME/CD1"
+grep -qx 'cdrom_01_image_path = cd/CDGAME/CD1/game.cue' "$W/86box.cfg.4" || fail "the VM's drive should hold cd/CDGAME/CD1/game.cue"
+grep -qx 'cdrom_01_image_history_01 = cd/CDGAME/CD2/disc2.iso' "$W/86box.cfg.4" || fail "disc 2 should be in the recent images"
 tr -d '\r' < "$C4/game.cue" | grep -qx 'FILE "game.gog" BINARY' || fail "the cue should name game.gog as it is on disk"
 [ "$(stat -c %h "$C4/game.gog")" = 2 ] || fail "the data track should be a hard link, not a copy"
 if command -v ffmpeg > /dev/null; then
@@ -319,7 +323,7 @@ if command -v ffmpeg > /dev/null; then
 else
     grep -q "Track03.WAV is 1 channels at 22050 Hz" "$W/cd.out" || fail "track 3's format should be reported"
 fi
-mdir -b -i "$HD@@32256" ::/GAME | grep -qi "gog\|ins\|iso" && fail "the CD's files were copied to C:"
+mdir -/ -b -i "$HD@@32256" ::/ | grep -qi "game.gog\|game.ins\|disc2.iso" && fail "the CD's files were copied to C:"
 grep -i "Not copied" "$W/cd.out" | grep -qi "game.ins\|game.gog\|track0\|disc2" && fail "the CD's files were listed as not copied"
 # 5: the folder as the CD, not on C:, and the letter noted.
 grep -qx 'cdrom_01_image_path = cd/FOLDERCD/FOLDCD' "$W/86box.cfg.5" ||
@@ -329,7 +333,7 @@ mdir -b -i "$HD@@32256" ::/FOLDERCD | grep -q "/CD" && fail "the CD folder was c
 grep -q "as E:" "$W/folder.out" || fail "the E: letter should be reported"
 # 6: KEEN4 as it is, the game picked, no Mac files, the Windows programs not offered.
 [ "$(mdir -b -i "$HD@@32256" ::/KEEN4 | wc -l)" = 6 ] || fail "C:\\KEEN4 should hold the zip's 6 files"
-mdir -b -i "$HD@@32256" ::/ | grep -qi MACOSX && fail "__MACOSX was copied"
+mdir -/ -b -i "$HD@@32256" ::/ | grep -qi MACOSX && fail "__MACOSX was copied"
 mtype -i "$HD@@32256" ::/KEEN4.BAT | tr -d '\r' | tail -2 | tr '\n' ' ' | grep -qx 'cd \\KEEN4 KEEN4E.EXE ' ||
     fail "KEEN4.BAT should run KEEN4E.EXE in C:\\KEEN4"
 grep -q "Commander Keen 4:" "$W/zip.out" || fail "the game's name should come from the archive's"
@@ -342,7 +346,6 @@ if [ -n "$SEVEN" ]; then
     tr -d '\r' < "$W/cd/SPACEGM/space.cue" | grep -qx 'FILE "space.bin" BINARY' || fail "the cue should name space.bin"
     tr -d '\r' < "$W/cd/SPACEGM/space.cue" | grep -qx 'FILE "Track 02.ogg" WAVE' || fail "the OGG track should be WAVE"
     mdir -b -i "$HD@@32256" ::/ | grep -qi "/CD/\|space.bin" && fail "the CD was copied to C:"
-    [ -z "$(ls -A "$(dirname "$HD")" | grep '^\.import-')" ] || fail "the unpacking folder was left behind"
 fi
 # 8: the ISO in the drive, its installer reported, nothing on C:.
 grep -qx 'cdrom_01_image_path = cd/BIGGAMEC/Big Game CD.iso' "$W/86box.cfg.8" || fail "the ISO should be in the drive"

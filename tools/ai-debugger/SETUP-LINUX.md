@@ -28,12 +28,13 @@ sudo apt install build-essential cmake ninja-build pkg-config git \
     libfreetype-dev libgles2-mesa-dev libpng-dev librtmidi-dev libopenal-dev \
     libslirp-dev libfluidsynth-dev libvdeplug-dev libserialport-dev libzstd-dev \
     qtbase5-dev qtbase5-private-dev qttools5-dev qttranslations5-l10n \
-    libsdl2-dev python3-venv mtools innoextract p7zip-full
+    libsdl2-dev python3-venv mtools innoextract p7zip-full libarchive-tools
 ```
 
 The last line covers SDL (for the build), Python for the bridge, and the game
-importer's tools (mtools; innoextract for GOG's installers; 7-Zip for 7z,
-rar and other archives). If your distribution has a `7zip` package,
+importer's tools: mtools; innoextract for GOG's installers; 7-Zip for 7z,
+lzh and arj archives; bsdtar (libarchive-tools) for rar, which Debian's and
+Ubuntu's 7-Zip can't unpack. If your distribution has a `7zip` package,
 `sudo apt install 7zip` gives a newer 7-Zip than p7zip-full.
 
 ## 2. Build 86Box with the debugger
@@ -227,7 +228,7 @@ cmake --build ~/86Box/build/regular
 | `MCP server 86box already exists` from `claude mcp add` | `claude mcp remove 86box -s user`, then add again |
 | The 86Box window stays black | The machine is paused: see step 6 |
 | Tools time out | 86Box was paused from its own menu: resume it there |
-| `7-Zip is needed to unpack` | `sudo apt install 7zip` (or `p7zip-full`) |
+| `7-Zip is needed to unpack` | `sudo apt install 7zip` (or `p7zip-full`); for rar, `sudo apt install libarchive-tools` |
 | `86Box (process N) is running this VM` | Close 86Box first: it holds the disk and rewrites `86box.cfg` when it closes |
 | The batch file starts the wrong program | Import again with `--run PROGRAM` (the importer listed the candidates and why it picked one) |
 | `Not a supported Inno Setup installer` | The installer is newer than your innoextract: use the game's installed folder (step 7), or a newer innoextract (github.com/dscharrer/innoextract) |

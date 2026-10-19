@@ -1474,9 +1474,10 @@ zips, CD rips. So did a design review that tried hostile archives against
 - A failed mcopy removes the folder it created and says which file failed.
 - mtools runs with `DEFAULT_CODEPAGE=437`, as DOS has it (mtools defaults
   to 850), and a UTF-8 locale.
-- The importer refuses to run while an 86Box process has the VM's folder.
-  That process holds the disk, and rewrites 86box.cfg from memory when it
-  closes.
+- The importer refuses to run while a process has the VM's disk image
+  open (86Box keeps it open), or an 86Box's command line names the VM's
+  folder. Such a process holds the disk, and 86Box rewrites 86box.cfg
+  from memory when it closes.
 
 **Games without a DOSBox configuration.** If no DOSBox config is found, the
 game is copied as it is. So is a non-GOG config whose C: can't be found;
@@ -1590,6 +1591,60 @@ for agents; the text then goes to stderr.
   and redirector calls as "ok". It now shows the error. Without a CD
   extender, 150Bh and 150Ch say that none answered.
 - `cdinfo` ignored track-info errors, and failed once after a disc change.
+
+**Second review.** Five reviewers read the reworked importer (security,
+plain games, DOSBox configs, CD images, docs and tests). A verifier per area
+reproduced their findings: 56 of 57 held. The worst:
+
+- A DOSBox config or a cue sheet in a download could name any host file or
+  folder: an absolute path, or `..` past the source. The importer would
+  copy an `~/.ssh` folder onto C:, or link `/dev/zero` into the VM's
+  `cd/` folder until the disk filled. Every path a source names now has
+  to lie inside it: mounts, `-conf`, the play task's working folder, cue,
+  TOC, CCD and MDS files. Only a config named on the command line may
+  point elsewhere, as in DOSBox. Files are probed only when they are
+  regular, so a FIFO can't hang the import.
+- Batch files named long folders and programs, which DOS can't use ("Doom
+  II", "Keen Dreams.exe": the latter even made the batch file call itself
+  through the PATH). They now name what DOS sees (`mshortname`), in code
+  page 437.
+- One game's batch file could overwrite another's: "Wing Commander"
+  matched "Wing Commander II"'s mark line as a substring.
+- When a game's folder on C: was taken, the whole C: mount was copied (all
+  of eXoDOS's games), and absolute `cd`s were made relative. Now only the
+  game's folder goes into C:\NEW\TOP, its `cd \X`s rebased onto it.
+- A GOG config given directly mounted from its own folder instead of
+  DOSBox's working folder, so it copied the folder above the game.
+  Configs given directly took the config's name, so every eXoDOS game was
+  named "dosbox".
+- `imgmount` without `-t`, or a numbered drive, put hard disk images into
+  the CD drive.
+- Others:
+  - DOSBox built-ins (INTRO, BOOT) are left out only when the game has no
+    program of that name;
+  - DM.EXE and BUILD.EXE are skipped only next to Doom or a Build game;
+  - installer batch files that drive DEICE come first;
+  - floppies are searched for the program on every disk;
+  - helper batch files (NOSOUND.BAT) no longer outrank the game;
+  - `--run` accepts DOS commands (LOADFIX GAME.EXE);
+  - `--dir GAMES\SR` works, and `--batch NAME.BAT` no longer gives
+    NAME.BAT.BAT;
+  - a re-import counts the game's earlier copy as free space, and an older
+    import (empty mark) is recognised by its files;
+  - Windows `setup_*.exe` files that aren't Inno installers no longer stop
+    the import;
+  - UTF-8 cue sheets are read as UTF-8;
+  - loose music tracks belong to their disc, and keep their numbers (a
+    silent track stands in for a missing one);
+  - an ISO whose loose music can't be converted goes in without it;
+  - each game's CDs get their own folder under `cd/`, marked with its
+    name;
+  - a cdrdao `.toc`'s AUDIOFILE tracks are copied and its names rewritten;
+  - CD-named game folders (CD-MAN, SOUND\CD) stay on C:;
+  - RAR goes through bsdtar where 7-Zip has no RAR codec;
+  - `--json` reports early errors too;
+  - the 86Box check reads its command line as 86Box does, and looks for
+    the open disk.
 
 **Tests.** `test_gog_import.sh` has cases 6-13: zip, 7z, ISO, raw image,
 nested GOG installer, installer-only folder, `--run`, a `../` 7z, and two

@@ -133,7 +133,7 @@ elsewhere too:
 python3 tools/ai-debugger/gog_import.py setup_game.exe vm/hd.img       # a Windows installer (needs innoextract)
 python3 tools/ai-debugger/gog_import.py gog_game.sh vm/hd.img          # a Linux installer
 python3 tools/ai-debugger/gog_import.py "/path/to/GOG Games/Game" vm/hd.img   # or an installed game
-python3 tools/ai-debugger/gog_import.py game.zip vm/hd.img             # a zip or 7z archive (7z needs 7-Zip or bsdtar), or a folder
+python3 tools/ai-debugger/gog_import.py game.zip vm/hd.img             # a zip, 7z or rar archive (7-Zip, bsdtar), or a folder
 python3 tools/ai-debugger/gog_import.py game.iso vm/hd.img             # a CD image (.iso, .cue, .ccd, .mds, raw .bin)
 ```
 
@@ -182,20 +182,31 @@ python3 tools/ai-debugger/gog_import.py game.iso vm/hd.img             # a CD im
   system (ISO 9660 or High Sierra, in 2048-, 2352- or 2448-byte sectors)
   and names its DOS installer. An ISO with loose music tracks gets a cue
   sheet for them.
-- Archives are untrusted:
+- Archives and folders are untrusted:
   - zips are unpacked by hand;
-  - 7z, rar, lzh and arj go through 7-Zip (or bsdtar for 7z), after its
-    listing is checked;
-  - anything that isn't a plain file or folder is removed before copying;
+  - 7z, lzh and arj go through 7-Zip after its listing is checked, and
+    rar through bsdtar where 7-Zip lacks the codec (Debian, Ubuntu);
+  - anything that isn't a plain file or folder is removed before copying,
+    and never opened while scanning (a FIFO would hang);
+  - a DOSBox config's mounts and a cue sheet's files must lie inside what
+    was given (only a config named on the command line may point
+    elsewhere, as in DOSBox);
   - names DOS can't have are left out and reported;
-  - the host's and the image's free space is checked first.
+  - the host's and the image's free space is checked first (a re-import
+    counts the game's earlier copy as free).
 
   Unpacking goes to a hidden folder next to the VM, which is removed
   afterwards. An archive holding a GOG installer, or only other archives,
   is unpacked a level further.
-- It won't run while 86Box has the VM open (86Box rewrites `86box.cfg` when
-  it closes). The report ends with the next steps. `--json` prints the
-  report as JSON (the text then goes to stderr), for agents.
+- The batch file names folders and programs as DOS sees them (8.3 short
+  names for long ones, in code page 437). `--batch` takes a name without
+  `.BAT`, `--dir` a path such as `GAMES\KEEN4`.
+- Each game's CDs get a folder of their own under the VM's `cd/` (CD1,
+  CD2... for several discs).
+- It won't run while a process has the VM's disk open, or while an 86Box's
+  command line names the VM (86Box rewrites `86box.cfg` when it closes).
+  The report ends with the next steps. `--json` prints the report as JSON
+  (the text then goes to stderr), errors included, for agents.
 
 It finds the FAT partition from the image's partition table; `--offset`
 gives its byte offset instead (0 for a floppy). An mtools error is shown
