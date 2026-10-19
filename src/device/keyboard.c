@@ -28,6 +28,7 @@
 #include <86box/device.h>
 #include <86box/keyboard.h>
 #include <86box/plat.h>
+#include <86box/thread.h>
 
 #include "cpu.h"
 
@@ -146,9 +147,16 @@ keyboard_toggle_override(void)
     override_capture ^= 1;
 }
 
+/* Keys come from the UI thread, and from a debugger injecting them on the
+   emulation thread: one at a time, as both update the same state and queues. */
+static mutex_t *input_mutex;
+
 void
 keyboard_init(void)
 {
+    if (!input_mutex) /* first called at startup, before those threads run */
+        input_mutex = thread_create_mutex();
+
     num_lock     = 0;
     caps_lock    = 0;
     scroll_lock  = 0;
@@ -296,9 +304,35 @@ key_process(uint16_t scan, int down)
     }
 }
 
+static void keyboard_input_common(int down, uint16_t scan, int injected);
+
+static void
+keyboard_input_serialized(int down, uint16_t scan, int injected)
+{
+    if (input_mutex)
+        thread_wait_mutex(input_mutex);
+    keyboard_input_common(down, scan, injected);
+    if (input_mutex)
+        thread_release_mutex(input_mutex);
+}
+
 /* Handle a keystroke event from the UI layer. */
 void
 keyboard_input(int down, uint16_t scan)
+{
+    keyboard_input_serialized(down, scan, 0);
+}
+
+/* Handle a keystroke injected by a debugger, which reaches the guest even
+   when the keyboard requires the input to be captured. */
+void
+keyboard_input_injected(int down, uint16_t scan)
+{
+    keyboard_input_serialized(down, scan, 1);
+}
+
+static void
+keyboard_input_common(int down, uint16_t scan, int injected)
 {
     if (kbd_in_reset)
         return;
@@ -398,7 +432,7 @@ keyboard_input(int down, uint16_t scan)
     /* kbc_at_log("Received scan code: %03X (%s)\n", scan & 0x1ff, down ? "down" : "up"); */
     recv_key_ui[scan & 0x1ff] = down;
 
-    if (override_capture || mouse_capture || !kbd_req_capture || (video_fullscreen && !fullscreen_ui_visible)) {
+    if (injected || override_capture || mouse_capture || !kbd_req_capture || (video_fullscreen && !fullscreen_ui_visible)) {
         recv_key[scan & 0x1ff] = down;
         key_process(scan & 0x1ff, down);
     }

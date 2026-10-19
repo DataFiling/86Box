@@ -29,7 +29,9 @@ enum {
     GDBSTUB_BREAK_HW     = 4,
     GDBSTUB_BREAK_RWATCH = 5,
     GDBSTUB_BREAK_WWATCH = 6,
-    GDBSTUB_BREAK_AWATCH = 7
+    GDBSTUB_BREAK_AWATCH = 7,
+    GDBSTUB_BREAK_CATCH  = 8,
+    GDBSTUB_BREAK_RANGE  = 9
 };
 
 #ifdef USE_GDBSTUB
@@ -43,6 +45,11 @@ enum {
             gdbstub_mem_access(gdbstub_addrs, (access) | (width));                    \
         }
 
+/* Pages with a watchpoint must not enter the MMU lookup caches, as accesses
+   through those bypass readmembl() and friends, and with them the checks. */
+#    define GDBSTUB_PAGE_WATCHED(addr) \
+        (gdbstub_watch_pages[((addr) >> MEM_GRANULARITY_BITS) >> 6] & (1ULL << (((addr) >> MEM_GRANULARITY_BITS) & 63)))
+
 #    define GDBSTUB_MEM_ACCESS_FAST(addrs, access, width)                           \
         uint32_t gdbstub_page = (addrs)[0] >> MEM_GRANULARITY_BITS;                 \
         if (gdbstub_watch_pages[gdbstub_page >> 6] & (1ULL << (gdbstub_page & 63))) \
@@ -54,14 +61,19 @@ extern uint64_t gdbstub_watch_pages[(((uint32_t) -1) >> (MEM_GRANULARITY_BITS + 
 extern void gdbstub_cpu_init(void);
 extern int  gdbstub_instruction(void);
 extern int  gdbstub_int3(void);
+extern void gdbstub_int(uint8_t vector);
+extern void gdbstub_cpu_reset(void);
+extern void gdbstub_irq(uint8_t vector);
 extern void gdbstub_mem_access(uint32_t *addrs, int access);
 extern void gdbstub_init(void);
 extern void gdbstub_close(void);
+extern void gdbstub_frame_blit(int monitor_index, int x, int y, int w, int h);
 
 #else
 
 #    define GDBSTUB_MEM_ACCESS(addr, access, width)
 #    define GDBSTUB_MEM_ACCESS_FAST(addrs, access, width)
+#    define GDBSTUB_PAGE_WATCHED(addr) 0
 
 #    define gdbstub_step      0
 #    define gdbstub_next_asap 0
@@ -69,8 +81,12 @@ extern void gdbstub_close(void);
 #    define gdbstub_cpu_init()
 #    define gdbstub_instruction() 0
 #    define gdbstub_int3()        0
+#    define gdbstub_int(vector)
+#    define gdbstub_cpu_reset()
+#    define gdbstub_irq(vector)
 #    define gdbstub_init()
 #    define gdbstub_close()
+#    define gdbstub_frame_blit(monitor_index, x, y, w, h)
 
 #endif
 

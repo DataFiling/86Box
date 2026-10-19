@@ -610,6 +610,9 @@ addreadlookup(uint32_t virt, uint32_t phys)
     if (virt == 0xffffffff)
         return;
 
+    if (GDBSTUB_PAGE_WATCHED(virt))
+        return;
+
     if (readlookup2[index] != (uintptr_t) LOOKUP_INV)
         return;
 
@@ -628,6 +631,9 @@ void
 addwritelookup(uint32_t virt, uint32_t phys)
 {
     if (virt == 0xffffffff)
+        return;
+
+    if (GDBSTUB_PAGE_WATCHED(virt))
         return;
 
     if (page_lookup[virt >> 12])
@@ -709,8 +715,8 @@ getpccache(uint32_t a)
     return NULL;
 }
 
-uint8_t
-read_mem_b(uint32_t addr)
+static uint8_t
+read_mem_b_common(uint32_t addr)
 {
     mem_mapping_t *map;
     uint8_t        ret        = 0xff;
@@ -725,8 +731,8 @@ read_mem_b(uint32_t addr)
     return ret;
 }
 
-uint16_t
-read_mem_w(uint32_t addr)
+static uint16_t
+read_mem_w_common(uint32_t addr)
 {
     mem_mapping_t *map;
     uint16_t       ret        = 0xffff;
@@ -735,7 +741,7 @@ read_mem_w(uint32_t addr)
     addr &= rammask;
 
     if (addr & 1)
-        ret = read_mem_b(addr) | (read_mem_b(addr + 1) << 8);
+        ret = read_mem_b_common(addr) | (read_mem_b_common(addr + 1) << 8);
     else {
         map = read_mapping[addr >> MEM_GRANULARITY_BITS];
 
@@ -748,8 +754,38 @@ read_mem_w(uint32_t addr)
     return ret;
 }
 
-void
-write_mem_b(uint32_t addr, uint8_t val)
+uint8_t
+read_mem_b(uint32_t addr)
+{
+    GDBSTUB_MEM_ACCESS(addr, GDBSTUB_MEM_READ, 1);
+
+    return read_mem_b_common(addr);
+}
+
+uint16_t
+read_mem_w(uint32_t addr)
+{
+    GDBSTUB_MEM_ACCESS(addr, GDBSTUB_MEM_READ, 2);
+
+    return read_mem_w_common(addr);
+}
+
+/* Instruction fetches by 8086-class CPUs, which are not data reads and so
+   don't trigger read watchpoints. */
+uint8_t
+read_mem_fetch_b(uint32_t addr)
+{
+    return read_mem_b_common(addr);
+}
+
+uint16_t
+read_mem_fetch_w(uint32_t addr)
+{
+    return read_mem_w_common(addr);
+}
+
+static void
+write_mem_b_common(uint32_t addr, uint8_t val)
 {
     mem_mapping_t *map;
 
@@ -762,16 +798,26 @@ write_mem_b(uint32_t addr, uint8_t val)
 }
 
 void
+write_mem_b(uint32_t addr, uint8_t val)
+{
+    GDBSTUB_MEM_ACCESS(addr, GDBSTUB_MEM_WRITE, 1);
+
+    write_mem_b_common(addr, val);
+}
+
+void
 write_mem_w(uint32_t addr, uint16_t val)
 {
     mem_mapping_t *map;
+
+    GDBSTUB_MEM_ACCESS(addr, GDBSTUB_MEM_WRITE, 2);
 
     mem_logical_addr = addr;
     addr &= rammask;
 
     if (addr & 1) {
-        write_mem_b(addr, val);
-        write_mem_b(addr + 1, val >> 8);
+        write_mem_b_common(addr, val);
+        write_mem_b_common(addr + 1, val >> 8);
     } else {
         map = write_mapping[addr >> MEM_GRANULARITY_BITS];
         if (map) {
