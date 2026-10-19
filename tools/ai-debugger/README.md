@@ -18,7 +18,7 @@ Claude ──MCP (stdio)──> server.py ──GDB remote protocol (TCP 12345)�
 **New here? [SETUP-LINUX.md](SETUP-LINUX.md)** goes from nothing to a
 working setup with Claude Code: 86Box with the debugger, a ready DOS game
 machine (a prebuilt kit on the `vm-kit` branch), the bridge, and importing
-GOG games.
+games (from GOG, archives or CD images).
 
 It covers steps 1 to 5 of a larger plan (see [Roadmap](#roadmap)).
 
@@ -123,15 +123,18 @@ connects, so quitting the AI client resumes the CPU and drops its points.
 Screenshots are saved in a private per-user folder (its path is printed). The bridge's modules (`gdb_rsp.py`, `dos.py`, `pcinput.py`)
 can also be imported directly from Python.
 
-## GOG games
+## Importing games
 
 GOG's DOS games come wrapped in DOSBox. `gog_import.py` puts one on an
-86Box disk image (with mtools; stop the emulator first):
+86Box disk image (with mtools; stop the emulator first), and games from
+elsewhere too:
 
 ```sh
 python3 tools/ai-debugger/gog_import.py setup_game.exe vm/hd.img       # a Windows installer (needs innoextract)
 python3 tools/ai-debugger/gog_import.py gog_game.sh vm/hd.img          # a Linux installer
 python3 tools/ai-debugger/gog_import.py "/path/to/GOG Games/Game" vm/hd.img   # or an installed game
+python3 tools/ai-debugger/gog_import.py game.zip vm/hd.img             # a zip or 7z archive (7z needs 7-Zip or bsdtar), or a folder
+python3 tools/ai-debugger/gog_import.py game.iso vm/hd.img             # a CD image (.iso, .cue, .ccd, .mds, raw .bin)
 ```
 
 - It follows the game's "Play" task (`goggame-*.info`) to its DOSBox
@@ -151,6 +154,24 @@ python3 tools/ai-debugger/gog_import.py "/path/to/GOG Games/Game" vm/hd.img   # 
 - It reports where the game's DOSBox setup differs from the game VM's
   (`testdata/make_game_vm.sh`): a CD letter other than D:, other Sound
   Blaster settings, no EMS; and DOSBox's memory and CPU speed.
+- A game without a DOSBox configuration (an archive or folder from
+  elsewhere) is copied from the folder nearest the top that holds DOS
+  programs, named as that folder when DOS can have the name (else from the
+  archive's name). The batch file runs the program that looks like the
+  game: not an installer, setup program, DOS extender, unpacker or
+  Windows program (DOSBox), and among several, a batch file that starts
+  one of the others, then one named like the game, then the biggest.
+  `--run` names another; the importer lists the others and the setup
+  program to pick the sound card with. CD images in the archive go into
+  the CD-ROM drive, not onto C:.
+- A CD image on its own goes into the drive, and the importer lists the
+  disc's root folder (read from its ISO 9660 file system, also from raw
+  2352-byte sectors) and names its installer. A raw image without a cue
+  sheet gets one, since 86Box would read it as an ISO.
+- A zip or 7z archive is unpacked next to the disk image (its CDs are then
+  hard-linked into the VM's `cd/` folder), after 7-Zip's listing is checked
+  for paths outside the folder and for links; an archive holding a GOG
+  installer is imported from that installer.
 
 It finds the FAT partition from the image's partition table; `--offset`
 gives its byte offset instead (0 for a floppy). An mtools error is shown

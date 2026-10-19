@@ -28,11 +28,12 @@ sudo apt install build-essential cmake ninja-build pkg-config git \
     libfreetype-dev libgles2-mesa-dev libpng-dev librtmidi-dev libopenal-dev \
     libslirp-dev libfluidsynth-dev libvdeplug-dev libserialport-dev libzstd-dev \
     qtbase5-dev qtbase5-private-dev qttools5-dev qttranslations5-l10n \
-    libsdl2-dev python3-venv mtools innoextract
+    libsdl2-dev python3-venv mtools innoextract p7zip-full
 ```
 
-The last line covers SDL (for the build), Python for the bridge, and the GOG
-importer's tools (mtools, innoextract).
+The last line covers SDL (for the build), Python for the bridge, and the game
+importer's tools (mtools; innoextract for GOG's installers; 7-Zip for 7z
+archives).
 
 ## 2. Build 86Box with the debugger
 
@@ -154,7 +155,9 @@ Close 86Box first: the disk image must not change while the machine runs.
 - **What it accepts:** GOG's Windows offline installer (`setup_*.exe`,
   with its `.bin` parts in the same folder), GOG's Linux installer
   (`*.sh`), or a folder where GOG installed the game. On gog.com these
-  are under the game's "offline backup game installers".
+  are under the game's "offline backup game installers". Games from
+  elsewhere work too: a zip or 7z archive, a game's folder, or a CD image
+  (`.iso`, a `.cue` with its `.bin` and music tracks, `.ccd`, `.mds`).
 - **Not tried with a real GOG download yet.** The tests use folders laid
   out like GOG's. If an installer fails, install the game with Wine (or
   copy its folder from a Windows PC) and give the importer that folder.
@@ -172,6 +175,17 @@ Close 86Box first: the disk image must not change while the machine runs.
 - **Sound and EMS need no setup.** The machine's Sound Blaster and its
   EMS are set the way GOG's DOSBox sets them. The importer says when a
   game was set up differently.
+- **Games not from GOG** have no DOSBox setup to follow. The importer
+  copies the game's folder to C: (CD images in it go into the CD-ROM
+  drive) and writes a batch file that runs the program that looks like
+  the game. It lists the game's other programs; to start another, import
+  again with `--run GAME.EXE`. If the game has no sound, run its setup
+  program (the importer names it) and pick Sound Blaster 16 at port 220,
+  IRQ 7, DMA 1, high DMA 5.
+- **A CD image on its own** goes into the CD-ROM drive, and nothing is
+  copied to C:. Most CD games install from the disc: start the machine,
+  type `D:` and the installer's name (the importer says which), and install
+  to C:. Then ask Claude to run the game from where it installed.
 - **Other DOS software:** use mtools directly, for example `mcopy -s -i
   ~/86box-vms/game-vm/hd.img@@32256 MYGAME ::/MYGAME`.
 
@@ -211,6 +225,7 @@ cmake --build ~/86Box/build/regular
 | `MCP server 86box already exists` from `claude mcp add` | `claude mcp remove 86box -s user`, then add again |
 | The 86Box window stays black | The machine is paused: see step 6 |
 | Tools time out | 86Box was paused from its own menu: resume it there |
+| `7-Zip is needed to unpack` | `sudo apt install p7zip-full` |
 | `Not a supported Inno Setup installer` | The installer is newer than your innoextract: use the game's installed folder (step 7), or a newer innoextract (github.com/dscharrer/innoextract) |
 | A game has no sound | Run its setup program and pick Sound Blaster 16 at 220, IRQ 7, DMA 1 (high DMA 5) |
 | Sound effects play but the music is silent | The game plays General MIDI music, which needs a synthesizer: `sudo apt install fluid-soundfont-gm`, then in 86Box's Settings > Sound > MIDI, set MIDI Out Device to FluidSynth. Or pick Sound Blaster or AdLib music in the game's setup |
