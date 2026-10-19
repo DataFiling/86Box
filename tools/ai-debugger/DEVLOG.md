@@ -1432,53 +1432,170 @@ reach C:.
 ### 30. Games from archives and CD images
 
 The importer took only GOG's installers and folders. It now also takes a
-zip or 7z archive, any DOS game's folder, and a CD image on its own.
+zip, 7z (and, through 7-Zip, rar, lzh and arj) archive, any DOS game's
+folder, a DOSBox configuration file, and a CD image on its own. A research
+pass on how DOS games are shared today shaped the heuristics: eXoDOS and
+archive.org zips, the Total DOS Collection, abandonware sites, shareware
+zips, CD rips. So did a design review that tried hostile archives against
+7-Zip 23.01, bsdtar 3.7.2 and Python's zipfile. Its findings:
 
-**Archives.** Zips are unpacked with Python's zipfile, which keeps names
-inside the target folder. 7z archives are unpacked with 7-Zip (`7z`, `7zz`
-or `7za`) or bsdtar. Archives from the web are untrusted, so 7-Zip's
-listing (`l -slt`) is read first: an absolute path, a `..` component or a
-link stops the import, and so does an encrypted entry. `-p` with an empty
-password and stdin from /dev/null keep 7-Zip from waiting for a password.
-bsdtar refuses such paths by itself. Archives are unpacked into a hidden
-folder next to the disk image, not /tmp, which may be a RAM disk; the CD
-images in them are then hard-linked into the VM's `cd/` folder. An
-archive holding a GOG installer (`setup_*.exe` that is a Windows program,
-or a `.sh` with a zip in it) is imported from that installer.
+- bsdtar extracts links to anywhere and recreates FIFOs, so a 7z unpacked
+  with it could copy /etc/passwd onto C:, or hang mcopy on a FIFO.
+- zipfile keeps backslashes in names.
+- Neither zipfile nor bsdtar handles Deflate64 or PKZIP 1's methods.
+- 7-Zip waits for a password unless given `-p`.
 
-**Games without a DOSBox configuration.** When no DOSBox config is found,
-or the one found mounts no folder here as C:, the game is copied as it is:
+**Unpacking.** Archives are untrusted:
 
-- the folder nearest the top that holds DOS programs (EXE, COM or BAT);
-  Windows programs (an NE or PE header) and batch files that start DOSBox
-  or use cmd.exe syntax don't count. When several folders at that depth
-  hold programs (an archive of several games), the folder holding them all
-  is copied;
-- CD images in it stay off C: and go into the CD-ROM drive; Mac
-  archivers' `__MACOSX` and `.DS_Store` stay behind;
-- the folder on C: keeps the game folder's name when it is a DOS name
-  (`KEEN4`), else one is made from the archive's name, without the
-  "(1991)(id Software)" tags such collections add.
+- Zips are unpacked by hand: backslashes become folders, absolute paths,
+  drive letters and `..` are dropped, links are skipped.
+- Methods zipfile lacks go to 7-Zip, whose raw CP437 names are then
+  decoded.
+- 7-Zip's listing (`l -slt`) is read before extracting: paths outside the
+  folder, links, special files and encrypted entries stop the import. The
+  listed sizes are checked against the free space.
+- After any unpacking (zipfile, 7-Zip, bsdtar, innoextract), everything
+  that isn't a plain file or folder is removed, and files are made
+  readable.
+- 7zz comes before 7z: where both are packaged, 7zz is the newer one.
+- Unpacking goes to a hidden folder next to the VM, so its CDs can be
+  hard-linked into the VM's `cd/` folder. A signal handler and a cleanup
+  at start remove it if an import is killed.
+- An archive holding a GOG installer is imported from that installer. One
+  holding only archives (and notes) is unpacked one level further.
 
-The batch file runs the program that looks like the game. Installers,
-setup and sound setup programs, DOS extenders (DOS4GW...), unpackers,
-network setup and document viewers are left out. Among the rest, a batch
-file that runs one of the others comes first (the game's own launcher, as
-Sierra's games have), then a name like the game's, then the biggest. The
-report lists the other programs (`--run` picks one) and the setup program
-for the sound card. A folder with only an installer gets no batch file;
-the report says to run the installer.
+**Copying.** `copy_tree` plans the copy before writing anything:
+
+- It leaves out names FAT can't hold, DOS device names (CON, AUX...), files
+  whose names differ only in case, links and special files. It reports
+  them, and reports long names, which DOS sees as NAME~1.
+- It checks the image's free space against the files' sizes rounded up to
+  clusters.
+- A failed mcopy removes the folder it created and says which file failed.
+- mtools runs with `DEFAULT_CODEPAGE=437`, as DOS has it (mtools defaults
+  to 850), and a UTF-8 locale.
+- The importer refuses to run while an 86Box process has the VM's folder.
+  That process holds the disk, and rewrites 86box.cfg from memory when it
+  closes.
+
+**Games without a DOSBox configuration.** If no DOSBox config is found, the
+game is copied as it is. So is a non-GOG config whose C: can't be found;
+a GOG game in that case still stops with the old error.
+
+- *The game's folder* is reached by going past folders that hold only one
+  folder and a download site's notes (`.nfo`, `.txt`, scans). The whole
+  folder is copied, data next to the program's subfolder included. Its
+  name on C: is the folder's own when it is a DOS name (punctuation such
+  as `AVISH!` included) and not a generic one (GAME, DOS, BIN...);
+  otherwise it comes from the archive's name, without its
+  `(1991)(Publisher)[tags]`.
+- *Folder names on C:.* A folder another game already has on C: (known
+  from the batch files' mark line and their `cd` lines) gets a digit, for
+  GOG games too. Before, two games with a GAME folder were merged into
+  one.
+- *The program that starts it* is searched folder level by folder level.
+  A level with only installers and helpers sends the search deeper (5% of
+  archive.org's games start one level down), and DOS folders come before
+  WIN ones. Left out are:
+  - installers and setup programs;
+  - DOS extenders and other run-time parts;
+  - DOS tools, unpackers, document viewers, editors;
+  - Windows programs (an NE or PE header) and self-extracting archives;
+  - batch files that start DOSBox, use cmd.exe syntax, or use DOSBox-only
+    commands (mount, imgmount, config -set...).
+- *Ranking the rest*, best first:
+  - a batch file that runs one of the others;
+  - a launcher's name (START, PLAY, GO...) or Sierra's launcher;
+  - a name like the game's, the title's initials (AOE for Aces Over
+    Europe), or a title word;
+  - a 32-bit DOS-extended program;
+  - the VGA and English builds;
+  - intros and demos last, then size.
+
+  The report says why the program was picked, and names the others with
+  equal scores.
+- *Sound.* An SB16 folder of setup files (archive.org copies ship one) is
+  copied over the game's. Setup files already there are reported as such:
+  those copies are set for DOSBox's Sound Blaster 16, which is the VM's.
+  Otherwise the setup program is named. An ULTRASND folder gets a
+  warning.
+- *Floppy images* (FAT, at a floppy's size) are unpacked into DISK1,
+  DISK2... in the game's folder. When the only program is an installer
+  (there or in DISK1), the batch file runs it.
+- *A DOSBox config from another packager*: any `.conf` or `.cfg` whose
+  [autoexec] mounts a drive counts. Mount paths are tried from the
+  config's folder up to three folders above it, within the source; eXoDOS
+  mounts relative to its root. An absolute Windows path is matched by its
+  last names in the archive. Mount options may come before the path
+  (`imgmount d -t iso game.cue`), and `imgmount -u` unmounts.
+- *A game that runs from its CD*: `d:` then `cd \X`. Commands are followed
+  by drive, so the `cd` on D: isn't taken for the game's folder on C:.
 
 **CD images.** `.iso`, `.cue` (and GOG's `.ins`), `.ccd`, `.mds`, `.toc`,
-and raw `.bin`/`.img` files go into the drive. The importer reads the
-disc's root folder from its ISO 9660 primary volume descriptor, in 2048-
-or 2352-byte sectors (MODE1 or MODE2), and names its installer. A raw
-image without a cue sheet gets one, since 86Box would read it as an ISO.
-CloneCD's `.img`/`.sub` and Alcohol's `.mdf` are copied with their
-descriptor. Extensions games also use for data (`.bin`, `.img`, `.toc`)
-count as CD images only by content: raw sectors, an ISO 9660 descriptor,
-or cdrdao keywords. NRG, CDI and other formats 86Box doesn't read are
-reported, not attached.
+`.chd` (which 86Box reads with libchdr), raw `.bin`/`.img` and folders
+named like a CD (CD, CDROM, CD1, CD-US) go into the drive.
+
+- *Detection.* Extensions games also use for data (`.bin`, `.img`, `.toc`)
+  count as CD images only by content: raw sectors, an ISO 9660 or High
+  Sierra descriptor, cdrdao keywords, a CHD header.
+- *What's on the disc.* `CdFs` reads the disc's ISO 9660 or High Sierra
+  file system, in 2048-, 2352- or 2448-byte sectors, MODE1 or MODE2. The
+  importer names the disc's DOS installer: INSTALL, else SETUP when its
+  header isn't Windows's, else one in a `DOS\`, `INSTALL\` or `*INST\`
+  folder.
+- *Cue sheets.* An ISO with loose music tracks (`Track02.mp3`,
+  `game 03.ogg`) and no cue sheet gets one. A cue sheet naming its tracks
+  with the ripper's folders, or as .wav where they are now .ogg, is
+  matched by name.
+- *Raw images.* A lone raw image needs no cue sheet, since 86Box detects
+  2352- and 2448-byte sectors itself. One with more data than its file
+  system (CD music ripped without the cue sheet) gets a note.
+- *Companion files.* CloneCD's `.img`/`.sub` and Alcohol's `.mdf` are
+  named after their descriptor in lower case, as 86Box opens them.
+- *Unreadable formats.* NRG, CDI and other formats 86Box doesn't read are
+  reported, not attached.
+
+**Report.** Every import ends with "Next, in the VM: ..." and lists what it
+left out and why. `--json` gives the same report as one object (kind,
+folder, batch file, commands, where they came from, the candidate
+programs with scores and reasons, setup, CDs, warnings, the next steps),
+for agents; the text then goes to stderr.
+
+**CD review fixes** (§29's code). A review with each finding verified found
+18 real problems:
+
+- Re-importing a disc from the VM's own copy deleted it (the hard link was
+  unlinked first).
+- ffmpeg wrote converted audio through a hard link into the user's GOG
+  folder. It now writes to another name and renames.
+- Discs whose files have the same names overwrote each other; they now go
+  into CD1, CD2...
+- The advice without ffmpeg gave no working disc.
+- DOSBox's `-label` for a CD folder was dropped. The folder copy is now
+  named for the label, since 86Box's virtual ISO takes its label from
+  there.
+- Importing a second CD game dropped the first one's discs from the recent
+  images.
+- Cue sheets with a UTF-8 byte order mark were read as ISOs. Cue sheets
+  with non-ASCII names were written in Latin-1; they are now UTF-8 with a
+  byte order mark.
+- MP3 tracks (libsndfile reads MP3 only from 1.1) were never checked.
+- The game VM had no LASTDRIVE, so SHSUCDX could give the CD no letter
+  past E:. It is now `LASTDRIVEHIGH=Z`.
+- `make_game_vm.sh` could write an empty AUTOEXEC.BAT, and failed on a
+  CP437 FDCONFIG.SYS after creating hd.img. The floppy is now prepared
+  first.
+- `build_cd_drivers.sh` failed with a relative OUT.
+- The INT 2Fh decoder showed failed MSCDEX device requests (1510h, 150Eh)
+  and redirector calls as "ok". It now shows the error. Without a CD
+  extender, 150Bh and 150Ch say that none answered.
+- `cdinfo` ignored track-info errors, and failed once after a disc change.
+
+**Tests.** `test_gog_import.sh` has cases 6-13: zip, 7z, ISO, raw image,
+nested GOG installer, installer-only folder, `--run`, a `../` 7z, and two
+same-named discs imported twice. `test_import_edge.sh` has 14 more cases,
+from the review's reproductions and the research's layouts; it runs
+without the real titles.
 
 ## Test results
 

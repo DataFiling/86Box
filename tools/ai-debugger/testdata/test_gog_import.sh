@@ -23,17 +23,22 @@
 #      with a setup program, and its CD as a cue sheet with a raw MODE1 data
 #      track and an OGG track, in a folder of its own.
 #   8. An ISO on its own: into the drive, its installer reported.
-#   9. A raw MODE2 image without a cue sheet: one is written.
+#   9. A raw MODE2 image without a cue sheet (86Box reads it as it is).
 #  10. A zip holding GOG's Linux installer (case 3's).
-#  11. A folder holding only an installer, and --run.
+#  11. A folder holding only an installer (the batch file runs it), and
+#      --run.
 #  12. A 7z with a "../" path (made with bsdtar): refused.
+#  13. Two discs in folders of their own whose files have the same names,
+#      one cue sheet with a UTF-8 byte order mark, a 22 kHz WAV track:
+#      imported twice (the second time the original track must stay as it
+#      is), then disc 1 imported again from the VM's own copy.
 # To run an import in a VM, give it the VM's disk image instead.
 
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC=${SRC:-$HERE/out/real-titles}
 W=$(mktemp -d)
-trap 'rm -rf "$W"' EXIT
+trap '[ -n "$KEEP" ] || rm -rf "$W"' EXIT
 fail() { echo "FAIL: $*"; exit 1; }
 [ -f "$SRC/SecondReality/MAIN/2NDFIX.EXE" ] || { echo "run add_real_titles.sh first (it fetches into $SRC)"; exit 1; }
 
@@ -110,7 +115,7 @@ printf 'FILE "GAME.GOG" BINARY\r\n  TRACK 01 MODE1/2048\r\n    INDEX 01 00:00:00
 head -c 4096 /dev/urandom > "$G4/disc2.iso"
 printf '[autoexec]\nmount C ".."\nimgmount D "..\\game.ins" "..\\disc2.iso" -t iso\nc:\ncd GAME\nGAME.EXE\n' > "$G4/dosbox_cd.conf"
 printf '{"name": "CD Game", "playTasks": [{"isPrimary": true, "arguments": "-conf \\"..\\\\dosbox_cd.conf\\"", "workingDir": "DOSBOX"}]}\n' > "$G4/goggame-4.info"
-python3 "$HERE/../gog_import.py" "$G4" "$HD" | tee "$W/cd.out"
+python3 "$HERE/../gog_import.py" "$G4" "$HD" > "$W/cd.out"; cat "$W/cd.out"
 cp "$W/86box.cfg" "$W/86box.cfg.4"
 
 # 5. A folder DOSBox mounts as a CD-ROM, as E:.
@@ -118,9 +123,9 @@ G5="$W/cdfolder"
 mkdir -p "$G5/DOSBOX" "$G5/CD/DATA"
 cp "$SRC/wolf3d/WOLFSRC/WOLF3D.EXE" "$G5/RUN.EXE"
 echo level > "$G5/CD/DATA/LEVEL1.DAT"
-printf '[autoexec]\nmount C ".."\nmount E "..\\CD" -t cdrom\nc:\nRUN.EXE\n' > "$G5/dosbox_f.conf"
+printf '[autoexec]\nmount C ".."\nmount E "..\\CD" -t cdrom -label FoldCD\nc:\nRUN.EXE\n' > "$G5/dosbox_f.conf"
 printf '{"name": "Folder CD", "playTasks": [{"isPrimary": true, "arguments": "-conf \\"..\\\\dosbox_f.conf\\"", "workingDir": "DOSBOX"}]}\n' > "$G5/goggame-5.info"
-python3 "$HERE/../gog_import.py" "$G5" "$HD" | tee "$W/folder.out"
+python3 "$HERE/../gog_import.py" "$G5" "$HD" > "$W/folder.out"; cat "$W/folder.out"
 
 cp "$W/86box.cfg" "$W/86box.cfg.5"
 
@@ -203,7 +208,7 @@ b[0x80:0x84] = b"PE\0\0"; open(sys.argv[1], "wb").write(b)' "$G6/DOSBox.exe"
 printf 'DOSBox.exe -conf keen.cfg -noconsole\r\n' > "$G6/Play.bat"
 echo mac > "$W/zip/__MACOSX/KEEN4/._KEEN4E.EXE"
 (cd "$W/zip" && python3 -m zipfile -c "$W/Commander Keen 4 (1991)(id Software).zip" KEEN4 __MACOSX)
-python3 "$HERE/../gog_import.py" "$W/Commander Keen 4 (1991)(id Software).zip" "$HD" | tee "$W/zip.out"
+python3 "$HERE/../gog_import.py" "$W/Commander Keen 4 (1991)(id Software).zip" "$HD" > "$W/zip.out"; cat "$W/zip.out"
 
 # 7. A 7z of a game with its CD in a folder of its own.
 if [ -n "$SEVEN" ]; then
@@ -221,7 +226,7 @@ if [ -n "$SEVEN" ]; then
         *bsdtar) (cd "$W/7z" && bsdtar --format 7zip -cf "$W/Space Game.7z" SPACEGM CD) ;;
         *) (cd "$W/7z" && "$SEVEN" a -bd "$W/Space Game.7z" SPACEGM CD > /dev/null) ;;
     esac
-    python3 "$HERE/../gog_import.py" "$W/Space Game.7z" "$HD" | tee "$W/7z.out"
+    python3 "$HERE/../gog_import.py" "$W/Space Game.7z" "$HD" > "$W/7z.out"; cat "$W/7z.out"
     cp "$W/86box.cfg" "$W/86box.cfg.7"
 else
     echo "(no 7z or bsdtar: case 7 skipped)"
@@ -231,26 +236,53 @@ fi
 head -c 4000 "$EXE" > "$W/install.bin"
 echo readme > "$W/readme.txt"
 python3 "$W/mkiso.py" "$W/Big Game CD.iso" BIGGAME 0 "INSTALL.EXE=$W/install.bin" "README.TXT=$W/readme.txt"
-python3 "$HERE/../gog_import.py" "$W/Big Game CD.iso" "$HD" | tee "$W/iso.out"
+python3 "$HERE/../gog_import.py" "$W/Big Game CD.iso" "$HD" > "$W/iso.out"; cat "$W/iso.out"
 cp "$W/86box.cfg" "$W/86box.cfg.8"
 
 # 9. A raw MODE2 image without a cue sheet.
 python3 "$W/mkiso.py" "$W/rawgame.bin" RAWGAME 2 "SETUP.EXE=$W/install.bin"
-python3 "$HERE/../gog_import.py" "$W/rawgame.bin" "$HD" | tee "$W/raw.out"
+python3 "$HERE/../gog_import.py" "$W/rawgame.bin" "$HD" > "$W/raw.out"; cat "$W/raw.out"
 cp "$W/86box.cfg" "$W/86box.cfg.9"
 
 # 10. A zip holding GOG's Linux installer.
 mkdir -p "$W/backup"
 cp "$W/wolf.sh" "$W/backup/gog_wolfenstein_3d_1.4.sh"
 (cd "$W/backup" && python3 -m zipfile -c "$W/backup.zip" gog_wolfenstein_3d_1.4.sh)
-python3 "$HERE/../gog_import.py" "$W/backup.zip" "$HD" | tee "$W/nested.out"
+python3 "$HERE/../gog_import.py" "$W/backup.zip" "$HD" > "$W/nested.out"; cat "$W/nested.out"
 
 # 11. A folder holding only an installer; and --run.
 mkdir -p "$W/SHAREW"
 cp "$W/install.bin" "$W/SHAREW/INSTALL.EXE"
 echo part > "$W/SHAREW/GAME.1"
-python3 "$HERE/../gog_import.py" "$W/SHAREW" "$HD" | tee "$W/installer.out"
+python3 "$HERE/../gog_import.py" "$W/SHAREW" "$HD" > "$W/installer.out"; cat "$W/installer.out"
 python3 "$HERE/../gog_import.py" "$W/SHAREW" "$HD" --run "INSTALL.EXE C:\\SHAREW" > /dev/null
+
+# 13. Two discs whose files have the same names, imported twice.
+G13="$W/twodisc"
+mkdir -p "$G13/DOSBOX" "$G13/GAME" "$G13/CD1" "$G13/CD2"
+cp "$EXE" "$G13/GAME/TWO.EXE"
+python3 -c '
+import sys, wave
+w = wave.open(sys.argv[1], "wb"); w.setnchannels(1); w.setsampwidth(2); w.setframerate(22050)
+w.writeframes(bytes(range(256)) * 400); w.close()' "$G13/CD2/track02.wav"
+for d in 1 2; do
+    python3 "$W/mkiso.py" "$G13/CD$d/game.gog" "DISC$d" 0 "README.TXT=$W/readme.txt"
+    printf '\xef\xbb\xbfFILE "GAME.GOG" BINARY\r\n  TRACK 01 MODE1/2048\r\n    INDEX 01 00:00:00\r\n' > "$G13/CD$d/game.ins"
+done
+printf '  TRACK 02 AUDIO\r\n    INDEX 01 00:00:00\r\n' > "$W/t2"
+printf 'FILE "track02.wav" WAVE\r\n' | cat - "$W/t2" >> "$G13/CD2/game.ins"
+printf '[autoexec]\nmount C ".."\nimgmount D "..\\CD1\\game.ins" "..\\CD2\\game.ins" -t iso\nc:\nGAME\\TWO.EXE\n' > "$G13/dosbox_two.conf"
+printf '{"name": "Two Discs", "playTasks": [{"isPrimary": true, "arguments": "-conf \\"..\\\\dosbox_two.conf\\"", "workingDir": "DOSBOX"}]}\n' > "$G13/goggame-13.info"
+sum13=$(md5sum < "$G13/CD2/track02.wav")
+PATH="$W/noffmpeg:$PATH"
+mkdir -p "$W/noffmpeg"
+printf '#!/bin/sh\nexit 1\n' > "$W/noffmpeg/ffmpeg"   # the first time without a working ffmpeg
+chmod +x "$W/noffmpeg/ffmpeg"
+python3 "$HERE/../gog_import.py" "$G13" "$HD" > "$W/two1.out"; cat "$W/two1.out"
+rm "$W/noffmpeg/ffmpeg"
+python3 "$HERE/../gog_import.py" "$G13" "$HD" > "$W/two2.out"; cat "$W/two2.out"
+cp "$W/86box.cfg" "$W/86box.cfg.13"
+python3 "$HERE/../gog_import.py" "$W/cd/TWODISCS/CD1/game.cue" "$HD" > "$W/two3.out"; cat "$W/two3.out"
 
 # 12. A 7z with a "../" path.
 if command -v bsdtar > /dev/null; then
@@ -288,9 +320,11 @@ else
     grep -q "Track03.WAV is 1 channels at 22050 Hz" "$W/cd.out" || fail "track 3's format should be reported"
 fi
 mdir -b -i "$HD@@32256" ::/GAME | grep -qi "gog\|ins\|iso" && fail "the CD's files were copied to C:"
+grep -i "Not copied" "$W/cd.out" | grep -qi "game.ins\|game.gog\|track0\|disc2" && fail "the CD's files were listed as not copied"
 # 5: the folder as the CD, not on C:, and the letter noted.
-grep -qx 'cdrom_01_image_path = cd/FOLDERCD/CD' "$W/86box.cfg.5" || fail "the VM's drive should hold the folder cd/FOLDERCD/CD"
-[ -f "$W/cd/FOLDERCD/CD/DATA/LEVEL1.DAT" ] || fail "the CD folder should be copied whole"
+grep -qx 'cdrom_01_image_path = cd/FOLDERCD/FOLDCD' "$W/86box.cfg.5" ||
+    fail "the VM's drive should hold the folder cd/FOLDERCD/FOLDCD, named for its label"
+[ -f "$W/cd/FOLDERCD/FOLDCD/DATA/LEVEL1.DAT" ] || fail "the CD folder should be copied whole"
 mdir -b -i "$HD@@32256" ::/FOLDERCD | grep -q "/CD" && fail "the CD folder was copied to C:"
 grep -q "as E:" "$W/folder.out" || fail "the E: letter should be reported"
 # 6: KEEN4 as it is, the game picked, no Mac files, the Windows programs not offered.
@@ -315,15 +349,27 @@ grep -qx 'cdrom_01_image_path = cd/BIGGAMEC/Big Game CD.iso' "$W/86box.cfg.8" ||
 grep -q "On the CD (BIGGAME): INSTALL.EXE, README.TXT" "$W/iso.out" || fail "the CD's files should be listed"
 grep -q "type D: and then INSTALL" "$W/iso.out" || fail "the installer should be named"
 mdir -b -i "$HD@@32256" ::/ | grep -qi "BIGGAME" && fail "an ISO alone should put nothing on C:"
-# 9: a cue sheet for the raw image.
-grep -qx 'cdrom_01_image_path = cd/RAWGAME/rawgame.cue' "$W/86box.cfg.9" || fail "the raw image should get a cue sheet"
-tr -d '\r' < "$W/cd/RAWGAME/rawgame.cue" | grep -qx '  TRACK 01 MODE2/2352' || fail "the raw image is MODE2/2352"
+# 9: the raw image in the drive as it is, its files read.
+grep -qx 'cdrom_01_image_path = cd/RAWGAME/rawgame.bin' "$W/86box.cfg.9" || fail "the raw image should be in the drive"
 grep -q "type D: and then SETUP" "$W/raw.out" || fail "the raw image's SETUP should be named"
 # 10: the installer inside the zip imported.
 grep -q "holds GOG's installer gog_wolfenstein_3d_1.4.sh" "$W/nested.out" || fail "the zip's installer should be used"
 grep -q "Wolfenstein 3D: 2 files" "$W/nested.out" || fail "the zip's installer's game should be imported"
-# 11: an installer only: no batch file until --run.
-grep -qF "run C:\\SHAREW\\INSTALL.EXE" "$W/installer.out" || fail "the installer should be named"
+# 13: the discs apart, the BOM'd cue sheets read, the original track left alone, the VM's copy kept.
+grep -qx 'cdrom_01_image_path = cd/TWODISCS/CD1/game.cue' "$W/86box.cfg.13" || fail "disc 1 should be in cd/TWODISCS/CD1"
+grep -qx 'cdrom_01_image_history_01 = cd/TWODISCS/CD2/game.cue' "$W/86box.cfg.13" || fail "disc 2 should be in cd/TWODISCS/CD2"
+tr -d '\r' < "$W/cd/TWODISCS/CD1/game.cue" | head -1 | grep -qx 'FILE "game.gog" BINARY' || fail "disc 1's BOM'd cue should be rewritten"
+cmp -s "$W/cd/TWODISCS/CD1/game.gog" "$G13/CD1/game.gog" || fail "disc 1's data track was overwritten by disc 2's"
+grep -q "install ffmpeg" "$W/two1.out" || fail "the first import should say to install ffmpeg"
+[ "$(md5sum < "$G13/CD2/track02.wav")" = "$sum13" ] || fail "the game's own track02.wav was changed"
+if command -v ffmpeg > /dev/null; then
+    python3 -c 'import sys, wave; w = wave.open(sys.argv[1]); sys.exit((w.getnchannels(), w.getframerate()) != (2, 44100))' \
+        "$W/cd/TWODISCS/CD2/track02.wav" || fail "disc 2's track should be converted the second time"
+fi
+[ -f "$W/cd/TWODISCS/CD1/game.gog" ] || fail "importing the VM's own copy of disc 1 deleted it"
+grep -qx 'cdrom_01_image_path = cd/TWODISCS/CD1/game.cue' "$W/86box.cfg" || fail "the VM's copy of disc 1 should be in the drive"
+# 11: an installer only: the batch file runs it, until --run names another program.
+grep -qF "C:\\SHAREW.BAT runs it (C:\\SHAREW\\INSTALL.EXE)" "$W/installer.out" || fail "the installer should be named"
 mtype -i "$HD@@32256" ::/SHAREW.BAT | tr -d '\r' | tail -1 | grep -qx 'INSTALL.EXE C:\\SHAREW' ||
     fail "--run should write SHAREW.BAT"
 echo "PASS"

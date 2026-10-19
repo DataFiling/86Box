@@ -547,8 +547,8 @@ def _disk(c):
 
 def _multiplex(c):
     ax = c.r("ax")
-    if ax >> 8 == 0x11 and ax not in MULTIPLEX_NAMES:
-        return "redirector " + REDIRECTOR_NAMES.get(ax & 0xFF, "function %02Xh" % (ax & 0xFF)), "", None, False
+    if ax >> 8 == 0x11 and ax not in MULTIPLEX_NAMES:  # failures: CF set, a DOS error code in AX
+        return "redirector " + REDIRECTOR_NAMES.get(ax & 0xFF, "function %02Xh" % (ax & 0xFF)), "", None, ax != 0x1100
     if ax >> 8 != 0x15:
         return MULTIPLEX_NAMES.get(ax, "function %04Xh" % ax), "", None, False
     al = ax & 0xFF
@@ -556,19 +556,20 @@ def _multiplex(c):
     o = lambda r: c.r(r, out=True)
     letter = lambda n: chr(ord("A") + n) + ":" if n < 26 else "drive %d" % n
     args, res = "", None
-    if al in (0x02, 0x03, 0x04, 0x05, 0x08, 0x09, 0x0B, 0x10):
+    if al in (0x02, 0x03, 0x04, 0x05, 0x08, 0x09, 0x0B, 0x0E, 0x10):
         args = letter(c.r("cx"))
     elif al == 0x0F:
         args = letter(c.r("cx") & 0xFF)
     if al == 0x00:
         res = lambda: ("%d CD-ROM drive(s) from %s" % (o("bx"), letter(o("cx"))) if o("bx") else
                        "no CD-ROM extender, or no drives")
-    elif al == 0x0B:
-        res = lambda: ("not a CD-ROM drive" if not o("ax") else "a CD-ROM drive") + (
-            "" if o("bx") == 0xADAD else " (no MSCDEX answering)")
+    elif al == 0x0B:  # an extender sets BX to ADADh; without one, nothing changes
+        res = lambda: ("not a CD-ROM drive" if not o("ax") else "a CD-ROM drive") if o("bx") == 0xADAD else \
+            "no CD-ROM extender answered"
     elif al == 0x0C:
-        res = lambda: "version %d.%02d" % (o("bx") >> 8, o("bx") & 0xFF)
-    return name, args, res, al in (0x01, 0x02, 0x03, 0x04, 0x05, 0x08, 0x09, 0x0F)
+        res = lambda: "version %d.%02d" % (o("bx") >> 8, o("bx") & 0xFF) if o("bx") else \
+            "no CD-ROM extender answered"
+    return name, args, res, al in (0x01, 0x02, 0x03, 0x04, 0x05, 0x08, 0x09, 0x0E, 0x0F, 0x10)
 
 
 def _byname(table, key_reg):
@@ -635,8 +636,9 @@ def describe(c):
     elif c.status == NO_RETURN:
         result = "(never returned)"
     elif uses_cf and c.cf():
-        result = _dpmi_error(c) if c.vector == 0x31 else (_dos_error(c) if c.vector == 0x21 else
-                                                            "failed (CF set, AX=%04X)" % c.r("ax", True))
+        result = _dpmi_error(c) if c.vector == 0x31 else (
+            _dos_error(c) if c.vector == 0x21 or (c.vector == 0x2F and c.r("ah") in (0x11, 0x15)) else
+            "failed (CF set, AX=%04X)" % c.r("ax", True))
     elif res is not None:
         try:
             result = res()

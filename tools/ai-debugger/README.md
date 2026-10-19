@@ -155,30 +155,56 @@ python3 tools/ai-debugger/gog_import.py game.iso vm/hd.img             # a CD im
   (`testdata/make_game_vm.sh`): a CD letter other than D:, other Sound
   Blaster settings, no EMS; and DOSBox's memory and CPU speed.
 - A game without a DOSBox configuration (an archive or folder from
-  elsewhere) is copied from the folder nearest the top that holds DOS
-  programs, named as that folder when DOS can have the name (else from the
-  archive's name). The batch file runs the program that looks like the
-  game: not an installer, setup program, DOS extender, unpacker or
-  Windows program (DOSBox), and among several, a batch file that starts
-  one of the others, then one named like the game, then the biggest.
-  `--run` names another; the importer lists the others and the setup
-  program to pick the sound card with. CD images in the archive go into
-  the CD-ROM drive, not onto C:.
-- A CD image on its own goes into the drive, and the importer lists the
-  disc's root folder (read from its ISO 9660 file system, also from raw
-  2352-byte sectors) and names its installer. A raw image without a cue
-  sheet gets one, since 86Box would read it as an ISO.
-- A zip or 7z archive is unpacked next to the disk image (its CDs are then
-  hard-linked into the VM's `cd/` folder), after 7-Zip's listing is checked
-  for paths outside the folder and for links; an archive holding a GOG
-  installer is imported from that installer.
+  elsewhere) is copied whole: its folder, past lone folders and the
+  download site's notes, under its own name when DOS can have it (else one
+  from the archive's name, without its "(1991)(Publisher)" tags). A
+  folder another game already has on C: is never reused. The batch file
+  goes into the program's folder and runs the program that looks like the
+  game. Installers, setup programs, DOS extenders, unpackers, Windows
+  programs and batch files for DOSBox don't count. Among the rest:
+  1. a batch file that starts one of the others;
+  2. a launcher's name (START, PLAY...) or Sierra's launcher;
+  3. a name like the game's, its initials, or a word of its title;
+  4. a 32-bit DOS-extended program, then the biggest.
+
+  The report says why it picked that one, and `--run` names another.
+- Also for those games:
+  - an SB16 folder of sound setup files is copied over the game's;
+  - floppy images are unpacked into DISK1, DISK2... (an installer alone
+    gets a batch file that runs it);
+  - CD images and folders named like a CD go into the CD-ROM drive.
+- Another packager's DOSBox config (any `.conf` or `.cfg` that mounts a
+  drive, eXoDOS's included) is followed like GOG's. Its mount paths are
+  tried from folders above it and by their last names, and mount options
+  may come anywhere.
+- A CD image on its own (`.iso`, `.cue`, `.ccd`, `.mds`, `.toc`, `.chd`, a
+  raw `.bin`) goes into the drive. The importer reads the disc's file
+  system (ISO 9660 or High Sierra, in 2048-, 2352- or 2448-byte sectors)
+  and names its DOS installer. An ISO with loose music tracks gets a cue
+  sheet for them.
+- Archives are untrusted:
+  - zips are unpacked by hand;
+  - 7z, rar, lzh and arj go through 7-Zip (or bsdtar for 7z), after its
+    listing is checked;
+  - anything that isn't a plain file or folder is removed before copying;
+  - names DOS can't have are left out and reported;
+  - the host's and the image's free space is checked first.
+
+  Unpacking goes to a hidden folder next to the VM, which is removed
+  afterwards. An archive holding a GOG installer, or only other archives,
+  is unpacked a level further.
+- It won't run while 86Box has the VM open (86Box rewrites `86box.cfg` when
+  it closes). The report ends with the next steps. `--json` prints the
+  report as JSON (the text then goes to stderr), for agents.
 
 It finds the FAT partition from the image's partition table; `--offset`
 gives its byte offset instead (0 for a floppy). An mtools error is shown
 as such, with what to check. Downloading stays with you (gog.com, or GOG's
 own tools), so no GOG credentials reach the bridge. No real GOG download
 has been imported yet: `testdata/test_gog_import.sh` tests it on folders
-and a Linux installer laid out as GOG's.
+and a Linux installer laid out as GOG's, and on archives and CD images;
+`testdata/test_import_edge.sh` on hostile archives and the layouts of
+other DOS game collections.
 
 ## Tools
 

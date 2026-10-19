@@ -16,6 +16,7 @@
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=${OUT:-$HERE/out}
+mkdir -p "$OUT" && OUT=$(cd "$OUT" && pwd)  # nasm runs in other folders
 GCDROM_REPO=https://gitlab.com/FreeDOS/drivers/gcdrom.git
 GCDROM_COMMIT=815078126e1332ec0917536043d973407e1008c1
 SHSUCD_REPO=https://github.com/adoxa/shsucd.git

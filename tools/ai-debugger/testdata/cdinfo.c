@@ -105,9 +105,15 @@ main(void)
     drive = r.x.cx;
     printf("CDINFO: %u CD-ROM drive(s), the first is %c:\n", r.x.bx, 'A' + drive);
 
-    memset(cb, 0, sizeof(cb));
-    cb[0] = 0x0A; /* Audio disk info: lowest and highest track, lead-out */
-    st    = ioctl_in(cb, 7);
+    /* After a disc change the driver answers "invalid disk change" (0Fh)
+       once: ask again. */
+    for (t = 0; t < 3; t++) {
+        memset(cb, 0, sizeof(cb));
+        cb[0] = 0x0A; /* Audio disk info: lowest and highest track, lead-out */
+        st    = ioctl_in(cb, 7);
+        if (!(st & STATUS_ERROR) || (st & 0xFF) != 0x0F)
+            break;
+    }
     if (st & STATUS_ERROR) {
         printf("CDINFO: the drive answers error %02Xh (no disc?)\n", st & 0xFF);
         return 1;
@@ -119,7 +125,11 @@ main(void)
         memset(cb, 0, sizeof(cb));
         cb[0] = 0x0B; /* Audio track info */
         cb[1] = (unsigned char) t;
-        ioctl_in(cb, 7);
+        st    = ioctl_in(cb, 7);
+        if (st & STATUS_ERROR) {
+            printf("  track %2d  error %02Xh\n", t, st & 0xFF);
+            continue;
+        }
         printf("  track %2d  %02u:%02u.%02u  %s\n", t, cb[4], cb[3], cb[2], (cb[6] & 0x40) ? "data" : "audio");
         if (!(cb[6] & 0x40) && !audio) {
             audio = t;

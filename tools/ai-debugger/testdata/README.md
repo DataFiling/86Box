@@ -159,13 +159,15 @@ channel, and its floppy loads two DOS programs for it, which
   license), at a pinned commit.
 
 FDCONFIG.SYS loads GCDROM with `DEVICEHIGH` and `DOS=HIGH,UMB` (JemmEx
-provides the upper memory), and AUTOEXEC.BAT runs `SHSUCDX /D:?CDROM1,D`,
-so the CD is D:. 549 KB of conventional memory stays free.
+provides the upper memory) and sets `LASTDRIVEHIGH=Z`, and AUTOEXEC.BAT
+runs `SHSUCDX /D:?CDROM1,D`, so the CD is D: (any letter can be set
+there). 549 KB of conventional memory stays free.
 
 The disc is an image in the VM's folder: `cdrom_01_image_path` in
-`86box.cfg`, or the Media menu. 86Box reads ISO, cue sheets (BIN and WAV,
-OGG, FLAC or MP3 audio tracks, which must be stereo at 44.1 kHz), CCD, MDS
-and TOC images, and a folder, which it shows as an ISO. `gog_import.py`
+`86box.cfg`, or the Media menu. 86Box reads ISO (also raw 2352- and
+2448-byte sectors), cue sheets (BIN and WAV, OGG, FLAC or MP3 audio
+tracks, which must be stereo at 44.1 kHz; MP3 needs libsndfile 1.1), CCD,
+MDS, TOC and CHD images, and a folder, which it shows as an ISO. `gog_import.py`
 copies a game's disc into the VM folder's `cd/` and sets the path; it
 rewrites GOG's cue sheets (`.ins` naming a `.gog` file) and converts audio
 tracks in other formats with ffmpeg.
@@ -180,8 +182,29 @@ Tested on a game VM: an ISO's files read from D:; a GOG-style disc (cue
 sheet, data track, an OGG track at 44.1 kHz stereo and one at 22 kHz mono,
 which the importer converted) imported with `gog_import.py`, where CDINFO
 listed the three tracks and track 2 played; a folder as the disc;
-`smoke_test.py`. `test_gog_import.sh` cases 4 and 5 check the importer's
-CD handling without the emulator.
+`smoke_test.py`. `test_gog_import.sh` (cases 4, 5, 7-9, 13) and
+`test_import_edge.sh` (7, 13, 14) check the importer's CD handling without
+the emulator.
+
+## Importer tests
+
+`test_gog_import.sh` imports folders laid out as GOG's (with programs from
+`add_real_titles.sh`), a Linux installer, archives, CD images and
+installer-only games onto scratch disk images, and checks what lands
+there. `test_import_edge.sh` needs no downloads (its programs are fake MZ
+headers). It tries:
+
+- archives built to break the importer: links, a FIFO, names DOS can't
+  have, Deflate64, a `../` path;
+- what other DOS game collections look like: data next to the program's
+  folder, title initials, an SB16 folder, install floppies, a zip in a
+  zip, another packager's DOSBox config;
+- two games with the same folder name;
+- `--json`;
+- an 86Box running in the VM's folder.
+
+7-Zip, bsdtar and ffmpeg cases are skipped where those aren't installed.
+`KEEP=1` keeps the work folder.
 
 ## Two more real titles: Second Reality and Wolfenstein 3D
 

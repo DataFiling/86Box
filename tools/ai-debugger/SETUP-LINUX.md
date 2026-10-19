@@ -32,8 +32,9 @@ sudo apt install build-essential cmake ninja-build pkg-config git \
 ```
 
 The last line covers SDL (for the build), Python for the bridge, and the game
-importer's tools (mtools; innoextract for GOG's installers; 7-Zip for 7z
-archives).
+importer's tools (mtools; innoextract for GOG's installers; 7-Zip for 7z,
+rar and other archives). If your distribution has a `7zip` package,
+`sudo apt install 7zip` gives a newer 7-Zip than p7zip-full.
 
 ## 2. Build 86Box with the debugger
 
@@ -176,12 +177,13 @@ Close 86Box first: the disk image must not change while the machine runs.
   EMS are set the way GOG's DOSBox sets them. The importer says when a
   game was set up differently.
 - **Games not from GOG** have no DOSBox setup to follow. The importer
-  copies the game's folder to C: (CD images in it go into the CD-ROM
-  drive) and writes a batch file that runs the program that looks like
-  the game. It lists the game's other programs; to start another, import
-  again with `--run GAME.EXE`. If the game has no sound, run its setup
-  program (the importer names it) and pick Sound Blaster 16 at port 220,
-  IRQ 7, DMA 1, high DMA 5.
+  copies the game's folder to C: and writes a batch file that runs the
+  program that looks like the game. It says why it picked that program
+  and lists the others; to start another, import again with `--run
+  GAME.EXE`. CD images in the download go into the CD-ROM drive, and
+  floppy images into DISK1, DISK2... next to the game. If the game has no
+  sound, run its setup program (the importer names it) and pick Sound
+  Blaster 16 at port 220, IRQ 7, DMA 1, high DMA 5.
 - **A CD image on its own** goes into the CD-ROM drive, and nothing is
   copied to C:. Most CD games install from the disc: start the machine,
   type `D:` and the installer's name (the importer says which), and install
@@ -225,7 +227,9 @@ cmake --build ~/86Box/build/regular
 | `MCP server 86box already exists` from `claude mcp add` | `claude mcp remove 86box -s user`, then add again |
 | The 86Box window stays black | The machine is paused: see step 6 |
 | Tools time out | 86Box was paused from its own menu: resume it there |
-| `7-Zip is needed to unpack` | `sudo apt install p7zip-full` |
+| `7-Zip is needed to unpack` | `sudo apt install 7zip` (or `p7zip-full`) |
+| `86Box (process N) is running this VM` | Close 86Box first: it holds the disk and rewrites `86box.cfg` when it closes |
+| The batch file starts the wrong program | Import again with `--run PROGRAM` (the importer listed the candidates and why it picked one) |
 | `Not a supported Inno Setup installer` | The installer is newer than your innoextract: use the game's installed folder (step 7), or a newer innoextract (github.com/dscharrer/innoextract) |
 | A game has no sound | Run its setup program and pick Sound Blaster 16 at 220, IRQ 7, DMA 1 (high DMA 5) |
 | Sound effects play but the music is silent | The game plays General MIDI music, which needs a synthesizer: `sudo apt install fluid-soundfont-gm`, then in 86Box's Settings > Sound > MIDI, set MIDI Out Device to FluidSynth. Or pick Sound Blaster or AdLib music in the game's setup |

@@ -44,7 +44,42 @@ if [ -e "$DIR/hd.img" ]; then
     echo "$DIR/hd.img exists: not overwriting a disk that may hold games."
     exit 1
 fi
+# The floppy first (a failure here leaves no hd.img behind): a copy, with
+# BLASTER set to match the card, the CD-ROM drive as D:, and C: as the
+# current drive once it has booted. DOS, the CD-ROM driver and SHSUCDX go
+# into upper memory (JemmEx provides it), so games keep their conventional
+# memory. LASTDRIVEHIGH=Z lets SHSUCDX give the CD any letter a game wants.
 mkdir -p "$DIR/nvr"
+cp "$FLOPPY" "$DIR/boot.img"
+mcopy -o -i "$DIR/boot.img" "$CDDIR/GCDROM.SYS" ::/GCDROM.SYS
+mcopy -o -i "$DIR/boot.img" "$CDDIR/SHSUCDX.COM" ::/SHSUCDX.COM
+A=$(mktemp)
+trap 'rm -f "$A" "$A.raw" "$A.new"' EXIT
+mtype -i "$DIR/boot.img" ::/FDCONFIG.SYS > "$A.raw" || { echo "$FLOPPY has no FDCONFIG.SYS"; exit 1; }
+python3 - "$A.raw" "$A" <<'PY'
+import re, sys
+text = open(sys.argv[1], encoding="latin-1").read().replace("\r", "")
+lines = [l for l in text.split("\n") if l and not re.match(r"(DOS=|LASTDRIVE(HIGH)?=|DEVICE(HIGH)?=GCDROM)", l, re.I)]
+at = next((i for i, l in enumerate(lines) if re.match(r"SHELL=", l, re.I)), len(lines))
+lines[at:at] = ["DEVICEHIGH=GCDROM.SYS /D:CDROM1"]
+lines[0:0] = ["DOS=HIGH,UMB", "LASTDRIVEHIGH=Z"]
+open(sys.argv[2], "w", encoding="latin-1", newline="").write("".join(l + "\r\n" for l in lines))
+PY
+mcopy -o -i "$DIR/boot.img" "$A" ::/FDCONFIG.SYS
+if mdir -b -i "$DIR/boot.img" ::/AUTOEXEC.BAT > /dev/null 2>&1; then
+    mtype -i "$DIR/boot.img" ::/AUTOEXEC.BAT > "$A.raw"
+else
+    : > "$A.raw"
+fi
+{   # (the lines added below are dropped first: the floppy may be one made before)
+    tr -d '\r' < "$A.raw" | grep -v -i -x 'SET BLASTER=.*\|SHSUCDX .*\|PATH A:\\;C:\\\|C:\|ECHO READY' || [ $? -eq 1 ]
+    echo 'SET BLASTER=A220 I7 D1 H5 P330 T6'
+    echo 'SHSUCDX /D:?CDROM1,D'
+    echo 'PATH A:\;C:\'
+    echo 'C:'
+    echo 'ECHO READY'
+} | sed 's/$/\r/' > "$A.new"
+mcopy -o -i "$DIR/boot.img" "$A.new" ::/AUTOEXEC.BAT
 
 # The disk: 16 heads, 63 sectors, as many cylinders as fit SIZE MB; one
 # FAT16 partition from sector 63 (byte 32256). Its MBR boots the floppy:
@@ -54,7 +89,7 @@ C=$((SIZE * 1024 * 1024 / (H * S * 512)))
 TOTAL=$((C * H * S))
 truncate -s $((TOTAL * 512)) "$DIR/hd.img"
 MBR=$(mktemp)
-trap 'rm -f "$MBR"' EXIT
+trap 'rm -f "$A" "$A.raw" "$A.new" "$MBR"' EXIT
 if command -v nasm >/dev/null; then
     nasm -f bin -o "$MBR" "$HERE/mbr_boot_a.asm"
 else
@@ -76,37 +111,6 @@ with open(img, "r+b") as f:
     f.write(mbr)
 PY
 mformat -i "$DIR/hd.img@@$((S * 512))" -T $((TOTAL - S)) -h $H -s $S -H $S -v GAMES ::
-
-# The floppy: a copy, with BLASTER set to match the card, the CD-ROM drive
-# as D:, and C: as the current drive once it has booted. DOS, the CD-ROM
-# driver and SHSUCDX go into upper memory (JemmEx provides it), so games keep
-# their conventional memory.
-cp "$FLOPPY" "$DIR/boot.img"
-mcopy -o -i "$DIR/boot.img" "$CDDIR/GCDROM.SYS" ::/GCDROM.SYS
-mcopy -o -i "$DIR/boot.img" "$CDDIR/SHSUCDX.COM" ::/SHSUCDX.COM
-A=$(mktemp)
-mtype -i "$DIR/boot.img" ::/FDCONFIG.SYS | tr -d '\r' > "$A"
-python3 - "$A" <<'PY'
-import re, sys
-lines = [l for l in open(sys.argv[1]).read().splitlines()
-         if not re.match(r"(DOS=|DEVICE(HIGH)?=GCDROM)", l, re.I)]
-at = next((i for i, l in enumerate(lines) if re.match(r"SHELL=", l, re.I)), len(lines))
-lines[at:at] = ["DEVICEHIGH=GCDROM.SYS /D:CDROM1"]
-lines.insert(0, "DOS=HIGH,UMB")
-open(sys.argv[1], "w").write("".join(l + "\r\n" for l in lines))
-PY
-mcopy -o -i "$DIR/boot.img" "$A" ::/FDCONFIG.SYS
-mtype -i "$DIR/boot.img" ::/AUTOEXEC.BAT | tr -d '\r' > "$A"
-{   # (the lines added below are dropped first: the floppy may be one made before)
-    grep -v -i -x 'SET BLASTER=.*\|SHSUCDX .*\|PATH A:\\;C:\\\|C:\|ECHO READY' "$A"
-    echo 'SET BLASTER=A220 I7 D1 H5 P330 T6'
-    echo 'SHSUCDX /D:?CDROM1,D'
-    echo 'PATH A:\;C:\'
-    echo 'C:'
-    echo 'ECHO READY'
-} | sed 's/$/\r/' > "$A.new"
-mcopy -o -i "$DIR/boot.img" "$A.new" ::/AUTOEXEC.BAT
-rm -f "$A" "$A.new"
 
 # The CMOS: floppy drive A: 1.44 MB, primary master IDE auto-detected.
 [ -f "$HERE/vms/p55t2p4.nvr" ] && cp "$HERE/vms/p55t2p4.nvr" "$DIR/nvr/"
