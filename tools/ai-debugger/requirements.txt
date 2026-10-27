@@ -1,0 +1,2 @@
+mcp>=1.0,<2   # mcp 2 removed mcp.server.fastmcp, which server.py uses
+capstone>=5.0

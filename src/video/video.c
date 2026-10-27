@@ -43,6 +43,7 @@
 #include <86box/thread.h>
 #include <86box/video.h>
 #include <86box/vid_svga.h>
+#include <86box/gdbstub.h>
 
 #include <minitrace/minitrace.h>
 
@@ -446,6 +447,8 @@ video_blit_memtoscreen_monitor(int x, int y, int w, int h, int monitor_index)
     monitors[monitor_index].mon_blit_data_ptr->w             = w;
     monitors[monitor_index].mon_blit_data_ptr->h             = h;
     monitors[monitor_index].mon_renderedframes++;
+
+    gdbstub_frame_blit(monitor_index, x, y, w, h);
 
     thread_set_event(monitors[monitor_index].mon_blit_data_ptr->wake_blit_thread);
     MTR_END("video", "video_blit_memtoscreen");

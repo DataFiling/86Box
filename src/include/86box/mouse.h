@@ -60,6 +60,7 @@ extern int    tablet_type;
 extern int    mouse_input_mode_initial;
 extern int    mouse_input_mode; /* 2 = Absolute (Visible Crosshair), 1 = Absolute, 0 = Relative */
 extern int    mouse_timed; /* 1 = Timed, 0 = Constant */
+extern int    mouse_injected; /* input comes from a debugger, deliver it uncaptured */
 extern int    mouse_tablet_in_proximity;
 extern double mouse_x_abs;
 extern double mouse_y_abs;
@@ -114,6 +115,7 @@ extern void            mouse_scalef(double x, double y);
 extern void            mouse_scale(int x, int y);
 extern void            mouse_scale_axis(int axis, int val);
 extern void            mouse_set_z(int z);
+extern void            mouse_wheel_clicks(int clicks);
 extern void            mouse_clear_z(void);
 extern void            mouse_subtract_z(int *delta_z, int min, int max, int invert);
 extern void            mouse_set_w(int w);

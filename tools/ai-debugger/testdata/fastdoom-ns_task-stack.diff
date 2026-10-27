@@ -1,0 +1,26 @@
+diff --git a/FASTDOOM/ns_task.c b/FASTDOOM/ns_task.c
+index 10a8903..767943d 100644
+--- a/FASTDOOM/ns_task.c
++++ b/FASTDOOM/ns_task.c
+@@ -181,8 +181,8 @@ static void TS_SetTimerToMaxTaskRate(void)
+ 
+ static void __interrupt __far TS_ServiceSchedule(void)
+ {
+-    task *ptr;
+-    task *next;
++    static task *ptr; // static: the stack switch below changes SS but not EBP
++    static task *next;
+ 
+     TS_InInterrupt = TRUE;
+ 
+@@ -230,8 +230,8 @@ static void __interrupt __far TS_ServiceSchedule(void)
+ 
+ static void __interrupt __far TS_ServiceScheduleIntEnabled(void)
+ {
+-    task *ptr;
+-    task *next;
++    static task *ptr; // static: the stack switch below changes SS but not EBP
++    static task *next;
+ 
+     TS_TimesInInterrupt++;
+     TaskServiceCount += TaskServiceRate;

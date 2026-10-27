@@ -311,6 +311,8 @@ extern int is_compare;
 
 extern uint8_t  read_mem_b(uint32_t addr);
 extern uint16_t read_mem_w(uint32_t addr);
+extern uint8_t  read_mem_fetch_b(uint32_t addr);
+extern uint16_t read_mem_fetch_w(uint32_t addr);
 extern void     write_mem_b(uint32_t addr, uint8_t val);
 extern void     write_mem_w(uint32_t addr, uint16_t val);
 
