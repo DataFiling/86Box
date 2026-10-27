@@ -24,7 +24,7 @@ SHA-256 of game-vm.tar.xz: 13901f3c7452455f73622a25ad51cf8e426f7ed07ce7b95141915
 | File | What |
 |---|---|
 | `86box.cfg` | ASUS P/I-P55T2P4, Pentium MMX 200, 32 MB, VGA, PS/2 wheel mouse, Sound Blaster 16 at 220h IRQ 7 DMA 1/5 (DOSBox's settings, which GOG's DOS games are configured for), IDE CD-ROM drive (secondary master), debugger port 12345 |
-| `boot.img` | FreeDOS boot floppy: kernel, FreeCOM, JemmEx (EMS/XMS, upper memory), CuteMouse, the CD-ROM driver and SHSUCDX (the CD is D:), BLASTER set; 549 KB of conventional memory free; ends at `C:\>`. Also small test programs (TXTGAME, VGAGAME, DATAGAME, MOUSETST) |
+| `boot.img` | FreeDOS boot floppy: kernel, FreeCOM, JemmEx (EMS/XMS, upper memory), CuteMouse, the CD-ROM driver and SHSUCDX (the CD is D:), BLASTER set; programs get 623 KB of conventional memory (the drivers are in upper memory, and FreeCOM swaps itself to XMS when it starts one); ends at `C:\>`. Also small test programs (TXTGAME, VGAGAME, DATAGAME, MOUSETST) |
 | `hd.img` | Empty 499 MB FAT16 hard disk, C:, for games; partition at byte 32256 (`gog_import.py` finds it by itself) |
 | `nvr/p55t2p4.nvr` | CMOS settings (floppy drive, IDE auto-detect), so the first boot needs no BIOS setup |
 
