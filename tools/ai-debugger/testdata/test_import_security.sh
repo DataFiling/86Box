@@ -26,9 +26,10 @@
 #      missing source, --offset 512 on a partitioned disk): stdout is JSON
 #      with an "error" key.
 #   7. Stand-in 86Box processes started from /: with a positional
-#      <vm>/86box.cfg, with -Z <vm>, with lower-case -p <vm>; and a process
-#      of another name holding the disk image open: the import refuses each
-#      time and changes nothing.
+#      <vm>/86box.cfg, with -Z <vm>, with lower-case -p <vm>; a process
+#      of another name holding the disk image open; and one named 86Box
+#      whose comm is qt_thread, as the Qt 86Box's: the import refuses each
+#      time, names 86Box for the last, and changes nothing.
 #   8. outer.zip with README.TXT and an inner zip named GAME (no extension):
 #      no traceback, the game is imported.
 
@@ -435,6 +436,31 @@ case7() {
         [ "$(md5sum < "$HD")" = "$sum" ] || { fail "7$v: the disk was written with $what running"; sum=$(md5sum < "$HD"); }
         [ "$(md5sum < "$VM/86box.cfg")" = "$cfgsum" ] || { fail "7$v: 86box.cfg was changed"; cfgsum=$(md5sum < "$VM/86box.cfg"); }
     done
+    # e: as the Qt 86Box, which renames its main thread (its comm) to
+    # qt_thread: the refusal still names 86Box.
+    if ! command -v cc > /dev/null; then
+        echo "(no cc: case 7e skipped)"
+        return
+    fi
+    mkdir -p "$W/fake7/qt"
+    printf '#include <fcntl.h>\n#include <sys/prctl.h>\n#include <unistd.h>\nint main(int c, char **v) { int fd = open(v[1], O_RDONLY); prctl(PR_SET_NAME, "qt_thread"); sleep(120); return fd < 0 || c < 2; }\n' > "$W/fake7/qt/stub.c"
+    cc -o "$W/fake7/qt/86Box" "$W/fake7/qt/stub.c"
+    (cd / && exec "$W/fake7/qt/86Box" "$HD") &
+    pid=$!
+    trap 'kill $pid 2> /dev/null || true' EXIT
+    up=
+    for _ in $(seq 50); do
+        [ "$(cat "/proc/$pid/comm" 2> /dev/null)" = qt_thread ] && ls -l "/proc/$pid/fd" 2> /dev/null | grep -qF "$HD" && up=1 && break
+        sleep 0.1
+    done
+    [ -n "$up" ] || fail "7e: setup: the stand-in did not start"
+    rc=0
+    out=$(imp "$W/7/KEEN" "$HD" 2>&1) || rc=$?
+    echo "$out" > "$W/7e.out"
+    kill $pid 2> /dev/null || true
+    wait $pid 2> /dev/null || true
+    [ $rc != 0 ] || fail "7e: the import should refuse with the Qt 86Box running: $out"
+    case "$out" in "86Box (process $pid) is running this VM"*) ;; *) fail "7e: the refusal should name 86Box: $out" ;; esac
 }
 
 # 8. An inner zip without an extension.

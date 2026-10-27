@@ -42,6 +42,11 @@
 #   9. Tactic/TACTIC.EXE + Tactic/MAPS/TERRAIN.ISO (50 KB,
 #      no ISO 9660 volume): TERRAIN.ISO copied to C: whole, nothing in the
 #      drive.
+#  10. 'Spiel (Disc 1).iso' given with 'Spiel (Disc 2).iso' beside it: a
+#      note names disc 2. solo.cue with its solo.bin, imported next: no
+#      such note, and a note that Spiel's disc stays in the Media menu (it
+#      is in the drive's history). A VM without a CD-ROM drive: told to
+#      take the current kit's boot.img and 86box.cfg.
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 IMPORT=${IMPORT:-$HERE/../gog_import.py}  # IMPORT=... tests another copy
@@ -490,7 +495,35 @@ open(sys.argv[1], "wb").write((b"TERRAIN-MAP-DATA" * 3200)[:51200])' "$T/MAPS/TE
     true
 }
 
-for CASE in 1 2 3 4 5 6 7 8 9; do
+# 10. A lone disc with another beside it; a cue with its own bin; a second
+# CD game in the one drive; a VM without a CD-ROM drive.
+case10() {
+    local S="$W/10/Spiel" O="$W/10/Solo"
+    mkdir -p "$S" "$O"
+    iso "$S/Spiel (Disc 1).iso" SPIEL1
+    iso "$S/Spiel (Disc 2).iso" SPIEL2
+    iso "$O/solo.bin" SOLO
+    printf 'FILE "solo.bin" BINARY\r\n  TRACK 01 MODE1/2048\r\n    INDEX 01 00:00:00\r\n' > "$O/solo.cue"
+    mkvm "$W/10/vm"
+    imp "$S/Spiel (Disc 1).iso" "$HD" > "$W/10a.out" 2>&1 || { fail "10a: the import failed: $(tail -3 "$W/10a.out")"; return; }
+    grep -qF "Other CD images are next to it: Spiel (Disc 2).iso" "$W/10a.out" ||
+        fail "10a: disc 2 beside disc 1 should be named: $(tr '\n' ' ' < "$W/10a.out")"
+    case "$(cfgval cdrom_01_image_path)" in *"Disc 1"*) ;; *) fail "10a: disc 1 should be in the drive: $(grep cdrom_01 "$CFG")" ;; esac
+    imp "$O/solo.cue" "$HD" > "$W/10b.out" 2>&1 || { fail "10b: the import failed: $(tail -3 "$W/10b.out")"; return; }
+    grep -q "Other CD images" "$W/10b.out" && fail "10b: a cue's own bin isn't another disc: $(tr '\n' ' ' < "$W/10b.out")"
+    grep -qF "The VM has one CD-ROM drive" "$W/10b.out" ||
+        fail "10b: the second CD game should say the first's disc stays in the Media menu: $(tr '\n' ' ' < "$W/10b.out")"
+    case "$(cfgval cdrom_01_image_path)" in *solo.cue) ;; *) fail "10b: solo.cue should be in the drive: $(grep cdrom_01 "$CFG")" ;; esac
+    grep -q '^cdrom_01_image_history_01 = .*Disc 1' "$CFG" || fail "10b: Spiel's disc should be in the history: $(grep cdrom_01 "$CFG")"
+    mkvm "$W/10/novm"
+    printf '[Floppy and CD-ROM drives]\nfdd_01_type = 35_2hd\n' > "$CFG"
+    imp "$O/solo.cue" "$HD" > "$W/10c.out" 2>&1 || true
+    grep -qF "older than CD support" "$W/10c.out" && grep -qF "boot.img and 86box.cfg" "$W/10c.out" ||
+        fail "10c: a VM without a CD-ROM drive should be told to take the current kit's boot.img and 86box.cfg: $(tr '\n' ' ' < "$W/10c.out")"
+    true
+}
+
+for CASE in 1 2 3 4 5 6 7 8 9 10; do
     echo "--- case $CASE"
     (set -e; "case$CASE")
     rc=$?

@@ -34,8 +34,9 @@ sudo apt install build-essential cmake ninja-build pkg-config git \
 The last line covers SDL (for the build), Python for the bridge, and the game
 importer's tools: mtools; innoextract for GOG's installers; 7-Zip for 7z,
 lzh and arj archives; bsdtar (libarchive-tools) for rar, which Debian's and
-Ubuntu's 7-Zip can't unpack. If your distribution has a `7zip` package,
-`sudo apt install 7zip` gives a newer 7-Zip than p7zip-full.
+Ubuntu's 7-Zip can't unpack. On Ubuntu 22.04 and Debian 12,
+`sudo apt install 7zip` gives a newer 7-Zip than p7zip-full; on later
+releases p7zip-full installs that one.
 
 ## 2. Build 86Box with the debugger
 
@@ -53,8 +54,8 @@ cmake --build build/regular            # 10-20 minutes; the program is build/reg
   packages (`qt6-base-dev qt6-base-private-dev qt6-tools-dev
   qt6-tools-dev-tools qt6-l10n-tools qt6-translations-l10n`).
 - **The debugger forces the CPU interpreter.** The recompiler doesn't
-  support breakpoints. Emulation keeps real time up to about a Pentium
-  MMX 200.
+  support breakpoints, so how fast the game machine (a Pentium MMX 200)
+  runs depends on your CPU: see step 6.
 
 ## 3. The ROMs
 
@@ -115,7 +116,7 @@ on the PATH.
 ## 6. Start the machine and check the connection
 
 ```sh
-pgrep -a 86Box      # prints nothing if no 86Box is running
+pidof 86Box         # prints nothing if no 86Box is running
 ~/86Box/build/regular/src/86Box -P ~/86box-vms/game-vm -R ~/86box-roms &
 ~/86box-venv/bin/python ~/86Box/tools/ai-debugger/smoke_test.py    # RESULT: PASS
 ```
@@ -137,9 +138,9 @@ Only one 86Box at a time can have the debugger port. A second one prints
   terminal and `kill` don't stop it.
 - **Speed depends on your computer.** The debugger runs the CPU without
   the recompiler, so the emulated Pentium MMX 200 may run slower than a
-  real one: on a 2.1 GHz server core it ran at about half speed. The
-  window's title bar shows the speed in percent. Games still work, only
-  slower.
+  real one: on a 2.1 GHz server core it ran at about 60% speed. The right
+  end of 86Box's toolbar shows the speed in percent. Games still work,
+  only slower.
 - **The debugger port has no password.** Like the rest of 86Box's
   debugger, it accepts connections from the network, not only from your
   computer. On a network you share, keep port 12345 closed in your
@@ -160,6 +161,8 @@ Close 86Box first: the disk image must not change while the machine runs.
   are under the game's "offline backup game installers". Games from
   elsewhere work too: a zip or 7z archive, a game's folder, or a CD image
   (`.iso`, a `.cue` with its `.bin` and music tracks, `.ccd`, `.mds`).
+  For a game on several discs, give it the folder or archive that holds
+  them all, not one disc's image.
 - **Not tried with a real GOG download yet.** The tests use folders laid
   out like GOG's. If an installer fails, install the game with Wine (or
   copy its folder from a Windows PC) and give the importer that folder.
@@ -171,7 +174,9 @@ Close 86Box first: the disk image must not change while the machine runs.
 - **CD games:** the game's CD goes into the machine's CD-ROM drive, D: in
   DOS. The importer copies it into `~/86box-vms/game-vm/cd/`. A game with
   several discs gets the others in 86Box's Media menu (CD-ROM 1, recent
-  images), where you change discs. CD music tracks must be 44.1 kHz
+  images), where you change discs. The machine has one CD-ROM drive, which
+  holds the CD of the game imported last: the CDs of games imported
+  before stay in that menu, to pick when you play them. CD music tracks must be 44.1 kHz
   stereo; with `ffmpeg` installed (`sudo apt install ffmpeg`) the
   importer converts others, and otherwise it says which.
 - **Sound and EMS need no setup.** The machine's Sound Blaster and its
@@ -182,15 +187,22 @@ Close 86Box first: the disk image must not change while the machine runs.
   program that looks like the game. It says why it picked that program
   and lists the others; to start another, import again with `--run
   GAME.EXE`. CD images in the download go into the CD-ROM drive, and
-  floppy images into DISK1, DISK2... next to the game. If the game has no
-  sound, run its setup program (the importer names it) and pick Sound
-  Blaster 16 at port 220, IRQ 7, DMA 1, high DMA 5.
+  floppy images into DISK1, DISK2... next to the game. An installer on
+  several disks runs from DISK1; when it asks for the next disk, give it
+  `C:\GAME\DISK2` and so on as the path, or first copy every disk into
+  DISK1: `mcopy -o -i ~/86box-vms/game-vm/hd.img@@32256 '::/GAME/DISK2/*'
+  ::/GAME/DISK1/`. If the game has no sound, go into its folder (`CD
+  \GAME`), run its setup program there (the importer names it), and pick
+  Sound Blaster 16 at port 220, IRQ 7, DMA 1, high DMA 5.
 - **A CD image on its own** goes into the CD-ROM drive, and nothing is
   copied to C:. Most CD games install from the disc: start the machine,
   type `D:` and the installer's name (the importer says which), and install
   to C:. Then ask Claude to run the game from where it installed.
 - **Other DOS software:** use mtools directly, for example `mcopy -s -i
-  ~/86box-vms/game-vm/hd.img@@32256 MYGAME ::/MYGAME`.
+  ~/86box-vms/game-vm/hd.img@@32256 MYGAME ::/MYGAME`. To update it
+  later, copy into the folder: `mcopy -s -o -i
+  ~/86box-vms/game-vm/hd.img@@32256 MYGAME/* ::/MYGAME/` (the first
+  command again would put a second MYGAME inside it).
 
 ## 8. Ask Claude
 
@@ -215,14 +227,51 @@ cmake --build ~/86Box/build/regular
 ~/86box-venv/bin/pip install -r ~/86Box/tools/ai-debugger/requirements.txt
 ```
 
+## Remove a game, or start over
+
+Close 86Box first. `mdir -i ~/86box-vms/game-vm/hd.img@@32256 ::/` lists
+C:. For a game in C:\GAME, started by C:\GAME.BAT:
+
+```sh
+mdeltree -i ~/86box-vms/game-vm/hd.img@@32256 ::/GAME
+mdel -i ~/86box-vms/game-vm/hd.img@@32256 ::/GAME.BAT
+```
+
+A CD game also has a folder of its own under `~/86box-vms/game-vm/cd/`,
+named like the game: remove it too, and its disc from 86Box's Media menu
+(CD-ROM 1). To import a game again, run the importer again: it replaces
+the earlier copy.
+
+To start over with an empty machine, close 86Box, delete
+`~/86box-vms/game-vm` and run step 4 again. That deletes every game on C:
+and every CD copy.
+
+## Change the boot floppy
+
+The machine's DOS setup is on its boot floppy, A:: `FDCONFIG.SYS` (the
+memory manager, the CD-ROM driver) and `AUTOEXEC.BAT` (mouse, CD letter,
+`BLASTER`). DOS on the floppy has no editor, so change them from Linux,
+with 86Box closed. For example, to give the CD the letter E:
+
+```sh
+F=~/86box-vms/game-vm/boot.img
+cp $F ~/86box-vms/boot.img.orig          # a copy of the original, once
+mtype -i $F ::AUTOEXEC.BAT | sed 's/CDROM1,D/CDROM1,E/' > /tmp/autoexec.bat
+mcopy -o -i $F /tmp/autoexec.bat ::AUTOEXEC.BAT
+```
+
+The files have DOS line endings, which `sed` keeps. For other changes,
+copy a file out with `mtype` the same way, edit it in an editor that
+keeps them, and copy it back with `mcopy -o`.
+
 ## If something goes wrong
 
 | Problem | Fix |
 |---|---|
 | `Could not find a package configuration file provided by "SDL3"` | Add `-DSDL2=ON` to the cmake command, or install `libsdl3-dev` |
 | `externally-managed-environment` from pip | Use the venv from step 5 |
-| `Cannot reach the 86Box GDB stub at 127.0.0.1:12345` | 86Box isn't running, was built without `-DGDBSTUB=ON`, or the machine uses another port (`gdbstub_port` in `86box.cfg`; register the bridge again, step 5, with `-e BOX86_GDB_PORT=N` after `86box`) |
-| `GDB Stub: Failed to bind on port 12345` | Another 86Box has the port: `pgrep -a 86Box`, and close it |
+| `Cannot reach the 86Box GDB stub at 127.0.0.1:12345` | 86Box isn't running, was built without `-DGDBSTUB=ON`, or the machine uses another port (`gdbstub_port` in `86box.cfg`; register the bridge again, step 5, with `-e BOX86_GDB_PORT=N` after `86box`; for the smoke test and `run_tool.py`, set `BOX86_GDB_PORT=N` in the environment) |
+| `GDB Stub: Failed to bind on port 12345` | Another 86Box has the port: `pidof 86Box` shows it; close it |
 | Claude doesn't list the 86box tools | `claude mcp list`; register again with `--scope user` (step 5) |
 | `claude mcp list` says "Failed to connect" | The bridge doesn't start: run `~/86box-venv/bin/python ~/86Box/tools/ai-debugger/server.py` to see its error (it waits for input when it works; Ctrl+C) |
 | `MCP server 86box already exists` from `claude mcp add` | `claude mcp remove 86box -s user`, then add again |
@@ -231,10 +280,11 @@ cmake --build ~/86Box/build/regular
 | `7-Zip is needed to unpack` | `sudo apt install 7zip` (or `p7zip-full`); for rar, `sudo apt install libarchive-tools` |
 | `86Box (process N) is running this VM` | Close 86Box first: it holds the disk and rewrites `86box.cfg` when it closes |
 | The batch file starts the wrong program | Import again with `--run PROGRAM` (the importer listed the candidates and why it picked one) |
-| `Not a supported Inno Setup installer` | The installer is newer than your innoextract: use the game's installed folder (step 7), or a newer innoextract (github.com/dscharrer/innoextract) |
-| A game has no sound | Run its setup program and pick Sound Blaster 16 at 220, IRQ 7, DMA 1 (high DMA 5) |
+| `innoextract could not unpack` | The file isn't a GOG installer, or it is newer than your innoextract. innoextract 1.9, the newest release and the one Ubuntu and Debian ship, reads installers up to Inno Setup 6.0.5. Newer ones need its development version, built from source as its README says (github.com/dscharrer/innoextract; not tried here). Or install the game with Wine (`wine setup_GAME.exe`) and give the importer the folder it went to, under `~/.wine/drive_c/GOG Games/` |
+| A game has no sound | Go into the game's folder (`CD \GAME`), run its setup program there, and pick Sound Blaster 16 at 220, IRQ 7, DMA 1 (high DMA 5) |
+| A game says there isn't enough memory | Programs get 623 KB of conventional memory, about what DOSBox gives, and the machine has 32 MB with EMS and XMS. For more memory in all, raise Memory in 86Box's Settings, Machine. For a game that wants no EMS, change the line in `A:\FDCONFIG.SYS` to `DEVICE=JEMMEX.EXE NOEMS` (see "Change the boot floppy"). Otherwise, ask Claude to find what the game checks |
 | Sound effects play but the music is silent | The game plays General MIDI music, which needs a synthesizer: `sudo apt install fluid-soundfont-gm`, then in 86Box's Settings > Sound > MIDI, set MIDI Out Device to FluidSynth. Or pick Sound Blaster or AdLib music in the game's setup |
-| A game can't find its CD | In the machine, `DIR D:` should list the CD. If the importer said the game used another letter, change `SHSUCDX /D:?CDROM1,D` in `A:\AUTOEXEC.BAT` to that letter. An empty drive means 86Box refused the image: see the importer's notes about its tracks |
+| A game can't find its CD | In the machine, `DIR D:` should list this game's CD (its label is on the first line). Another game's CD: pick this one in 86Box's Media menu, CD-ROM 1 (the drive holds the CD of the game imported last). If the importer said the game used another letter, change `SHSUCDX /D:?CDROM1,D` in `A:\AUTOEXEC.BAT` to that letter (see "Change the boot floppy"). An empty drive means 86Box refused the image: see the importer's notes about its tracks |
 | The machine has no CD-ROM drive | It was unpacked from a kit older than CD support: unpack the kit into another folder and copy its `boot.img` and `86box.cfg` into your machine's folder (your games on `hd.img` stay) |
 
 ## Other AI clients

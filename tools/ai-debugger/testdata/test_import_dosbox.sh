@@ -25,6 +25,8 @@
 #  12. noarch/ with dosbox_keen4.conf and dosbox_keen5.conf: one game's
 #      commands, the other config reported.
 #  13. A GOG config's 'intro' with GAME\INTRO.EXE: kept in the batch file.
+#  14. A config with memsize=64 and cycles=fixed 3000 on a 32 MB VM: both
+#      pointed out; memsize=16 and cycles=max: neither mentioned.
 # Keeps going after a failed case; prints "FAIL: case N: why" for each and
 # "PASS" only when all pass. KEEP=1 keeps the work folder.
 
@@ -524,9 +526,27 @@ case13() {
     echo "$out" | grep -A1 '^RAN intro' | grep -qx 'RAN main IN C:\\GAME' || fail "intro should come before main: $out"
 }
 
+# 14. DOSBox's memory and speed: said only when they need something done.
+case14() {
+    newvm "$W/14/vm"
+    printf '[Machine]\nmem_size = 32768\n' >> "$VM/86box.cfg"
+    local G="$W/14/Slow"
+    mkdir -p "$G"
+    mz "$G/SLOW.EXE"
+    printf '[dosbox]\nmemsize=64\n[cpu]\ncycles=fixed 3000\n[autoexec]\nmount c "C:\\Games\\Slow"\nc:\nSLOW.EXE\n' > "$G/dosbox.conf"
+    imp "$W/14/a" "$G" "$HD" || { fail "the import failed: $(why "$W/14/a")"; return; }
+    grep -qF "DOSBox gives this game 64 MB of memory, and the VM has 32 MB" "$W/14/a.err" ||
+        fail "64 MB in DOSBox against the VM's 32 MB should be pointed out: $(why "$W/14/a")"
+    grep -qF "fixed speed (cycles=3000)" "$W/14/a.err" || fail "a fixed DOSBox speed should be pointed out: $(why "$W/14/a")"
+    printf '[dosbox]\nmemsize=16\n[cpu]\ncycles=max\n[autoexec]\nmount c "C:\\Games\\Slow"\nc:\nSLOW.EXE\n' > "$G/dosbox.conf"
+    imp "$W/14/b" "$G" "$HD" || { fail "the import failed: $(why "$W/14/b")"; return; }
+    grep -qi "memory\|cycles" "$W/14/b.err" && fail "16 MB and cycles=max need nothing done: $(why "$W/14/b")"
+    true
+}
+
 # ---- run them -------------------------------------------------------------------
 
-for n in 1 2 3 4 5 6 7 8 9 10 11 12 13; do
+for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
     N=$n
     before=$(grep -c "^FAIL: case $n:" "$W/fails")
     (

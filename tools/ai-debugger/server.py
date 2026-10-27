@@ -51,7 +51,7 @@ find the code that changes it. snapshot_memory + diff_memory shows everything
 one game action changed.
 
 DOS awareness: dos_memory_map lists the programs in memory and which one is
-running (PSP, load segment). wait_for_program_start(name, command="GAME\n")
+running (PSP, load segment). wait_for_program_start(name, command="GAME\\n")
 stops at a program's first instruction; protected_mode=true then continues to
 a DOS-extender (DOS/4GW...) program's 32-bit entry. log_interrupts +
 read_interrupt_log record DOS/DPMI/BIOS/mouse calls with decoded arguments,

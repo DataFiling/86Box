@@ -1382,8 +1382,11 @@ reports "Unit 0: Secondary-master, 86B_CD00, PIO mode".
 **Game VM.** `make_game_vm.sh` adds an ATAPI drive at secondary master
 (`cdrom_01_parameters = 1, atapi`, `cdrom_01_ide_channel = 1:0`) and puts
 both programs on the floppy. GCDROM loads with `DEVICEHIGH` and
-`DOS=HIGH,UMB` (JemmEx's upper memory). Free conventional memory went from
-489 KB to 549 KB, with the CD driver loaded. AUTOEXEC.BAT runs
+`DOS=HIGH,UMB` (JemmEx's upper memory). The free block at the prompt went
+from 489 KB to 549 KB, with the CD driver loaded. A program gets more: FreeCOM
+swaps itself to XMS when it starts one, so TXTGAME's block was 623 KB, about
+what DOSBox gives (`dos_memory_map` at its first instruction; the drivers and
+CuteMouse are all in upper memory). AUTOEXEC.BAT runs
 `SHSUCDX /D:?CDROM1,D`, so the CD is D:, the letter most GOG configs give
 it. Running the script again on a made floppy leaves it unchanged.
 
@@ -1672,6 +1675,70 @@ from the review's reproductions and the research's layouts. The test
 pass's scripts are `test_import_security.sh`, `test_import_plain.sh`,
 `test_import_dosbox.sh` and `test_import_cd.sh`. Only `test_gog_import.sh`
 needs the real titles.
+
+### 31. A second walkthrough of the setup guide
+
+Before the user's first run on their own machine, an agent followed
+`SETUP-LINUX.md` word for word from an empty home directory, on Ubuntu
+24.04 (4 cores of a 2.1 GHz Xeon). It cloned and built the branch (2 min
+9 s), cloned the ROMs, unpacked the kit and registered the bridge
+(`claude mcp list`: Connected). The smoke test passed. It then imported
+three sources: the GOG-style Second Reality folder, a zip holding a small
+DOS game, and an ISO with a loose `Track02.wav`. All three ran in the
+machine: Second Reality's setup screen, the game's status line, and
+`cdinfo` on D: ending "OK (audio plays)". Two more agents fact-checked
+the guide and read it as a newcomer. A verifier per agent tried to refute
+each finding: 26 of 36 held, about 19 once duplicates are merged.
+
+- `pgrep -a 86Box` never finds the Qt 86Box: it renames its main thread,
+  and so its process name, to `qt_thread`. The guide now uses `pidof
+  86Box`. The importer named the process "qt_thread" when refusing to
+  write to a running VM; it now takes the name from the executable.
+- The speed is at the right end of 86Box's toolbar, not in the title bar.
+  Step 2 claimed real time up to a Pentium MMX 200; under JemmEx the
+  machine ran at 60% on that Xeon.
+- Several messages told the user to do something the guide never
+  explained:
+  - To change A:\AUTOEXEC.BAT or A:\FDCONFIG.SYS: the floppy has no
+    editor, so a new section shows `mtype`, `sed` and `mcopy -o` (which
+    keep the DOS line endings).
+  - To remove a game when C: is full: there is now a section, and the
+    message no longer suggests `make_game_vm.sh -s` (500 MB is already
+    close to its 504 MB limit).
+  - To "pick the VM's CPU to suit" DOSBox's cycles, and "Memory in
+    DOSBox: 16 MB". These now show only when something needs doing: a
+    fixed DOSBox speed, or more memory than the VM has.
+  - To get "a newer innoextract": 1.9 is the newest release, and it reads
+    Inno Setup only up to 6.0.5. The guide and the message now name
+    innoextract's development version, or Wine. Building innoextract from
+    source wasn't allowed in this environment, so those steps are
+    untried.
+- Sound setup programs were named by full path (`run C:\GAME\SETUP.EXE`).
+  Run from C:\, many keep their settings where the game never reads
+  them. Both messages now say `type CD \GAME, then SETUP.EXE`.
+- One disc's image given alone imported that disc only, saying nothing
+  about disc 2 beside it. The importer now names the other images and
+  says to give the folder. A second CD game takes the first one's place
+  in the one drive, and the guide and messages now say where it went.
+- The "no CD-ROM drive" message said to add a drive in Settings, which
+  gives DOS no D: without the driver on the floppy. It now says to take
+  the current kit's boot.img and 86box.cfg, as the guide does.
+- `mcopy -s` run again copied a folder into itself, and the guide now
+  shows how to update one. Multi-disk installers, and editing the CD
+  letter, are explained. The server's instructions split an example at a
+  literal newline.
+- Memory: the kit's README said "549 KB of conventional memory free". That
+  is the free block at the prompt. FreeCOM swaps itself to XMS when it
+  starts a program, so a program gets 623 KB (`dos_memory_map` at
+  TXTGAME's first instruction showed its block). The drivers and
+  CuteMouse are all in upper memory. The README and the guide now give
+  623 KB, and the guide has a row for games that say memory is short.
+
+Tests: `test_import_security.sh` case 7 has a stand-in named 86Box whose
+comm is `qt_thread`; `test_import_cd.sh` case 10 covers a lone disc beside
+another, a cue with its own bin, the one drive and a VM without a drive;
+`test_import_dosbox.sh` case 14 covers DOSBox's memory and speed. All
+three fail on the importer before these fixes.
 
 ## Test results
 

@@ -160,6 +160,19 @@ VALUE_OPTIONS = {"-a", "--assetpath", "-c", "--config", "-e", "--vmmpath", "-g",
                  "--rompath", "-v", "--vmname"}
 
 
+def proc_name(pid):
+    """A process's program name: its executable's (the Qt 86Box renames
+    its main thread, and so its comm, to qt_thread), else its comm."""
+    try:
+        return os.path.basename(os.readlink("/proc/%s/exe" % pid)).replace(" (deleted)", "")
+    except OSError:
+        try:
+            with open("/proc/%s/comm" % pid) as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+
+
 def vm_running(vmdir, image):
     """(name, process ID) of a process that has the VM's disk image open,
     or of an 86Box whose command line names the VM's folder (on Linux);
@@ -171,15 +184,13 @@ def vm_running(vmdir, image):
         if not pid.isdigit() or int(pid) == os.getpid():
             continue
         try:
-            with open("/proc/%s/comm" % pid) as f:
-                comm = f.read().strip()
             fds = os.listdir("/proc/%s/fd" % pid)
         except OSError:
             continue
         for fd in fds:
             try:
                 if os.path.realpath(os.readlink("/proc/%s/fd/%s" % (pid, fd))) == disk:
-                    return comm, int(pid)
+                    return proc_name(pid) or "a process", int(pid)
             except OSError:
                 pass
         try:
@@ -214,7 +225,7 @@ def vm_running(vmdir, image):
         if cfg:
             vm = os.path.dirname(os.path.join(vm, cfg))
         if os.path.realpath(vm) == want:
-            return comm or "86Box", int(pid)
+            return "86Box", int(pid)
     return None
 
 
@@ -402,8 +413,10 @@ def unpack(installer, dest):
             v = subprocess.run(["innoextract", "--version"], capture_output=True, text=True).stdout.splitlines()
             sys.exit("innoextract could not unpack %s:\n%s\n\n"
                      "Give it GOG's Windows offline installer (setup_*.exe, with its .bin parts next to it) or "
-                     "Linux installer (*.sh), or the folder of the installed game. This innoextract (%s) %s; a "
-                     "newer installer needs a newer one (github.com/dscharrer/innoextract)." % (
+                     "Linux installer (*.sh), or the folder of the installed game. This innoextract (%s) %s. A "
+                     "newer installer needs innoextract's development version, built from its source "
+                     "(github.com/dscharrer/innoextract; no release reads it yet); or install the game with Wine "
+                     "and give its folder (SETUP-LINUX.md, troubleshooting)." % (
                          installer, (r.stderr or r.stdout).strip(), v[0] if v else "?",
                          v[1][0].lower() + v[1][1:] if len(v) > 1 else "may be too old"))
     sanitize_tree(dest)
@@ -1195,6 +1208,16 @@ def music_after_data(image):
     return extra >> 20 if extra > (2 << 20) else 0
 
 
+def vm_memory_mb(cfg):
+    """The VM's memory in MB (86box.cfg's mem_size, in KB), or None."""
+    try:
+        with open(cfg, encoding="utf-8", errors="replace") as f:
+            m = re.search(r"^\s*mem_size\s*=\s*(\d+)", f.read(), re.M)
+    except OSError:
+        return None
+    return int(m.group(1)) // 1024 if m else None
+
+
 def set_cd_image(cfg, image, others=()):
     """Put image into the VM's first CD-ROM drive in 86box.cfg (as a path
     relative to the VM's folder), with others (more discs) in the drive's
@@ -1299,8 +1322,10 @@ def attach_cds(discs, cfg, short, game):
         return
     earlier = set_cd_image(cfg, ready[0][1], [to for _, to in ready[1:]])
     if earlier is None:
-        warn("The VM has no CD-ROM drive: add one (86Box's Settings, Storage) or make the VM again with "
-             "make_game_vm.sh, then put %s in it." % ready[0][1])
+        warn("The VM has no CD-ROM drive: it was made from a kit older than CD support. Unpack the current kit "
+             "into another folder and copy its boot.img and 86box.cfg over this VM's (a drive added in 86Box's "
+             "Settings alone gives DOS no D:: the CD driver is on the new boot.img); hd.img and its games stay. "
+             "Then import the game again, or put %s in the drive from 86Box's Media menu." % ready[0][1])
         return
     REPORT["cd"] = os.path.relpath(ready[0][1], vmdir)
     REPORT["other_discs"] = [os.path.relpath(to, vmdir) for _, to in ready[1:]]
@@ -1310,13 +1335,15 @@ def attach_cds(discs, cfg, short, game):
         else "the VM's own copy"))
     if ready[0][0] not in ("D", None):
         warn("DOSBox gave the game its CD as %s:. If the game needs that letter, change the VM's "
-             "A:\\AUTOEXEC.BAT line to SHSUCDX /D:?CDROM1,%s." % (ready[0][0], ready[0][0]))
+             "A:\\AUTOEXEC.BAT line to SHSUCDX /D:?CDROM1,%s (SETUP-LINUX.md, \"Change the boot floppy\")."
+             % (ready[0][0], ready[0][0]))
     if len(ready) > 1:
         say("More discs: %s, in 86Box's Media menu (CD-ROM 1, recent images) to change discs." % ", ".join(
             os.path.relpath(to, vmdir) for _, to in ready[1:]))
     if earlier:
-        say("The CDs that were in the drive stay in its recent images: %s." % ", ".join(
-            earlier[:3] + (["%d more" % (len(earlier) - 3)] if len(earlier) > 3 else [])))
+        say("The VM has one CD-ROM drive: the CDs that were in it stay in its recent images (86Box's Media menu, "
+            "CD-ROM 1), for the games that need them: %s." % ", ".join(
+                earlier[:3] + (["%d more" % (len(earlier) - 3)] if len(earlier) > 3 else [])))
 
 
 def cd_kind(path):
@@ -1531,9 +1558,10 @@ def copy_tree(src, image, offset, dest, exclude=(), gog=True, owners=None, game=
         used = re.match(r"\S+\s+(\d+)", mtools("mdu", "-s", "-i", target, "::" + dest, check=False).stdout.strip())
         earlier = int(used.group(1)) * cluster if used else 0
     if free is not None and need > free + earlier:
-        sys.exit("C: has %d MB free%s, and the game needs %d MB: make a bigger disk (make_game_vm.sh -s), or "
-                 "remove a game from it." % ((free + earlier) >> 20, " (with this game's earlier copy)" if earlier
-                                              else "", -(-need // (1 << 20))))
+        sys.exit("C: has %d MB free%s, and the game needs %d MB: remove a game from it (SETUP-LINUX.md, \"Remove "
+                 "a game\"), or give this game a VM of its own (unpack the kit into another folder; the kit's C: "
+                 "is already about as big as FAT16 allows here)." % ((free + earlier) >> 20, " (with this game's earlier copy)"
+                                                    if earlier else "", -(-need // (1 << 20))))
     parts = [p for p in dest.split("/") if p]
     for k in range(1, len(parts) + 1):  # each folder on the way, then the game's folders
         r = mtools("mmd", "-D", "s", "-i", target, "::/" + "/".join(parts[:k]), check=False)  # -D s: one there is fine
@@ -1943,7 +1971,8 @@ def sound_setup(folder, programs, target, dest):
         say("Sound: it was set up already (%s); copies from GOG, eXoDOS and archive.org are set for DOSBox's "
             "Sound Blaster 16 (220, IRQ 7, DMA 1, high DMA 5), as the VM's.%s" % (
                 ", ".join(sorted(configured)[:3]),
-                " If there is no sound, run %s." % setups[0] if setups else ""))
+                " If there is no sound, type CD %s, then %s (setup programs keep their settings in the folder "
+                "they run in)." % (dest.replace("/", "\\"), setups[0]) if setups else ""))
         return None
     return setups[0] if setups else None
 
@@ -2123,13 +2152,18 @@ def import_dosbox(a, root, name, settings, mounts, commands, target, cfg, owners
              "setup if it uses the GUS.")
     if settings.get("dos", {}).get("ems", "true").lower() in ("false", "0"):
         warn("DOSBox runs this game without EMS, which the game VM's JemmEx provides. Most games don't mind; "
-             "if this one fails, change the line in the VM's A:\\FDCONFIG.SYS to DEVICE=JEMMEX.EXE NOEMS.")
-    mem = settings.get("dosbox", {}).get("memsize")
-    if mem:
-        say("Memory in DOSBox: %s MB." % mem)
-    cpu = settings.get("cpu", {})
-    if cpu.get("cycles"):
-        say("CPU speed in DOSBox: cycles=%s (pick the VM's CPU to suit)." % cpu["cycles"])
+             "if this one fails, change the line in the VM's A:\\FDCONFIG.SYS to DEVICE=JEMMEX.EXE NOEMS "
+             "(SETUP-LINUX.md, \"Change the boot floppy\").")
+    mem = settings.get("dosbox", {}).get("memsize", "")
+    have = vm_memory_mb(cfg)
+    if mem.isdigit() and have and int(mem) > have:
+        warn("DOSBox gives this game %s MB of memory, and the VM has %d MB: if it runs short, raise Memory in "
+             "86Box's Settings, Machine." % (mem, have))
+    cycles = settings.get("cpu", {}).get("cycles", "").lower().split()
+    fixed = cycles[1] if cycles[:1] == ["fixed"] and len(cycles) > 1 else cycles[0] if cycles else ""
+    if fixed.isdigit():
+        say("In DOSBox it ran at a fixed speed (cycles=%s), likely slower than the VM's CPU: if the game runs too "
+            "fast, pick a slower CPU in 86Box's Settings, Machine." % fixed)
 
 
 def import_cds(discs, name, cfg):
@@ -2323,8 +2357,9 @@ def import_plain(a, top, name, target, cfg, owners, hint=()):
                     "%s (%s)" % (p, why[p]) if p in why else p for p in rest))
         setup = sound_setup(folder, programs, target, dos_dir)
         if setup:
-            say("If the game has no sound, run %s\\%s and pick Sound Blaster 16 (or a Sound Blaster) at port "
-                "220, IRQ 7, DMA 1, high DMA 5." % (run_in, setup))
+            say("If the game has no sound, type CD %s, then %s (setup programs keep their settings in the folder "
+                "they run in), and pick Sound Blaster 16 (or a Sound Blaster) at port 220, IRQ 7, DMA 1, high "
+                "DMA 5." % (run_in[2:], setup))
             REPORT["setup"] = "%s\\%s" % (run_in, setup)
     if extras:
         say("Not copied (outside the game's folder): %s" % ", ".join(sorted(extras)[:12]))
@@ -2406,6 +2441,19 @@ def run(a, target, vmdir, cfg, owners):
         images = [os.path.join(folder, n) for n in os.listdir(folder) if cd_kind(os.path.join(folder, n)) == "read"]
         tracks = loose_tracks(a.source, images) if os.path.splitext(a.source)[1].lower() in (
             ".iso", ".bin", ".img", ".gog") else []
+        # Other discs beside it (each with the files its descriptor names)
+        # go in only when the folder is given.
+        covered = {os.path.realpath(p) for p in [a.source] + companions(a.source)}
+        others = []
+        for p in sorted(images, key=lambda p: os.path.splitext(p)[1].lower() not in (".cue", ".ccd", ".mds", ".toc")):
+            theirs = {os.path.realpath(q) for q in [p] + companions(p)}
+            if not theirs & covered:
+                others.append(os.path.basename(p))
+            covered |= theirs
+        if others:
+            warn("Other CD images are next to it: %s. For a game on several discs, give the importer their "
+                 "folder instead: disc 1 then goes into the drive and the others into 86Box's Media menu." % (
+                     ", ".join(sorted(others)[:4] + (["%d more" % (len(others) - 4)] if len(others) > 4 else []))))
         return import_cds([(a.source, tracks)], game_name(a.source), cfg)
 
     source, conf_file, unpacked, inner_done, tried = a.source, None, None, False, False

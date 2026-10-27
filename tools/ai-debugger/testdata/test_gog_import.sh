@@ -341,7 +341,7 @@ grep -qi "dosbox\|play.bat" <(grep "Other programs" "$W/zip.out") && fail "DOSBo
 # 7: the batch file that runs the game, the CD in the drive, nothing of it on C:.
 if [ -n "$SEVEN" ]; then
     mtype -i "$HD@@32256" ::/SPACEGM.BAT | tr -d '\r' | tail -1 | grep -qx GO.BAT || fail "SPACEGM.BAT should run GO.BAT"
-    grep -q "SETUP.EXE and pick Sound Blaster" "$W/7z.out" || fail "the setup program should be named for the sound"
+    grep -qF 'type CD \SPACEGM, then SETUP.EXE' "$W/7z.out" || fail "the setup program should be named for the sound, with its folder"
     grep -qx 'cdrom_01_image_path = cd/SPACEGM/space.cue' "$W/86box.cfg.7" || fail "the 7z's CD should be in the drive"
     tr -d '\r' < "$W/cd/SPACEGM/space.cue" | grep -qx 'FILE "space.bin" BINARY' || fail "the cue should name space.bin"
     tr -d '\r' < "$W/cd/SPACEGM/space.cue" | grep -qx 'FILE "Track 02.ogg" WAVE' || fail "the OGG track should be WAVE"
