@@ -1740,6 +1740,39 @@ another, a cue with its own bin, the one drive and a VM without a drive;
 `test_import_dosbox.sh` case 14 covers DOSBox's memory and speed. All
 three fail on the importer before these fixes.
 
+**Review.** Three reviewers read that commit (the importer, the guide's
+new commands run on a copy of the kit, the tests and docs), and a verifier
+each tried to refute their findings: 14 of 17 held.
+
+- The new "other discs" note crashed the import when a neighbour's name
+  wasn't UTF-8 (files unzipped from old archives), under a desktop locale
+  whose stdout is strict. Output now escapes such characters, and
+  86box.cfg is read and written so that such a path survives.
+- The sound hint named `SoundSetup.exe`; DOS has `SOUNDS~1.EXE`. It now
+  gives the DOS name.
+- A game data file named `.ISO` was called another disc; the note now
+  uses the same content test as a folder import.
+- A game bigger than all of C: was told to remove a game. It is now told
+  it can't fit. The 504 MB limit comes from the disk's CHS layout, not
+  from FAT16.
+- Ubuntu 22.04 ships innoextract 1.8 (Inno Setup up to 6.0.2), so 1.9 is
+  a step up there; the message now depends on the installed version.
+- A CD image given as a symlink was refused (its real folder lies outside
+  the link's), and with no CD-ROM drive the report still said to type D:.
+- The one-drive note named a removed game's deleted disc, and the same
+  game's earlier copy of disc 1 (after the lone disc, then its folder).
+  Missing files and the game's own folder are now left out.
+- Guide: the multi-disk `mcopy` lacked `-s` and skipped subfolders; "it
+  replaces the earlier copy" was wrong (files the new copy lacks stay);
+  the README still promised real time. Case 7e needs a C compiler, which
+  the tests' README now says.
+
+`test_import_cd.sh` case 10 now covers the data `.ISO`, the folder after
+the lone disc, the removed game, the link, the non-UTF-8 name with strict
+output, and no `type D:` without a drive; `test_import_plain.sh` case 16
+covers the setup's DOS name and a game bigger than C:. Each check fails on
+the commit before.
+
 ## Test results
 
 Test machines, built with `-DQT=OFF -DSDL2=ON -DGDBSTUB=ON` and run headless
@@ -1775,8 +1808,9 @@ this environment), and V86 mode under EMM386.
   access reports its second byte's address.
 - Pausing from 86Box's own UI stops request servicing (tools time out).
 - One debugger client at a time; US keyboard layout.
-- Interpreter only while the stub is enabled (measured real time up to a
-  Pentium MMX 200).
+- Interpreter only while the stub is enabled (real time up to a Pentium
+  MMX 200 in plain DOS; the game VM under JemmEx ran at about 60% on a
+  2.1 GHz server core).
 
 ## Next steps
 

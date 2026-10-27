@@ -42,11 +42,15 @@
 #   9. Tactic/TACTIC.EXE + Tactic/MAPS/TERRAIN.ISO (50 KB,
 #      no ISO 9660 volume): TERRAIN.ISO copied to C: whole, nothing in the
 #      drive.
-#  10. 'Spiel (Disc 1).iso' given with 'Spiel (Disc 2).iso' beside it: a
-#      note names disc 2. solo.cue with its solo.bin, imported next: no
-#      such note, and a note that Spiel's disc stays in the Media menu (it
-#      is in the drive's history). A VM without a CD-ROM drive: told to
-#      take the current kit's boot.img and 86box.cfg.
+#  10. 'Spiel (Disc 1).iso' given with 'Spiel (Disc 2).iso' and a data
+#      file MAP.ISO beside it: a note names disc 2 only. The folder then:
+#      the first copy of disc 1 isn't called another game's CD. solo.cue
+#      with its solo.bin next: no such note, and a note that Spiel's discs
+#      stay in the Media menu (the drive's history). Solo's cd/ folder
+#      deleted, then a link to disc 2 given: the disc goes in, Solo isn't
+#      named. A neighbour whose name isn't UTF-8, with strict output: no
+#      crash. A VM without a CD-ROM drive: told to take the current kit's
+#      boot.img and 86box.cfg, and not to type D:.
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 IMPORT=${IMPORT:-$HERE/../gog_import.py}  # IMPORT=... tests another copy
@@ -495,31 +499,68 @@ open(sys.argv[1], "wb").write((b"TERRAIN-MAP-DATA" * 3200)[:51200])' "$T/MAPS/TE
     true
 }
 
-# 10. A lone disc with another beside it; a cue with its own bin; a second
-# CD game in the one drive; a VM without a CD-ROM drive.
+# 10. A lone disc with another beside it (and game data named .ISO); the
+# folder after it; a cue with its own bin; a removed game's disc; a link to
+# a disc; a name that isn't UTF-8, with output that must be valid; a VM
+# without a CD-ROM drive.
 case10() {
-    local S="$W/10/Spiel" O="$W/10/Solo"
-    mkdir -p "$S" "$O"
+    local S="$W/10/Spiel" O="$W/10/Solo" E="$W/10/Enc" L="$W/10/links"
+    mkdir -p "$S" "$O" "$E" "$L"
     iso "$S/Spiel (Disc 1).iso" SPIEL1
     iso "$S/Spiel (Disc 2).iso" SPIEL2
+    python3 -c '
+import sys
+open(sys.argv[1], "wb").write((b"TERRAIN-MAP-DATA" * 3200)[:51200])' "$S/MAP.ISO"
     iso "$O/solo.bin" SOLO
     printf 'FILE "solo.bin" BINARY\r\n  TRACK 01 MODE1/2048\r\n    INDEX 01 00:00:00\r\n' > "$O/solo.cue"
     mkvm "$W/10/vm"
+    # a: disc 1 alone; disc 2 is named, the data file isn't.
     imp "$S/Spiel (Disc 1).iso" "$HD" > "$W/10a.out" 2>&1 || { fail "10a: the import failed: $(tail -3 "$W/10a.out")"; return; }
-    grep -qF "Other CD images are next to it: Spiel (Disc 2).iso" "$W/10a.out" ||
-        fail "10a: disc 2 beside disc 1 should be named: $(tr '\n' ' ' < "$W/10a.out")"
+    grep -qF "Other CD images are next to it: Spiel (Disc 2).iso." "$W/10a.out" ||
+        fail "10a: disc 2 (only) beside disc 1 should be named: $(tr '\n' ' ' < "$W/10a.out")"
     case "$(cfgval cdrom_01_image_path)" in *"Disc 1"*) ;; *) fail "10a: disc 1 should be in the drive: $(grep cdrom_01 "$CFG")" ;; esac
-    imp "$O/solo.cue" "$HD" > "$W/10b.out" 2>&1 || { fail "10b: the import failed: $(tail -3 "$W/10b.out")"; return; }
-    grep -q "Other CD images" "$W/10b.out" && fail "10b: a cue's own bin isn't another disc: $(tr '\n' ' ' < "$W/10b.out")"
-    grep -qF "The VM has one CD-ROM drive" "$W/10b.out" ||
-        fail "10b: the second CD game should say the first's disc stays in the Media menu: $(tr '\n' ' ' < "$W/10b.out")"
-    case "$(cfgval cdrom_01_image_path)" in *solo.cue) ;; *) fail "10b: solo.cue should be in the drive: $(grep cdrom_01 "$CFG")" ;; esac
-    grep -q '^cdrom_01_image_history_01 = .*Disc 1' "$CFG" || fail "10b: Spiel's disc should be in the history: $(grep cdrom_01 "$CFG")"
+    # b: the folder, as the note says: the first import's copy of disc 1
+    # isn't another game's CD.
+    imp "$S" "$HD" > "$W/10b.out" 2>&1 || { fail "10b: the import failed: $(tail -3 "$W/10b.out")"; return; }
+    grep -qF "one CD-ROM drive" "$W/10b.out" && fail "10b: no other game's CD was in the drive: $(tr '\n' ' ' < "$W/10b.out")"
+    case "$(cfgval cdrom_01_image_path)" in *"CD1/Spiel (Disc 1).iso") ;; *) fail "10b: CD1's disc 1 should be in the drive: $(grep cdrom_01 "$CFG")" ;; esac
+    # c: another CD game: Spiel's discs stay in the history, and it says so.
+    imp "$O/solo.cue" "$HD" > "$W/10c.out" 2>&1 || { fail "10c: the import failed: $(tail -3 "$W/10c.out")"; return; }
+    grep -q "Other CD images" "$W/10c.out" && fail "10c: a cue's own bin isn't another disc: $(tr '\n' ' ' < "$W/10c.out")"
+    grep -qF "The VM has one CD-ROM drive" "$W/10c.out" ||
+        fail "10c: the second CD game should say the first's disc stays in the Media menu: $(tr '\n' ' ' < "$W/10c.out")"
+    case "$(cfgval cdrom_01_image_path)" in *solo.cue) ;; *) fail "10c: solo.cue should be in the drive: $(grep cdrom_01 "$CFG")" ;; esac
+    grep -q '^cdrom_01_image_history_01 = .*CD1/Spiel (Disc 1)' "$CFG" || fail "10c: Spiel's disc should be in the history: $(grep cdrom_01 "$CFG")"
+    # d: Solo removed (its cd/ folder deleted), then a link to Spiel's
+    # disc 2 given: the link's target goes in; Solo isn't named.
+    rm -rf "$VM/cd/SOLO"
+    ln -s "../Spiel/Spiel (Disc 2).iso" "$L/Link.iso"
+    imp "$L/Link.iso" "$HD" > "$W/10d.out" 2>&1 || { fail "10d: the import failed: $(tail -3 "$W/10d.out")"; return; }
+    grep -q "isn't a file or folder in what was given" "$W/10d.out" && fail "10d: a linked disc was refused: $(tr '\n' ' ' < "$W/10d.out")"
+    case "$(cfgval cdrom_01_image_path)" in *"Spiel (Disc 2).iso") ;; *) fail "10d: the linked disc should be in the drive: $(grep cdrom_01 "$CFG")" ;; esac
+    grep -i "one CD-ROM drive" "$W/10d.out" | grep -qi solo && fail "10d: Solo's deleted disc was named: $(tr '\n' ' ' < "$W/10d.out")"
+    grep -qi '^cdrom_01_image_history_.*solo' "$CFG" && fail "10d: Solo's deleted disc stayed in the history: $(grep cdrom_01 "$CFG")"
+    # e: a neighbour whose name isn't UTF-8, with output that may not
+    # carry undecodable characters (a desktop locale's strict stdout).
+    iso "$E/Enc (Disc 1).iso" ENC1
+    iso "$W/10/enc2.iso" ENC2
+    python3 -c 'import os, sys; os.rename(sys.argv[1], os.path.join(os.fsencode(sys.argv[2]), b"Enc f\xfcr (Disc 2).iso"))' "$W/10/enc2.iso" "$E"
+    "$TIMEOUT" -k 5 "$TO" python3 -I -c '
+import runpy, sys
+sys.stdout.reconfigure(errors="strict")
+sys.stderr.reconfigure(errors="strict")
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")' "$IMPORT" "$E/Enc (Disc 1).iso" "$HD" > "$W/10e.out" 2>&1 ||
+        fail "10e: the import failed: $(tail -3 "$W/10e.out")"
+    grep -qF "Other CD images are next to it: Enc f" "$W/10e.out" || fail "10e: the other disc should be named: $(tr '\n' ' ' < "$W/10e.out")"
+    case "$(cfgval cdrom_01_image_path)" in *"Enc (Disc 1).iso") ;; *) fail "10e: Enc's disc 1 should be in the drive: $(grep cdrom_01 "$CFG")" ;; esac
+    # f: a VM without a CD-ROM drive: told what to do, and not to type D:.
     mkvm "$W/10/novm"
     printf '[Floppy and CD-ROM drives]\nfdd_01_type = 35_2hd\n' > "$CFG"
-    imp "$O/solo.cue" "$HD" > "$W/10c.out" 2>&1 || true
-    grep -qF "older than CD support" "$W/10c.out" && grep -qF "boot.img and 86box.cfg" "$W/10c.out" ||
-        fail "10c: a VM without a CD-ROM drive should be told to take the current kit's boot.img and 86box.cfg: $(tr '\n' ' ' < "$W/10c.out")"
+    imp "$O/solo.cue" "$HD" > "$W/10f.out" 2>&1 || true
+    grep -qF "older than CD support" "$W/10f.out" && grep -qF "boot.img and 86box.cfg" "$W/10f.out" ||
+        fail "10f: a VM without a CD-ROM drive should be told to take the current kit's boot.img and 86box.cfg: $(tr '\n' ' ' < "$W/10f.out")"
+    grep -q "type D:\|Next, in the VM: D:" "$W/10f.out" && fail "10f: with no drive there's no D: to go to: $(tr '\n' ' ' < "$W/10f.out")"
     true
 }
 

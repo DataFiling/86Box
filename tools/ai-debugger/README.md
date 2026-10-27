@@ -292,10 +292,11 @@ Example prompts:
 - The interrupt log keeps the last 4096 calls (identical back-to-back calls
   count as one); value scans keep their state on disk (in the system temp
   directory), one scan at a time per emulator.
-- With the stub enabled, 86Box runs the CPU interpreter only. That still
-  keeps real time for a Pentium MMX 200 under a CPU-bound load on a modern
-  host (measurements in [testdata/README.md](testdata/README.md)); faster
-  emulated CPUs may fall behind.
+- With the stub enabled, 86Box runs the CPU interpreter only. In plain DOS
+  that kept real time for a Pentium MMX 200 under a CPU-bound load
+  (measurements in [testdata/README.md](testdata/README.md)); the game VM,
+  under JemmEx, ran at about 60% on a 2.1 GHz server core. How fast it
+  runs depends on the host's CPU.
 - Input tools resume a paused CPU, since the guest must run to read input.
   The keyboard uses the US layout. Mouse movement is relative (mickeys), as
   real mice are; take a screenshot to see where the pointer went.

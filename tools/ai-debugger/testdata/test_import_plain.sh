@@ -23,6 +23,8 @@
 #  14. A real ISO in the game's folder (SPACE/CD/space.iso): not on C:,
 #      in the drive.
 #  15. --dir 'GAMES\SR' and --dir GAMES/SR: the files in C:\GAMES\SR.
+#  16. 'Star Game' with SoundSetup.exe: the sound hint names SOUNDS~1.EXE,
+#      the name DOS has. A game bigger than the whole of C:: told so.
 # Prints "ok: case N" or "FAIL: case N: why" for each, then PASS when all
 # pass. KEEP=1 keeps the work folder.
 
@@ -503,8 +505,24 @@ case_15() {
     true
 }
 
+# 16. The sound setup by its DOS name; a game bigger than C:.
+case_16() {
+    mkvm "$W/16/vm"
+    mkdir -p "$W/16/Star Game" "$W/16/HUGE"
+    mz "$W/16/Star Game/STARGAME.EXE" 40000
+    mz "$W/16/Star Game/SoundSetup.exe" 9000
+    imp "$W/16/Star Game" "$HD" > "$W/16/a.out" 2>&1 || bad "import failed: $(cat "$W/16/a.out")"
+    grep -qF 'type CD \STARGAME, then SOUNDS~1.EXE' "$W/16/a.out" ||
+        bad "the sound setup should be named as DOS has it: $(cat "$W/16/a.out")"
+    mz "$W/16/HUGE/HUGE.EXE" 40000
+    truncate -s $((25 << 20)) "$W/16/HUGE/DATA.BIN"
+    imp "$W/16/HUGE" "$HD" > "$W/16/b.out" 2>&1 && bad "a 25 MB game on a 20 MB C: should be refused: $(cat "$W/16/b.out")"
+    grep -qF "doesn't fit on this VM's C:" "$W/16/b.out" || bad "it should say the game can't fit at all: $(cat "$W/16/b.out")"
+    true
+}
+
 FAILS=()
-for n in $(seq 1 15); do
+for n in $(seq 1 16); do
     (
         set -e
         N=$n
@@ -523,7 +541,7 @@ done
 if [ ${#FAILS[@]} = 0 ]; then
     echo PASS
 else
-    echo "${#FAILS[@]} of 15 cases failed:"
+    echo "${#FAILS[@]} of 16 cases failed:"
     printf '%s\n' "${FAILS[@]}"
     exit 1
 fi

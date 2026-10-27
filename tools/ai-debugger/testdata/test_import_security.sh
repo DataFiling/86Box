@@ -29,7 +29,8 @@
 #      <vm>/86box.cfg, with -Z <vm>, with lower-case -p <vm>; a process
 #      of another name holding the disk image open; and one named 86Box
 #      whose comm is qt_thread, as the Qt 86Box's: the import refuses each
-#      time, names 86Box for the last, and changes nothing.
+#      time, names 86Box for the last, and changes nothing. The last needs a
+#      C compiler (cc, from build-essential); it is skipped without one.
 #   8. outer.zip with README.TXT and an inner zip named GAME (no extension):
 #      no traceback, the game is imported.
 

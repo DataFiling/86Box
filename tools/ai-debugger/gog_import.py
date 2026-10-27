@@ -411,14 +411,18 @@ def unpack(installer, dest):
                            capture_output=True, text=True, errors="replace", stdin=subprocess.DEVNULL)
         if r.returncode:
             v = subprocess.run(["innoextract", "--version"], capture_output=True, text=True).stdout.splitlines()
+            ver = tuple(int(x) for x in re.findall(r"\d+", v[0])[:2]) if v else ()
             sys.exit("innoextract could not unpack %s:\n%s\n\n"
                      "Give it GOG's Windows offline installer (setup_*.exe, with its .bin parts next to it) or "
                      "Linux installer (*.sh), or the folder of the installed game. This innoextract (%s) %s. A "
-                     "newer installer needs innoextract's development version, built from its source "
-                     "(github.com/dscharrer/innoextract; no release reads it yet); or install the game with Wine "
-                     "and give its folder (SETUP-LINUX.md, troubleshooting)." % (
+                     "newer installer needs %s; or install the game with Wine and give its folder (SETUP-LINUX.md, "
+                     "\"If something goes wrong\")." % (
                          installer, (r.stderr or r.stdout).strip(), v[0] if v else "?",
-                         v[1][0].lower() + v[1][1:] if len(v) > 1 else "may be too old"))
+                         v[1][0].lower() + v[1][1:] if len(v) > 1 else "may be too old",
+                         "innoextract's development version, built from its source (github.com/dscharrer/"
+                         "innoextract; no release reads it yet)" if ver >= (1, 9) else
+                         "innoextract 1.9 (github.com/dscharrer/innoextract/releases; Inno Setup up to 6.0.5) or, "
+                         "for the newest installers, its development version, built from its source"))
     sanitize_tree(dest)
 
 
@@ -488,13 +492,16 @@ def partition_offset(image):
 
 
 def image_space(target):
-    """(free bytes, cluster bytes) of the FAT volume at target."""
+    """(free bytes, cluster bytes, whole volume's bytes or None) of the FAT
+    volume at target."""
     free = re.findall(r"([\d ]+) bytes free", mtools("mdir", "-i", target, "::/", check=False).stdout)
     info = mtools("minfo", "-i", target, check=False).stdout
     sector = re.search(r"sector size: (\d+)", info)
     cluster = re.search(r"cluster size: (\d+)", info)
+    sectors = max((int(n) for n in re.findall(r"(?:small|big) size: (\d+) sectors", info)), default=0)
     return (int(free[-1].replace(" ", "")) if free else None,
-            int(sector.group(1)) * int(cluster.group(1)) if sector and cluster else 4096)
+            int(sector.group(1)) * int(cluster.group(1)) if sector and cluster else 4096,
+            sectors * int(sector.group(1)) if sector and sectors else None)
 
 
 # ---- DOSBox configurations ------------------------------------------------------
@@ -1218,13 +1225,13 @@ def vm_memory_mb(cfg):
     return int(m.group(1)) // 1024 if m else None
 
 
-def set_cd_image(cfg, image, others=()):
+def set_cd_image(cfg, image, others=(), own=None):
     """Put image into the VM's first CD-ROM drive in 86box.cfg (as a path
     relative to the VM's folder), with others (more discs) in the drive's
     recent images (86Box's Media menu), and the discs already there (an
-    earlier game's) after them. Returns those earlier discs; None if the VM
-    has no CD-ROM drive."""
-    with open(cfg, encoding="utf-8") as f:
+    earlier game's, still there and not in this game's folder own) after
+    them. Returns those earlier discs; None if the VM has no CD-ROM drive."""
+    with open(cfg, encoding="utf-8", errors="surrogateescape") as f:
         lines = f.read().splitlines()
     sec = next((i for i, l in enumerate(lines) if l.strip().lower() == "[floppy and cd-rom drives]"), None)
     if sec is None:
@@ -1240,14 +1247,16 @@ def set_cd_image(cfg, image, others=()):
             if not re.match(r"cdrom_01_image_(path|history_\d+)$", k)]
     rel = [os.path.relpath(p, vmdir) for p in [image] + list(others)]
     where = {os.path.normpath(os.path.join(vmdir, r)) for r in rel}
-    earlier = list(dict.fromkeys(v for _, v in old if v and os.path.normpath(os.path.join(vmdir, v)) not in where))
+    earlier = list(dict.fromkeys(v for _, v in old if v and os.path.normpath(os.path.join(vmdir, v)) not in where
+                                 and os.path.exists(os.path.join(vmdir, v))
+                                 and not (own and inside(os.path.join(vmdir, v), own))))
     history = (rel[1:] + earlier)[:10]
     at = next((i + 1 for i, l in enumerate(body) if l.split("=", 1)[0].strip() == "cdrom_01_ide_channel"),
               next((i + 1 for i, l in enumerate(body) if l.split("=", 1)[0].strip() == "cdrom_01_parameters")))
     body[at:at] = ["cdrom_01_image_path = %s" % rel[0]] + [
         "cdrom_01_image_history_%02d = %s" % (n + 1, r) for n, r in enumerate(history)]
     lines[sec + 1:end] = body
-    with open(cfg, "w", encoding="utf-8") as f:
+    with open(cfg, "w", encoding="utf-8", errors="surrogateescape") as f:
         f.write("\n".join(lines) + "\n")
     return [e for e in earlier if e in history]
 
@@ -1320,7 +1329,7 @@ def attach_cds(discs, cfg, short, game):
             ready.append((drive, to))
     if not ready:
         return
-    earlier = set_cd_image(cfg, ready[0][1], [to for _, to in ready[1:]])
+    earlier = set_cd_image(cfg, ready[0][1], [to for _, to in ready[1:]], dest)
     if earlier is None:
         warn("The VM has no CD-ROM drive: it was made from a kit older than CD support. Unpack the current kit "
              "into another folder and copy its boot.img and 86box.cfg over this VM's (a drive added in 86Box's "
@@ -1550,18 +1559,22 @@ def copy_tree(src, image, offset, dest, exclude=(), gog=True, owners=None, game=
             if not SHORT_NAME.match(name):
                 longnames.append(os.path.join(rel, name) if rel != "." else name)
             plan.append((p, "/".join(x for x in (dest, rel, name) if x and x != "."), os.path.getsize(p)))
-    free, cluster = image_space(target)
+    free, cluster, total = image_space(target)
     need = sum(-(-size // cluster) * cluster for _, _, size in plan) + (len(dirs) + 1) * cluster
     existed = mtools("mdir", "-b", "-i", target, "::" + dest, check=False).returncode == 0
     earlier = 0  # this game's copy from before, which this one replaces
     if existed:
         used = re.match(r"\S+\s+(\d+)", mtools("mdu", "-s", "-i", target, "::" + dest, check=False).stdout.strip())
         earlier = int(used.group(1)) * cluster if used else 0
+    if total and need > total:
+        sys.exit("The game needs %d MB, and C: holds %d MB in all, so it doesn't fit on this VM's C: (the kit's "
+                 "C: is already near the 504 MB its disk layout allows)." % (-(-need // (1 << 20)), total >> 20))
     if free is not None and need > free + earlier:
         sys.exit("C: has %d MB free%s, and the game needs %d MB: remove a game from it (SETUP-LINUX.md, \"Remove "
-                 "a game\"), or give this game a VM of its own (unpack the kit into another folder; the kit's C: "
-                 "is already about as big as FAT16 allows here)." % ((free + earlier) >> 20, " (with this game's earlier copy)"
-                                                    if earlier else "", -(-need // (1 << 20))))
+                 "a game, or start over\"), or give this game a VM of its own (unpack the kit into another folder; "
+                 "the kit's C: is already near the 504 MB its disk layout allows)." % (
+                     (free + earlier) >> 20, " (with this game's earlier copy)" if earlier else "",
+                     -(-need // (1 << 20))))
     parts = [p for p in dest.split("/") if p]
     for k in range(1, len(parts) + 1):  # each folder on the way, then the game's folders
         r = mtools("mmd", "-D", "s", "-i", target, "::/" + "/".join(parts[:k]), check=False)  # -D s: one there is fine
@@ -1965,6 +1978,9 @@ def sound_setup(folder, programs, target, dest):
              "Sound Blaster 16: if there is no sound, run its setup and pick Sound Blaster.")
     setups = sorted((p for p in programs if SETUP_PROGRAM.fullmatch(os.path.splitext(p)[0])),
                     key=lambda p: p.lower().startswith("instal"))
+    # As DOS names it (SoundSetup.exe is SOUNDS~1.EXE there).
+    setups = [dos_path(target, dest + "/" + p.replace(os.sep, "/"))[len(dest) + 1:].replace("/", "\\")
+              for p in setups[:1]]
     configured = [n for n in os.listdir(folder) if SOUND_CONFIG.fullmatch(n) or n.lower() in {
         os.path.splitext(p)[0].lower() + ".cfg" for p in programs}]
     if configured:
@@ -2170,6 +2186,9 @@ def import_cds(discs, name, cfg):
     """A game that is only CDs: put them in the drive and say what to run."""
     REPORT.update(kind="cd", name=name)
     attach_cds([(None, p, None, tracks) for p, tracks in discs], cfg, short_name(name), name)
+    if "cd" not in REPORT:  # not in the drive (the notes above say why), so not D: either
+        REPORT["next"] = []
+        return
     step = report_disc(discs[0][0])
     REPORT["next"] = ["D:", step] if step else ["D:", "DIR"]
 
@@ -2368,6 +2387,11 @@ def import_plain(a, top, name, target, cfg, owners, hint=()):
 
 def main():
     global JSON_OUT
+    for stream in (sys.stdout, sys.stderr):  # a file name that isn't UTF-8 must not stop the import
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("source", help="a GOG installer (setup_*.exe, or *.sh for Linux), a zip or 7z archive, a "
                     "DOSBox configuration, a CD image (.iso, .cue, .ccd, .mds, .chd...), or a game's folder")
@@ -2437,15 +2461,19 @@ def run(a, target, vmdir, cfg, owners):
         sys.exit("86Box doesn't read %s images: convert it to an ISO or a cue sheet (BIN/CUE), and give the "
                  "importer that." % os.path.splitext(a.source)[1])
     if kind:
-        BOUND = folder = os.path.dirname(os.path.abspath(a.source))  # the files a cue sheet names: next to it
+        source = os.path.realpath(a.source)  # (a link: the files a cue sheet names are beside what it links to)
+        BOUND = folder = os.path.dirname(source)  # the files a cue sheet names: next to it
         images = [os.path.join(folder, n) for n in os.listdir(folder) if cd_kind(os.path.join(folder, n)) == "read"]
-        tracks = loose_tracks(a.source, images) if os.path.splitext(a.source)[1].lower() in (
+        tracks = loose_tracks(source, images) if os.path.splitext(source)[1].lower() in (
             ".iso", ".bin", ".img", ".gog") else []
         # Other discs beside it (each with the files its descriptor names)
         # go in only when the folder is given.
-        covered = {os.path.realpath(p) for p in [a.source] + companions(a.source)}
+        covered = {os.path.realpath(p) for p in [source] + companions(source)}
         others = []
         for p in sorted(images, key=lambda p: os.path.splitext(p)[1].lower() not in (".cue", ".ccd", ".mds", ".toc")):
+            if os.path.splitext(p)[1].lower() in (".iso", ".bin", ".img", ".gog", ".mdf") and \
+                    raw_sectors(p)[0] == 2048 and cd_root(p) is None:
+                continue  # the game's data, named like a CD image (as find_cds tells them apart)
             theirs = {os.path.realpath(q) for q in [p] + companions(p)}
             if not theirs & covered:
                 others.append(os.path.basename(p))
@@ -2454,7 +2482,7 @@ def run(a, target, vmdir, cfg, owners):
             warn("Other CD images are next to it: %s. For a game on several discs, give the importer their "
                  "folder instead: disc 1 then goes into the drive and the others into 86Box's Media menu." % (
                      ", ".join(sorted(others)[:4] + (["%d more" % (len(others) - 4)] if len(others) > 4 else []))))
-        return import_cds([(a.source, tracks)], game_name(a.source), cfg)
+        return import_cds([(source, tracks)], game_name(a.source), cfg)
 
     source, conf_file, unpacked, inner_done, tried = a.source, None, None, False, False
     if os.path.isfile(source) and re.search(r"\.(conf|cfg)$", source, re.I) and is_dosbox_conf(source):

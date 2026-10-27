@@ -190,8 +190,8 @@ Close 86Box first: the disk image must not change while the machine runs.
   floppy images into DISK1, DISK2... next to the game. An installer on
   several disks runs from DISK1; when it asks for the next disk, give it
   `C:\GAME\DISK2` and so on as the path, or first copy every disk into
-  DISK1: `mcopy -o -i ~/86box-vms/game-vm/hd.img@@32256 '::/GAME/DISK2/*'
-  ::/GAME/DISK1/`. If the game has no sound, go into its folder (`CD
+  DISK1: `mcopy -s -o -i ~/86box-vms/game-vm/hd.img@@32256
+  '::/GAME/DISK2/*' ::/GAME/DISK1/`. If the game has no sound, go into its folder (`CD
   \GAME`), run its setup program there (the importer names it), and pick
   Sound Blaster 16 at port 220, IRQ 7, DMA 1, high DMA 5.
 - **A CD image on its own** goes into the CD-ROM drive, and nothing is
@@ -239,8 +239,9 @@ mdel -i ~/86box-vms/game-vm/hd.img@@32256 ::/GAME.BAT
 
 A CD game also has a folder of its own under `~/86box-vms/game-vm/cd/`,
 named like the game: remove it too, and its disc from 86Box's Media menu
-(CD-ROM 1). To import a game again, run the importer again: it replaces
-the earlier copy.
+(CD-ROM 1). Importing a game again copies it over its earlier copy:
+files the new copy lacks, such as saved games, stay. For a clean copy,
+remove the game first.
 
 To start over with an empty machine, close 86Box, delete
 `~/86box-vms/game-vm` and run step 4 again. That deletes every game on C:
@@ -280,7 +281,7 @@ keeps them, and copy it back with `mcopy -o`.
 | `7-Zip is needed to unpack` | `sudo apt install 7zip` (or `p7zip-full`); for rar, `sudo apt install libarchive-tools` |
 | `86Box (process N) is running this VM` | Close 86Box first: it holds the disk and rewrites `86box.cfg` when it closes |
 | The batch file starts the wrong program | Import again with `--run PROGRAM` (the importer listed the candidates and why it picked one) |
-| `innoextract could not unpack` | The file isn't a GOG installer, or it is newer than your innoextract. innoextract 1.9, the newest release and the one Ubuntu and Debian ship, reads installers up to Inno Setup 6.0.5. Newer ones need its development version, built from source as its README says (github.com/dscharrer/innoextract; not tried here). Or install the game with Wine (`wine setup_GAME.exe`) and give the importer the folder it went to, under `~/.wine/drive_c/GOG Games/` |
+| `innoextract could not unpack` | The file isn't a GOG installer, or it is newer than your innoextract: `innoextract --version` says which Inno Setup versions it reads. Ubuntu 22.04's 1.8 reads up to 6.0.2; 1.9 (Ubuntu 24.04's, and the newest release, on github.com/dscharrer/innoextract) up to 6.0.5. Newer installers need its development version, built from source as its README says (not tried here). Or install the game with Wine (`wine setup_GAME.exe`) and give the importer the folder it went to, under `~/.wine/drive_c/GOG Games/` |
 | A game has no sound | Go into the game's folder (`CD \GAME`), run its setup program there, and pick Sound Blaster 16 at 220, IRQ 7, DMA 1 (high DMA 5) |
 | A game says there isn't enough memory | Programs get 623 KB of conventional memory, about what DOSBox gives, and the machine has 32 MB with EMS and XMS. For more memory in all, raise Memory in 86Box's Settings, Machine. For a game that wants no EMS, change the line in `A:\FDCONFIG.SYS` to `DEVICE=JEMMEX.EXE NOEMS` (see "Change the boot floppy"). Otherwise, ask Claude to find what the game checks |
 | Sound effects play but the music is silent | The game plays General MIDI music, which needs a synthesizer: `sudo apt install fluid-soundfont-gm`, then in 86Box's Settings > Sound > MIDI, set MIDI Out Device to FluidSynth. Or pick Sound Blaster or AdLib music in the game's setup |
